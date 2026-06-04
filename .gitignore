@@ -1,0 +1,24 @@
+# Entorno
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Artefactos de voz / modelos pesados
+*.onnx
+*.onnx.json
+*.wav
+
+# Datos locales / runtime
+.crotolamo/
+*.sqlite
+*.sqlite3
+*.db
+
+# Config local del patrón (sobrescribe la de ejemplo)
+config/crotolamo.local.toml
+
+# Basura del SO
+.DS_Store

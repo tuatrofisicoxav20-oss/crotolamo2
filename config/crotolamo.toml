@@ -1,0 +1,59 @@
+# Configuración de Crotolamo 2.
+# CERO hardcodeo: todas las rutas usan ~ y se expanden en settings.py.
+# El usuario actual se detecta solo (nada de /home/exitili quemado).
+#
+# Para overrides locales sin tocar este archivo, crea config/crotolamo.local.toml
+# (está en .gitignore) con solo las claves que quieras cambiar.
+
+[paths]
+# ~ se expande al home del usuario que corre el proceso.
+home       = "~"
+documentos = "~/Documentos"
+descargas  = "~/Descargas"
+# Voz Piper (Fase 5). Apunta a donde tengas el modelo .onnx.
+voces      = "~/Documentos/crotolamo2/voices"
+# Base de datos de memoria persistente (Fase 4).
+db         = "~/.crotolamo/crotolamo.sqlite"
+# Notas creadas por la tool create_note (Fase 3).
+notas      = "~/Documentos/crotolamo_notas"
+
+# Allowlist de raíces donde las tools de archivo pueden operar (Fase 3).
+# El guard rechaza cualquier ruta fuera de estas raíces.
+allowed_roots = [
+    "~/Documentos",
+    "~/Descargas",
+    "~/.crotolamo",
+]
+
+# Proyectos del patrón sobre los que Crotolamo puede razonar (Fase 3).
+[projects]
+crotolamo  = "~/Documentos/crotolamo2"
+huevonitis = "~/Documentos/huevonitis 4"
+
+[llm]
+host        = "http://localhost:11434"
+model       = "qwen2.5-coder:7b"
+temperature = 0.2
+timeout     = 120
+# Máximo de iteraciones del loop agéntico (anti-loop infinito).
+max_iterations = 6
+
+[memory]
+# Ventana deslizante del historial conversacional (nº de turnos user+assistant).
+max_turns = 20
+
+[voice]
+whisper_model = "small"
+piper_voice   = "es_MX-ald-medium.onnx"
+sample_rate   = 16000
+# VAD (Fase 5): cortar al silencio.
+vad_silence_ms = 800
+
+[wake]
+target    = "crotolamo"
+threshold = 0.67
+variants  = [
+    "crotolamo", "coto y amo", "coto lamo", "coto amo", "croto lamo",
+    "croto el amo", "corto lamo", "corto la mano", "crotolo amo",
+    "control amo", "contro lamo", "cuatro lamo", "proto lamo", "troto lamo",
+]

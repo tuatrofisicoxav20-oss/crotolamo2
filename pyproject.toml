@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crotolamo2"
+version = "2.0.0"
+description = "Crotolamo 2 — asistente local agéntico para Fedora (tool-calling sobre Ollama)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Emiliano / Caos Orbital" }]
+
+# Núcleo (Fases 0-2): el agente conversacional + tool-calling NO necesita
+# nada fuera de la stdlib. Ollama se habla por HTTP con urllib.
+dependencies = []
+
+[project.optional-dependencies]
+# Voz (Fase 5). Se instala con: pip install -e ".[voice]"
+voice = [
+    "faster-whisper",
+    "sounddevice",
+    "numpy",
+    "scipy",
+    "piper-tts",
+]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[project.scripts]
+crotolamo = "crotolamo.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["crotolamo*", "interfaces*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
