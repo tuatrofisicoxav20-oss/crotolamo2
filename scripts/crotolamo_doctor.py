@@ -1,0 +1,185 @@
+"""Auditor de salud de Crotolamo 2.
+
+Reporta ✅/❌ por cada check con una sugerencia de fix. Nunca lanza:
+un entorno a medias debe poder diagnosticarse.
+
+Uso:
+    python -m crotolamo doctor
+    python scripts/crotolamo_doctor.py
+"""
+
+from __future__ import annotations
+
+import json
+import shutil
+import sys
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+
+try:
+    from crotolamo.settings import load_settings
+except ModuleNotFoundError:  # ejecutado como script suelto
+    import os
+
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from crotolamo.settings import load_settings
+
+
+@dataclass
+class Check:
+    name: str
+    ok: bool
+    detail: str
+    fix: str = ""
+
+
+def _ollama_tags(host: str, timeout: float = 5.0) -> list[str] | None:
+    """Devuelve la lista de modelos instalados, o None si Ollama no responde."""
+    try:
+        with urllib.request.urlopen(f"{host}/api/tags", timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return [m.get("name", "") for m in data.get("models", [])]
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, TimeoutError):
+        return None
+
+
+def collect_checks() -> list[Check]:
+    checks: list[Check] = []
+
+    try:
+        settings = load_settings()
+    except Exception as error:  # noqa: BLE001 - el doctor nunca debe morir
+        return [
+            Check(
+                "config",
+                False,
+                f"No pude cargar la config: {error}",
+                "Revisa config/crotolamo.toml.",
+            )
+        ]
+
+    checks.append(Check("config", True, "config/crotolamo.toml cargada", ""))
+
+    # Usuario detectado (no hardcodeado).
+    checks.append(
+        Check("usuario", True, f"corriendo como '{settings.user}' (home={settings.home})", "")
+    )
+
+    # Rutas críticas.
+    problems = settings.validate_critical()
+    checks.append(
+        Check(
+            "rutas",
+            not problems,
+            "rutas críticas OK" if not problems else "; ".join(problems),
+            "Crea las carpetas o ajusta [paths] en la config.",
+        )
+    )
+
+    # Ollama responde.
+    host = settings.llm.get("host", "http://localhost:11434")
+    model = settings.llm.get("model", "qwen2.5-coder:7b")
+    tags = _ollama_tags(host)
+    if tags is None:
+        checks.append(
+            Check(
+                "ollama",
+                False,
+                f"no responde en {host}",
+                "Arranca el servicio: `ollama serve` (o systemctl start ollama).",
+            )
+        )
+    else:
+        checks.append(Check("ollama", True, f"responde en {host}", ""))
+        has_model = any(t == model or t.split(":")[0] == model.split(":")[0] for t in tags)
+        checks.append(
+            Check(
+                "modelo",
+                has_model,
+                f"'{model}' instalado" if has_model else f"falta '{model}' (hay: {', '.join(tags) or 'ninguno'})",
+                f"Instálalo: `ollama pull {model}`.",
+            )
+        )
+
+    # Deps del núcleo: solo stdlib. Confirmamos tomllib (3.11+).
+    try:
+        import tomllib  # noqa: F401
+
+        checks.append(Check("python", True, f"Python {sys.version.split()[0]} con tomllib", ""))
+    except ModuleNotFoundError:
+        checks.append(
+            Check(
+                "python",
+                False,
+                "falta tomllib (Python < 3.11)",
+                "Usa Python 3.11+ o instala el backport `tomli`.",
+            )
+        )
+
+    # Voz (opcional): voz Piper en la ruta de config.
+    voces = settings.paths.get("voces")
+    piper_voice = settings.voice.get("piper_voice", "")
+    if voces and piper_voice:
+        onnx = voces / piper_voice
+        checks.append(
+            Check(
+                "voz-piper",
+                onnx.exists(),
+                f"voz en {onnx}" if onnx.exists() else f"sin voz en {onnx} (opcional hasta Fase 5)",
+                "Coloca el .onnx en [paths].voces o instala con `pip install -e '.[voice]'`.",
+            )
+        )
+
+    # Entorno Wayland / ydotool (opcional, para control de ventanas futuro).
+    has_ydotool = shutil.which("ydotool") is not None
+    checks.append(
+        Check(
+            "ydotool",
+            has_ydotool,
+            "ydotool presente" if has_ydotool else "sin ydotool (opcional)",
+            "Instala con `sudo dnf install ydotool` si quieres control de ventanas.",
+        )
+    )
+
+    # Navegador para las tools de desktop.
+    browser = shutil.which("xdg-open") or shutil.which("flatpak")
+    checks.append(
+        Check(
+            "navegador",
+            browser is not None,
+            f"lanzador disponible ({browser})" if browser else "sin xdg-open/flatpak",
+            "Instala xdg-utils: `sudo dnf install xdg-utils`.",
+        )
+    )
+
+    return checks
+
+
+def run_doctor() -> int:
+    checks = collect_checks()
+    print("Doctor de Crotolamo 2\n" + "=" * 40)
+
+    # Distinguimos checks obligatorios de opcionales para el código de salida.
+    optional = {"voz-piper", "ydotool"}
+    hard_fail = False
+
+    for c in checks:
+        mark = "✅" if c.ok else "❌"
+        print(f"{mark} {c.name:12s} {c.detail}")
+        if not c.ok:
+            if c.fix:
+                print(f"   ↳ fix: {c.fix}")
+            if c.name not in optional:
+                hard_fail = True
+
+    print("=" * 40)
+    if hard_fail:
+        print("Hay fallos que arreglar, patrón. Mira los ❌ de arriba.")
+        return 1
+    print("Todo en orden, patrón. (Los ❌ opcionales no bloquean.)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(run_doctor())
