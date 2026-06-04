@@ -1,0 +1,113 @@
+"""Cliente de Ollama con tool-calling. Reescritura de C1::ask_ollama.
+
+Habla /api/chat por HTTP (stdlib, sin dependencias). Soporta el campo `tools`
+para tool-calling nativo de qwen2.5-coder. Los errores se devuelven en personaje.
+"""
+
+from __future__ import annotations
+
+import json
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+from typing import Any
+
+
+class LLMError(RuntimeError):
+    """Error hablando con Ollama, ya con mensaje en personaje."""
+
+
+@dataclass
+class ChatResponse:
+    content: str = ""
+    # Lista de tool calls pedidos: [{"name": str, "arguments": dict}, ...]
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    # El mensaje crudo del asistente (para reinyectar al historial tal cual).
+    raw_message: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def wants_tools(self) -> bool:
+        return bool(self.tool_calls)
+
+
+def _parse_tool_calls(message: dict[str, Any]) -> list[dict[str, Any]]:
+    calls = []
+    for call in message.get("tool_calls") or []:
+        fn = call.get("function", {})
+        args = fn.get("arguments", {})
+        # Ollama suele mandar arguments como dict; algunos modelos lo mandan
+        # como string JSON. Normalizamos a dict.
+        if isinstance(args, str):
+            try:
+                args = json.loads(args) if args.strip() else {}
+            except json.JSONDecodeError:
+                args = {}
+        calls.append({"name": fn.get("name", ""), "arguments": args or {}})
+    return calls
+
+
+class LLMClient:
+    def __init__(
+        self,
+        host: str = "http://localhost:11434",
+        model: str = "qwen2.5-coder:7b",
+        temperature: float = 0.2,
+        timeout: float = 120,
+    ) -> None:
+        self.host = host.rstrip("/")
+        self.model = model
+        self.temperature = temperature
+        self.timeout = timeout
+
+    @classmethod
+    def from_settings(cls, settings) -> "LLMClient":
+        llm = settings.llm
+        return cls(
+            host=llm.get("host", "http://localhost:11434"),
+            model=llm.get("model", "qwen2.5-coder:7b"),
+            temperature=llm.get("temperature", 0.2),
+            timeout=llm.get("timeout", 120),
+        )
+
+    def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> ChatResponse:
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "stream": False,
+            "messages": messages,
+            "options": {"temperature": self.temperature},
+        }
+        if tools:
+            payload["tools"] = tools
+
+        req = urllib.request.Request(
+            f"{self.host}/api/chat",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                raw = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.URLError as error:
+            raise LLMError(
+                f"No pude hablar con Ollama en {self.host}, patrón. "
+                f"¿Está vivo el servicio? ({error.reason})"
+            ) from error
+        except (TimeoutError, OSError) as error:
+            raise LLMError(
+                f"Ollama no respondió a tiempo, patrón. ({error})"
+            ) from error
+        except json.JSONDecodeError as error:
+            raise LLMError("Ollama me devolvió basura no-JSON, patrón.") from error
+
+        message = raw.get("message", {}) or {}
+        return ChatResponse(
+            content=(message.get("content") or "").strip(),
+            tool_calls=_parse_tool_calls(message),
+            raw_message=message,
+        )
