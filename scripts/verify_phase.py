@@ -39,7 +39,15 @@ def verify(phase: int) -> int:
     if phase >= 2:
         print("== Fase 2: tool-calling ==")
         failures += _pytest(
-            ["tests/test_tools.py", "tests/test_safety.py", "tests/test_wake.py"]
+            ["tests/test_tools.py", "tests/test_safety.py", "tests/test_wake.py",
+             "tests/test_agent.py"]
+        ) != 0
+
+    if phase >= 3:
+        print("== Fase 3: tools que hacen cosas ==")
+        failures += _pytest(
+            ["tests/test_files.py", "tests/test_projects.py",
+             "tests/test_system.py", "tests/test_shortcuts.py"]
         ) != 0
 
     print("\n" + "=" * 40)

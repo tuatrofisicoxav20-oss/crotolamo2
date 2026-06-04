@@ -34,7 +34,9 @@ huevonitis = "~/Documentos/huevonitis 4"
 host        = "http://localhost:11434"
 model       = "qwen2.5-coder:7b"
 temperature = 0.2
-timeout     = 120
+# En CPU (sin GPU) la inferencia con muchos tool-schemas es lenta: timeout holgado.
+# Con GPU se puede bajar a 60-90 sin problema.
+timeout     = 240
 # Máximo de iteraciones del loop agéntico (anti-loop infinito).
 max_iterations = 6
 
