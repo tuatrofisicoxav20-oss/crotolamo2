@@ -50,6 +50,10 @@ def verify(phase: int) -> int:
              "tests/test_system.py", "tests/test_shortcuts.py"]
         ) != 0
 
+    if phase >= 4:
+        print("== Fase 4: memoria persistente ==")
+        failures += _pytest(["tests/test_facts.py"]) != 0
+
     print("\n" + "=" * 40)
     if failures:
         print(f"Fase {phase}: {failures} bloque(s) en rojo, patrón.")

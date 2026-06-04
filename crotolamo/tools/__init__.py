@@ -10,6 +10,7 @@ def default_registry() -> Registry:
     # Los imports tienen efecto colateral: cada @tool se registra al importarse.
     from crotolamo.tools import (  # noqa: F401
         desktop,
+        facts,
         files,
         projects,
         search,

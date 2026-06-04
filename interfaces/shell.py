@@ -12,13 +12,19 @@ from crotolamo.core.agent import Agent
 from crotolamo.core.llm import LLMClient
 from crotolamo.core.memory import Conversation
 from crotolamo.core.persona import system_prompt
+from crotolamo.persistence import facts
 from crotolamo.settings import get_settings
 
 
 def _build_agent() -> tuple[Agent, Conversation]:
     settings = get_settings()
+    # Fase 4: arrancar "sabiendo quién es el patrón" — inyectamos los hechos.
+    try:
+        contexto = facts.facts_context()
+    except Exception:
+        contexto = ""
     conversation = Conversation(
-        system_prompt(),
+        system_prompt(contexto),
         max_turns=settings.memory.get("max_turns", 20),
     )
     llm = LLMClient.from_settings(settings)
@@ -87,6 +93,13 @@ def run_shell(argv: list[str] | None = None) -> int:
             continue
         if low == "/historial":
             _show_history(conversation)
+            continue
+
+        # Fase 4: fast-path "acuérdate que ..." — guarda sin depender del LLM.
+        fact = facts.detect_remember(user)
+        if fact:
+            facts.remember(fact)
+            print(f"\nCrotolamo > Anotado, patrón. Lo recordaré: «{fact}».\n")
             continue
 
         reply = agent.handle_turn(user)
