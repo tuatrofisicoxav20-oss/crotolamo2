@@ -131,6 +131,22 @@ def collect_checks() -> list[Check]:
             )
         )
 
+    # Deps de voz (opcional, extra [voice]).
+    missing_voice = []
+    for mod in ("faster_whisper", "sounddevice", "numpy"):
+        try:
+            __import__(mod)
+        except ImportError:
+            missing_voice.append(mod)
+    checks.append(
+        Check(
+            "voz-deps",
+            not missing_voice,
+            "deps de voz importables" if not missing_voice else f"faltan: {', '.join(missing_voice)} (opcional hasta usar voz)",
+            "Instala la voz: pip install -e '.[voice]'.",
+        )
+    )
+
     # Entorno Wayland / ydotool (opcional, para control de ventanas futuro).
     has_ydotool = shutil.which("ydotool") is not None
     checks.append(
@@ -161,7 +177,7 @@ def run_doctor() -> int:
     print("Doctor de Crotolamo 2\n" + "=" * 40)
 
     # Distinguimos checks obligatorios de opcionales para el código de salida.
-    optional = {"voz-piper", "ydotool"}
+    optional = {"voz-piper", "voz-deps", "ydotool"}
     hard_fail = False
 
     for c in checks:

@@ -32,8 +32,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_doctor()
 
     if command == "listen":
-        print("La voz llega en la Fase 5, patrón. Por ahora usa: python -m crotolamo shell")
-        return 0
+        from interfaces.listener import run_listen
+        return run_listen(rest)
 
     print(f"Comando desconocido: {command!r}", file=sys.stderr)
     print("Usa: python -m crotolamo [--version|shell|doctor|listen]", file=sys.stderr)

@@ -1,0 +1,59 @@
+"""Text-to-speech con Piper. Migrado de C1::voice_out, SIN la ruta hardcodeada.
+
+La voz .onnx se resuelve desde la config ([paths].voces + [voice].piper_voice),
+no del /home/exitili quemado de C1.
+"""
+
+from __future__ import annotations
+
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+
+
+class TTS:
+    def __init__(self, voice_model: Path) -> None:
+        self.voice_model = Path(voice_model)
+
+    @classmethod
+    def from_settings(cls, settings) -> "TTS":
+        voces = settings.paths.get("voces", Path.home() / "voices")
+        piper_voice = settings.voice.get("piper_voice", "es_MX-ald-medium.onnx")
+        return cls(voces / piper_voice)
+
+    def available(self) -> bool:
+        return self.voice_model.exists() and shutil.which("ffplay") is not None
+
+    def speak(self, text: str) -> None:
+        text = text.strip()
+        if not text:
+            return
+        if not self.voice_model.exists():
+            print(f"[voz desactivada: no encuentro {self.voice_model}]")
+            return
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            audio_path = Path(tmp.name)
+        try:
+            subprocess.run(
+                ["python", "-m", "piper", "-m", str(self.voice_model),
+                 "-f", str(audio_path), "--", text],
+                check=True, text=True, capture_output=True,
+            )
+            if shutil.which("ffplay"):
+                subprocess.run(
+                    ["ffplay", "-autoexit", "-nodisp", "-loglevel", "quiet", str(audio_path)],
+                    check=False,
+                )
+            else:
+                print("[voz: falta ffplay para reproducir]")
+        except subprocess.CalledProcessError as error:
+            print(f"[error en Piper: {error.stderr}]")
+        except FileNotFoundError:
+            print("[voz desactivada: falta piper. Instala con pip install -e '.[voice]']")
+        finally:
+            try:
+                audio_path.unlink(missing_ok=True)
+            except OSError:
+                pass

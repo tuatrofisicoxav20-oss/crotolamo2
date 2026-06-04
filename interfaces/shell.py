@@ -16,7 +16,12 @@ from crotolamo.persistence import facts
 from crotolamo.settings import get_settings
 
 
-def _build_agent() -> tuple[Agent, Conversation]:
+def build_agent(confirm_fn=None) -> tuple[Agent, Conversation]:
+    """Construye el agente con tools, guard y memoria persistente inyectada.
+
+    Reusable por el shell (texto) y el listener (voz). confirm_fn decide cómo se
+    pide confirmación para tools inseguras (texto o voz).
+    """
     settings = get_settings()
     # Fase 4: arrancar "sabiendo quién es el patrón" — inyectamos los hechos.
     try:
@@ -41,7 +46,7 @@ def _build_agent() -> tuple[Agent, Conversation]:
             registry=default_registry(),
             guard=Guard.from_settings(settings),
             max_iterations=settings.llm.get("max_iterations", 6),
-            confirm_fn=_text_confirm,
+            confirm_fn=confirm_fn or _text_confirm,
         )
     except Exception:
         agent = Agent(llm, conversation)
@@ -69,7 +74,7 @@ def _show_history(conversation: Conversation) -> None:
 
 
 def run_shell(argv: list[str] | None = None) -> int:
-    agent, conversation = _build_agent()
+    agent, conversation = build_agent()
 
     print("Crotolamo Shell. 'salir' para terminar. /reset limpia memoria, /historial la muestra.\n")
 

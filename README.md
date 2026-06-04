@@ -22,7 +22,11 @@ Crotolamo 2:  LLM elige tool(nombre, args) → función Python TIPADA y SEGURA
 python -m crotolamo --version
 python -m crotolamo doctor      # auditor de salud
 python -m crotolamo shell       # REPL de texto
+python -m crotolamo listen      # bucle de voz wake-word (requiere extra [voice])
 ```
+
+Para la voz: `pip install -e ".[voice]"` (faster-whisper, sounddevice, piper-tts) y
+un modelo Piper `.onnx` en `[paths].voces`.
 
 ## Configuración
 
@@ -35,9 +39,9 @@ por git) con solo las claves que quieras cambiar.
 - [x] **Fase 0** — andamiaje: repo, config, settings, doctor
 - [x] **Fase 1** — núcleo conversacional con memoria de corto plazo (REPL)
 - [x] **Fase 2** — tool-calling: el loop agéntico + tools de desktop/search seguras
-- [ ] **Fase 3** — tools que leen/razonan sobre proyectos + archivos seguros
-- [ ] **Fase 4** — memoria persistente (SQLite)
-- [ ] **Fase 5** — voz (VAD, latencia) sobre el agente nuevo
+- [x] **Fase 3** — tools que leen/razonan sobre proyectos + archivos seguros
+- [x] **Fase 4** — memoria persistente (SQLite)
+- [x] **Fase 5** — voz (VAD real, latencia) sobre el agente nuevo
 
 ## Procedencia (qué se migró de Crotolamo 1)
 
