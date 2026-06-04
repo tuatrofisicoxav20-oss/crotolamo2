@@ -35,11 +35,18 @@ def _build_agent() -> tuple[Agent, Conversation]:
             registry=default_registry(),
             guard=Guard.from_settings(settings),
             max_iterations=settings.llm.get("max_iterations", 6),
+            confirm_fn=_text_confirm,
         )
     except Exception:
         agent = Agent(llm, conversation)
 
     return agent, conversation
+
+
+def _text_confirm(reason: str) -> bool:
+    """Pide confirmación por texto antes de una acción marcada como insegura."""
+    answer = input(f"{reason} [s/N] ").strip().lower()
+    return answer in {"s", "si", "sí", "y", "yes"}
 
 
 def _show_history(conversation: Conversation) -> None:
