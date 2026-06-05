@@ -74,9 +74,16 @@ def _show_history(conversation: Conversation) -> None:
 
 
 def run_shell(argv: list[str] | None = None) -> int:
-    agent, conversation = build_agent()
+    from crotolamo.core.agent import ToolAgent
 
-    print("Crotolamo Shell. 'salir' para terminar. /reset limpia memoria, /historial la muestra.\n")
+    argv = argv or []
+    stream = "--stream" in argv
+
+    agent, conversation = build_agent()
+    can_stream = stream and isinstance(agent, ToolAgent)
+
+    extra = " (streaming)" if can_stream else ""
+    print(f"Crotolamo Shell{extra}. 'salir' para terminar. /reset limpia memoria, /historial la muestra.\n")
 
     while True:
         try:
@@ -107,8 +114,13 @@ def run_shell(argv: list[str] | None = None) -> int:
             print(f"\nCrotolamo > Anotado, patrón. Lo recordaré: «{fact}».\n")
             continue
 
-        reply = agent.handle_turn(user)
-        print(f"\nCrotolamo > {reply}\n")
+        if can_stream:
+            print("\nCrotolamo > ", end="", flush=True)
+            agent.handle_turn(user, on_token=lambda t: print(t, end="", flush=True))
+            print("\n")
+        else:
+            reply = agent.handle_turn(user)
+            print(f"\nCrotolamo > {reply}\n")
 
 
 if __name__ == "__main__":

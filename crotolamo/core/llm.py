@@ -111,3 +111,72 @@ class LLMClient:
             tool_calls=_parse_tool_calls(message),
             raw_message=message,
         )
+
+    def chat_stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        on_token=None,
+    ) -> ChatResponse:
+        """Como chat() pero con stream=True: invoca on_token(chunk) por cada delta.
+
+        Acumula el contenido y captura tool_calls del último mensaje. Útil para
+        respuesta token-a-token (Fase 6). Funciona mejor con GPU o modelos que usan
+        el campo nativo tool_calls.
+        """
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "stream": True,
+            "messages": messages,
+            "options": {"temperature": self.temperature},
+        }
+        if tools:
+            payload["tools"] = tools
+
+        req = urllib.request.Request(
+            f"{self.host}/api/chat",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                content, last_message = self._consume_stream(resp, on_token)
+        except urllib.error.URLError as error:
+            raise LLMError(
+                f"No pude hablar con Ollama en {self.host}, patrón. ({error.reason})"
+            ) from error
+        except (TimeoutError, OSError) as error:
+            raise LLMError(f"Ollama no respondió a tiempo, patrón. ({error})") from error
+
+        return ChatResponse(
+            content=content.strip(),
+            tool_calls=_parse_tool_calls(last_message),
+            raw_message=last_message,
+        )
+
+    @staticmethod
+    def _consume_stream(resp, on_token) -> tuple[str, dict[str, Any]]:
+        """Parsea el JSONL de /api/chat?stream=true. Reusable y testeable."""
+        parts: list[str] = []
+        last_message: dict[str, Any] = {}
+        for raw_line in resp:
+            line = raw_line.decode("utf-8").strip() if isinstance(raw_line, bytes) else raw_line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            msg = obj.get("message", {}) or {}
+            if msg:
+                last_message = msg
+            delta = msg.get("content") or ""
+            if delta:
+                parts.append(delta)
+                if on_token:
+                    on_token(delta)
+            if obj.get("done"):
+                break
+        return "".join(parts), last_message

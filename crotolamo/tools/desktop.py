@@ -167,3 +167,39 @@ def open_folder(name: str) -> str:
 
     run_detached(["xdg-open", str(folder)])
     return f"{funny_line()}\nAbrí {folder}, patrón."
+
+
+# Combos de teclas conocidos -> secuencia de keycodes Linux para ydotool
+# (formato keycode:estado, 1=presionar 0=soltar).
+_HOTKEYS: dict[str, list[str]] = {
+    "alt+tab": ["56:1", "15:1", "15:0", "56:0"],
+    "super": ["125:1", "125:0"],
+    "ctrl+alt+t": ["29:1", "56:1", "20:1", "20:0", "56:0", "29:0"],
+    "alt+f4": ["56:1", "62:1", "62:0", "56:0"],
+}
+
+
+@tool(safe=False)
+def send_hotkey(combo: str) -> str:
+    """Envía un atajo de teclado al escritorio vía ydotool (control de ventanas).
+
+    Combos soportados: alt+tab, super, ctrl+alt+t, alt+f4. Acción insegura
+    (afecta a todo el escritorio): pide confirmación.
+
+    Args:
+        combo: el atajo a enviar.
+    """
+    key = normalize_key(combo).replace(" ", "")
+    if key not in _HOTKEYS:
+        return f"No conozco el atajo '{combo}', patrón. Tengo: {', '.join(_HOTKEYS)}."
+    if not shutil.which("ydotool"):
+        return "No tengo ydotool, patrón. Instálalo con `sudo dnf install ydotool`."
+    try:
+        subprocess.run(["ydotool", "key", *_HOTKEYS[key]], check=True,
+                       capture_output=True, text=True, timeout=5)
+    except subprocess.CalledProcessError:
+        return ("Falló ydotool, patrón. ¿Está corriendo el demonio ydotoold? "
+                "(`systemctl --user start ydotoold`).")
+    except (OSError, subprocess.TimeoutExpired):
+        return "No pude enviar el atajo, patrón."
+    return f"Envié {combo}, patrón."

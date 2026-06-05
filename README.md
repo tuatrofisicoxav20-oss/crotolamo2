@@ -42,6 +42,7 @@ por git) con solo las claves que quieras cambiar.
 - [x] **Fase 3** — tools que leen/razonan sobre proyectos + archivos seguros
 - [x] **Fase 4** — memoria persistente (SQLite)
 - [x] **Fase 5** — voz (VAD real, latencia) sobre el agente nuevo
+- [x] **Fase 6** — extensiones: streaming token-a-token, TTS por frases, memoria fuzzy, búsqueda en proyectos, hotkeys
 
 ## Procedencia (qué se migró de Crotolamo 1)
 

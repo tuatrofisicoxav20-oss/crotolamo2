@@ -36,6 +36,20 @@ def recall_facts(categoria: str = "") -> str:
 
 
 @tool
+def search_facts(query: str) -> str:
+    """Busca entre los hechos recordados los más relevantes a una consulta.
+
+    Args:
+        query: lo que quieres encontrar (ej: "proyecto principal").
+    """
+    rows = facts.search(query)
+    if not rows:
+        return f"No encontré nada parecido a «{query}» en mi memoria, patrón."
+    lines = [f"#{r['id']} ({r['categoria']}): {r['texto']}" for r in rows]
+    return "Lo más parecido que recuerdo, patrón:\n" + "\n".join(lines)
+
+
+@tool
 def forget_fact(fact_id: int) -> str:
     """Olvida (borra) un hecho por su número de id.
 

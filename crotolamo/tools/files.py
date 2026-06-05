@@ -135,6 +135,36 @@ def delete_file(path: str) -> str:
 
 
 @tool
+def search_files(query: str) -> str:
+    """Busca archivos por nombre dentro de Documentos del patrón (read-only).
+
+    Args:
+        query: parte del nombre del archivo a buscar.
+    """
+    import subprocess
+
+    base = get_settings().paths.get("documentos", Path.home() / "Documentos")
+    query = query.strip()
+    if not query:
+        return "Dame un nombre que buscar, patrón."
+    if not base.exists():
+        return f"No existe la base de búsqueda, patrón: {base}"
+    try:
+        result = subprocess.run(
+            ["find", str(base), "-iname", f"*{query}*"],
+            text=True, capture_output=True, timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return "La búsqueda tardó demasiado, patrón."
+    lines = result.stdout.strip().splitlines()
+    if not lines:
+        return f"No encontré archivos con «{query}», patrón."
+    shown = lines[:20]
+    extra = f"\n...y {len(lines) - 20} más." if len(lines) > 20 else ""
+    return f"Encontré esto, patrón:\n" + "\n".join(shown) + extra
+
+
+@tool
 def create_note(title: str, content: str = "") -> str:
     """Crea una nota en markdown en la carpeta de notas del patrón.
 

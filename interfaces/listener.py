@@ -78,7 +78,11 @@ def run_listen(argv: list[str] | None = None) -> int:
 
             print(f"Orden: {command}", flush=True)
             reply = agent.handle_turn(command)
-            say(reply)
+            print(reply, flush=True)
+            try:
+                tts.speak_sentences(reply)  # Fase 6: TTS por frases
+            except Exception as error:  # noqa: BLE001
+                print(f"[voz falló: {error}]", flush=True)
             time.sleep(0.5)
 
         except KeyboardInterrupt:

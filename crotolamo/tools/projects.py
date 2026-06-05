@@ -9,6 +9,7 @@ Los proyectos se leen de [projects] en la config (cero hardcodeo).
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 from crotolamo.settings import get_settings
@@ -128,6 +129,39 @@ def read_project_file(project: str, relative_path: str) -> str:
     if len(text) > _READ_CAP:
         text = text[:_READ_CAP] + f"\n...[recortado, {len(text)} chars en total]"
     return f"Contenido de {project}/{relative_path}:\n{text}"
+
+
+@tool
+def find_in_project(project: str, pattern: str) -> str:
+    """Busca un texto/patrón dentro de los archivos de un proyecto (read-only).
+
+    Args:
+        project: nombre del proyecto.
+        pattern: el texto a buscar.
+    """
+    base = _resolve_project(project)
+    if base is None:
+        return f"No tengo registrado el proyecto '{project}', patrón."
+    if not base.exists():
+        return f"No encontré el proyecto {project}: {base}"
+    if not pattern.strip():
+        return "Dame algo que buscar, patrón."
+
+    cmd = ["grep", "-rniI", "--max-count=3",
+           "--exclude-dir=.git", "--exclude-dir=.venv", "--exclude-dir=__pycache__",
+           pattern, str(base)]
+    try:
+        result = subprocess.run(cmd, text=True, capture_output=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return "La búsqueda falló o tardó demasiado, patrón."
+
+    lines = result.stdout.strip().splitlines()
+    if not lines:
+        return f"No encontré «{pattern}» en {project}, patrón."
+    shown = lines[:25]
+    out = "\n".join(s.replace(str(base) + "/", "") for s in shown)
+    extra = f"\n...y {len(lines) - 25} coincidencias más." if len(lines) > 25 else ""
+    return f"Encontré «{pattern}» en {project}, patrón:\n{out}{extra}"
 
 
 @tool

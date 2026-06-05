@@ -71,6 +71,39 @@ class Agent:
         return reply
 
 
+class _LiveStreamer:
+    """Streamea tokens al patrón en vivo, salvo que la respuesta empiece como un
+    tool-call JSON ('{', '[' o cerca de código) — en ese caso retiene, para no
+    filtrar el JSON crudo de los tool-calls que qwen emite en `content`.
+    """
+
+    def __init__(self, on_token: Callable[[str], None]) -> None:
+        self._on_token = on_token
+        self._buf: list[str] = []
+        self._decision: str | None = None  # None | "stream" | "hold"
+
+    def feed(self, chunk: str) -> None:
+        self._buf.append(chunk)
+        if self._decision == "stream":
+            self._on_token(chunk)
+            return
+        if self._decision == "hold":
+            return
+        head = "".join(self._buf).lstrip()
+        if len(head) < 2:
+            return  # aún no hay suficiente para decidir
+        if head[0] in "{[" or head.startswith("```"):
+            self._decision = "hold"
+        else:
+            self._decision = "stream"
+            self._on_token(head)  # soltamos lo acumulado de golpe y seguimos en vivo
+
+    def flush_if_held(self, final_text: str) -> None:
+        """Si retuvimos pero resultó ser texto final, lo emitimos completo."""
+        if self._decision != "stream":
+            self._on_token(final_text)
+
+
 # Callback de confirmación: recibe el motivo, devuelve True si el patrón acepta.
 ConfirmFn = Callable[[str], bool]
 
@@ -113,14 +146,20 @@ class ToolAgent(Agent):
 
         return self.registry.run(name, arguments)
 
-    def handle_turn(self, text: str) -> str:
+    def handle_turn(self, text: str, on_token=None) -> str:
         self.conversation.add_user(text)
         schemas = self.registry.schemas()
         known = set(self.registry.names())
 
         for _ in range(self.max_iterations):
+            streamer = _LiveStreamer(on_token) if on_token is not None else None
             try:
-                response = self.llm.chat(self.conversation.to_messages(), tools=schemas)
+                if streamer is not None:
+                    response = self.llm.chat_stream(
+                        self.conversation.to_messages(), tools=schemas, on_token=streamer.feed,
+                    )
+                else:
+                    response = self.llm.chat(self.conversation.to_messages(), tools=schemas)
             except LLMError as error:
                 return str(error)
 
@@ -132,6 +171,9 @@ class ToolAgent(Agent):
 
             if not calls:
                 reply = response.content or "Listo, patrón."
+                # Si retuvimos por sospecha de tool-call pero era texto, lo soltamos ahora.
+                if streamer is not None:
+                    streamer.flush_if_held(reply)
                 self.conversation.add_assistant(reply)
                 return reply
 
