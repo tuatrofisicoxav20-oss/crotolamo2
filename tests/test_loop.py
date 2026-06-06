@@ -8,7 +8,9 @@ import queue
 import threading
 import time
 
-from crotolamo.voice.loop import END, BrainThread, MouthThread, Utterance
+from pathlib import Path
+
+from crotolamo.voice.loop import END, BrainThread, MouthThread, SttThread, Utterance
 from crotolamo.voice.state import Mode, SharedState
 
 
@@ -133,3 +135,59 @@ def test_brain_drops_reply_if_turn_changed():
     finally:
         shutdown.set()
         brain.join(timeout=2.0)
+
+
+# --- M3.5: SttThread ---
+class FakeStt:
+    def __init__(self, text="abre youtube"):
+        self.text = text
+        self.transcribed = 0
+
+    def transcribe(self, path):
+        self.transcribed += 1
+        return self.text
+
+    def listen_once(self, **kwargs):
+        return ""
+
+
+_NO_WAV = Path("/tmp/crotolamo_no_existe.wav")
+
+
+def test_stt_passes_text_for_current_turn():
+    state = SharedState()
+    state.new_turn()  # actual = 1
+    stt = FakeStt("abre youtube")
+    in_q: queue.Queue = queue.Queue()
+    out_q: queue.Queue = queue.Queue()
+    shutdown = threading.Event()
+    th = SttThread(stt, in_q, out_q, state, shutdown)
+    th.start()
+    try:
+        in_q.put((_NO_WAV, 1))
+        assert _wait(lambda: not out_q.empty())
+        text, turn = out_q.get()
+        assert text == "abre youtube" and turn == 1
+    finally:
+        shutdown.set()
+        th.join(timeout=2.0)
+
+
+def test_stt_drops_if_turn_changed():
+    state = SharedState()
+    state.new_turn()
+    state.new_turn()  # actual = 2; el audio será de turno 1 (abortado)
+    stt = FakeStt("lo que sea")
+    in_q: queue.Queue = queue.Queue()
+    out_q: queue.Queue = queue.Queue()
+    shutdown = threading.Event()
+    th = SttThread(stt, in_q, out_q, state, shutdown)
+    th.start()
+    try:
+        in_q.put((_NO_WAV, 1))
+        time.sleep(0.15)
+        assert out_q.empty()
+        assert stt.transcribed == 0  # ni siquiera se transcribió
+    finally:
+        shutdown.set()
+        th.join(timeout=2.0)

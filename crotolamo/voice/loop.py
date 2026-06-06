@@ -100,3 +100,36 @@ class BrainThread(threading.Thread):
             for sentence in split_sentences(reply):
                 self.tts_q.put(Utterance(sentence, turn))
             self.tts_q.put(END)
+
+
+class SttThread(threading.Thread):
+    """Transcribe el audio de comandos, solo si el turno sigue vigente (M3.5)."""
+
+    def __init__(self, stt, stt_queue: queue.Queue, command_queue: queue.Queue,
+                 state: SharedState, shutdown: threading.Event) -> None:
+        super().__init__(name="Stt", daemon=True)
+        self.stt = stt
+        self.in_q = stt_queue
+        self.out_q = command_queue
+        self.state = state
+        self.shutdown = shutdown
+
+    def run(self) -> None:
+        while not self.shutdown.is_set():
+            try:
+                audio_path, turn = self.in_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if not self.state.is_current(turn):
+                continue  # comando abortado antes de transcribir
+            try:
+                text = self.stt.transcribe(audio_path)
+            except Exception as error:  # noqa: BLE001
+                log.warning("stt: %s", error)
+                text = ""
+            try:
+                audio_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            if text.strip() and self.state.is_current(turn):
+                self.out_q.put((text, turn))
