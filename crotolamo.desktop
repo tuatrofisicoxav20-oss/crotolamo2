@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Crotolamo 2
+Comment=Asistente local agéntico (launcher)
+Exec=kitty --hold -e /home/exitili/Documentos/crotolamo2/launch.sh
+Path=/home/exitili/Documentos/crotolamo2
+Terminal=false
+Categories=Utility;

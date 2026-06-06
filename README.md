@@ -18,6 +18,15 @@ Crotolamo 2:  LLM elige tool(nombre, args) → función Python TIPADA y SEGURA
 
 ## Uso
 
+La forma más fácil — **el launcher con menú** (detecta el venv solo):
+
+```bash
+./launch.sh            # menú: doctor / shell / voz / smoke
+./launch.sh doctor     # o directo: doctor|shell|listen|smoke|version
+```
+
+O a mano:
+
 ```bash
 python -m crotolamo --version
 python -m crotolamo doctor      # auditor de salud
