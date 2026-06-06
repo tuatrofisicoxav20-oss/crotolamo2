@@ -45,9 +45,12 @@ max_iterations = 6
 max_turns = 20
 
 [voice]
-whisper_model = "small"
-piper_voice   = "es_MX-ald-medium.onnx"
-sample_rate   = 16000
+# I3: 'base' es casi igual que 'small' en español y mucho más rápido en CPU.
+whisper_model      = "base"
+# Modelo barato solo para detectar la palabra de activación (wake).
+wake_whisper_model = "tiny"
+piper_voice        = "es_MX-ald-medium.onnx"
+sample_rate        = 16000
 # VAD (Fase 5): cortar al silencio.
 vad_silence_ms = 800
 

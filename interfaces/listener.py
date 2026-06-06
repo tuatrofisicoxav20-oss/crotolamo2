@@ -21,7 +21,12 @@ from interfaces.shell import build_agent
 
 def run_listen(argv: list[str] | None = None) -> int:
     settings = get_settings()
-    stt = STT.from_settings(settings)
+    stt = STT.from_settings(settings)  # 'base' para el comando
+    # I3: modelo 'tiny' barato solo para escuchar la palabra de activación.
+    wake_stt = STT(
+        model_size=settings.voice.get("wake_whisper_model", "tiny"),
+        sample_rate=settings.voice.get("sample_rate", 16000),
+    )
     tts = TTS.from_settings(settings)
     threshold = settings.wake.get("threshold", 0.67)
     variants = settings.wake.get("variants")
@@ -37,7 +42,7 @@ def run_listen(argv: list[str] | None = None) -> int:
     def voice_confirm(reason: str) -> bool:
         say(reason + " Di 'confirmo' o 'cancela', patrón.")
         try:
-            answer = stt.listen_once(silence_ms=silence_ms, max_seconds=5)
+            answer = wake_stt.listen_once(silence_ms=silence_ms, max_seconds=5)
         except VoiceUnavailable:
             return False
         if wake.contains_any(answer, wake.CANCEL_VARIANTS):
@@ -56,7 +61,7 @@ def run_listen(argv: list[str] | None = None) -> int:
         try:
             print("\nEsperando palabra de activación...", flush=True)
             try:
-                heard = stt.listen_once(silence_ms=silence_ms, max_seconds=5, start_timeout_s=6)
+                heard = wake_stt.listen_once(silence_ms=silence_ms, max_seconds=5, start_timeout_s=6)
             except VoiceUnavailable as error:
                 print(str(error))
                 return 1

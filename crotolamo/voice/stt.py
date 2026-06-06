@@ -21,7 +21,9 @@ _INITIAL_PROMPT = (
     "Frases comunes: crea una carpeta, abre archivos, mi escritorio, patrón."
 )
 
-_model = None
+# Caché de modelos Whisper POR tamaño: así 'base' (comando) y 'tiny' (wake) pueden
+# coexistir sin pisarse el uno al otro.
+_models: dict[str, object] = {}
 
 
 class VoiceUnavailable(RuntimeError):
@@ -53,14 +55,13 @@ class STT:
         )
 
     def _get_model(self):
-        global _model
-        if _model is None:
+        if self.model_size not in _models:
             faster_whisper = _require("faster_whisper")
-            print("Cargando Whisper, patrón. La primera vez tarda...")
-            _model = faster_whisper.WhisperModel(
+            print(f"Cargando Whisper '{self.model_size}', patrón. La primera vez tarda...")
+            _models[self.model_size] = faster_whisper.WhisperModel(
                 self.model_size, device="cpu", compute_type="int8"
             )
-        return _model
+        return _models[self.model_size]
 
     # --- grabación ---
     def _write_wav(self, path: Path, audio_int16) -> None:
@@ -89,12 +90,14 @@ class STT:
         silence_chunks = max(1, int(silence_ms / chunk_ms))
         max_chunks = int(max_seconds * 1000 / chunk_ms)
         start_chunks = int(start_timeout_s * 1000 / chunk_ms)
+        # M1: calibrar el piso de ruido con ~10 chunks (≈300 ms), no con uno solo.
+        calib_chunks = 10
 
         frames: list = []
         speaking = False
         silent_run = 0
-        # Umbral de energía adaptativo a partir del primer chunk de ambiente.
-        threshold = None
+        threshold = None  # se fija tras la calibración
+        calib_rms: list[float] = []
 
         with sd.InputStream(samplerate=self.sample_rate, channels=1, dtype="float32") as stream:
             for i in range(max_chunks):
@@ -103,9 +106,14 @@ class STT:
                 frames.append(block)
                 rms = float(np.sqrt(np.mean(block ** 2)) + 1e-9)
 
-                if threshold is None:
-                    threshold = max(rms * 3.0, 0.01)
+                # Fase de calibración: promediamos el ruido de ambiente.
+                if i < calib_chunks:
+                    calib_rms.append(rms)
                     continue
+                if threshold is None:
+                    noise_floor = float(np.mean(calib_rms)) if calib_rms else 0.0
+                    # Umbral de voz = 3x el piso de ruido medido, con mínimo de seguridad.
+                    threshold = max(noise_floor * 3.0, 0.01)
 
                 if rms >= threshold:
                     speaking = True
@@ -131,8 +139,10 @@ class STT:
     # --- transcripción ---
     def transcribe(self, path: Path) -> str:
         model = self._get_model()
+        # I4: vad_filter=False — ya recortamos por energía en record_until_silence;
+        # el doble VAD (energía + el de Whisper) se comía audio.
         segments, _ = model.transcribe(
-            str(path), language=self.language, beam_size=5, vad_filter=True,
+            str(path), language=self.language, beam_size=5, vad_filter=False,
             condition_on_previous_text=False, initial_prompt=_INITIAL_PROMPT,
         )
         raw = " ".join(seg.text.strip() for seg in segments).strip()
