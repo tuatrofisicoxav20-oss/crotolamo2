@@ -133,3 +133,94 @@ class SttThread(threading.Thread):
                 pass
             if text.strip() and self.state.is_current(turn):
                 self.out_q.put((text, turn))
+
+
+def _drain_queue(q: queue.Queue) -> None:
+    """Saca todo de la cola sin bloquear."""
+    try:
+        while True:
+            q.get_nowait()
+    except queue.Empty:
+        pass
+
+
+class EarThread(threading.Thread):
+    """El oído: único thread que toca el micrófono y decide transiciones por audio
+    (M3.6). Reúne wake word (M1), Silero VAD (M2) y barge-in. Dependencias inyectadas
+    (mic/wake_fn/vad_fn/to_wav) para ser testeable con fakes sin micrófono real.
+
+    Eco/barge-in: con auriculares es confiable. Con altavoces y SIN AEC, las capas de
+    M3.8 reducen los auto-disparos pero no los eliminan; si molesta, usa --no-barge-in.
+    AEC real (webrtc-audio-processing) es una mejora futura.
+    """
+
+    def __init__(self, mic, wake_fn, vad_fn, to_wav, tts,
+                 stt_queue: queue.Queue, tts_queue: queue.Queue,
+                 state: SharedState, shutdown: threading.Event, *,
+                 vad_threshold: float = 0.8, silence_ms: int = 640,
+                 max_command_s: float = 12.0, allow_barge_in: bool = False,
+                 chunk_ms: float = 32.0) -> None:
+        super().__init__(name="Ear", daemon=True)
+        self.mic = mic
+        self.wake_fn = wake_fn
+        self.vad_fn = vad_fn
+        self.to_wav = to_wav
+        self.tts = tts
+        self.stt_q = stt_queue
+        self.tts_q = tts_queue
+        self.state = state
+        self.shutdown = shutdown
+        self.vad_threshold = vad_threshold
+        self.allow_barge_in = allow_barge_in
+        self._silence_chunks = max(1, int(silence_ms / chunk_ms))
+        self._max_chunks = int(max_command_s * 1000 / chunk_ms)
+        self._turn = 0
+        self._cmd_frames: list = []
+        self._silent_run = 0
+        self._cmd_count = 0
+
+    def _start_command(self, preroll: list | None = None) -> None:
+        # M2: arrancar con el buffer de pre-activación para no perder el inicio.
+        self._cmd_frames = list(preroll or [])
+        self._silent_run = 0
+        self._cmd_count = 0
+
+    def _is_patron_voice(self, chunk, mode) -> bool:
+        # M3.6: versión simple; M3.8 la endurece contra el eco.
+        return self.vad_fn(chunk) >= self.vad_threshold
+
+    def _finish_command(self) -> None:
+        wav = self.to_wav(self._cmd_frames)
+        self.stt_q.put((wav, self._turn))
+        self.state.set_mode(Mode.THINKING)
+
+    def run(self) -> None:
+        while not self.shutdown.is_set():
+            chunk = self.mic.read()
+            if chunk is None:
+                continue
+            mode = self.state.get_mode()
+
+            if mode is Mode.IDLE:
+                if self.wake_fn(chunk):
+                    self._turn = self.state.new_turn()
+                    self.state.set_mode(Mode.LISTENING)
+                    self._start_command(preroll=[chunk])
+
+            elif mode is Mode.LISTENING:
+                self._cmd_frames.append(chunk)
+                self._cmd_count += 1
+                if self.vad_fn(chunk) >= self.vad_threshold:
+                    self._silent_run = 0
+                else:
+                    self._silent_run += 1
+                if self._silent_run >= self._silence_chunks or self._cmd_count >= self._max_chunks:
+                    self._finish_command()
+
+            elif mode in (Mode.THINKING, Mode.SPEAKING):
+                if self.allow_barge_in and self._is_patron_voice(chunk, mode):
+                    self.tts.stop()            # corta el audio YA
+                    _drain_queue(self.tts_q)   # tira las frases viejas
+                    self._turn = self.state.new_turn()  # invalida turnos viejos
+                    self.state.set_mode(Mode.LISTENING)
+                    self._start_command(preroll=[chunk])
