@@ -14,7 +14,7 @@ from pathlib import Path
 
 from crotolamo.settings import get_settings
 from crotolamo.tools.base import tool
-from crotolamo.tools.desktop import normalize_key, run_detached
+from crotolamo.tools.desktop import normalize_key, run_detached, terminal_exec
 
 _SKIP_DIRS = {".venv", "venv", "__pycache__", ".git", "node_modules"}
 _READ_CAP = 20_000
@@ -185,15 +185,18 @@ def launch_project(name: str) -> str:
             launchers.append(path)
 
     if not launchers:
-        run_detached(["gnome-terminal", "--working-directory", str(project)])
+        argv = terminal_exec(f'cd "{project}"; exec bash')
+        if argv is None:
+            return f"No hallé launcher ni terminal para {name}, patrón. Cablea uno en [apps]."
+        run_detached(argv)
         return f"No hallé launcher claro para {name}, patrón. Te abrí una terminal ahí."
 
     launcher = launchers[0]
     if launcher.suffix == ".desktop":
         run_detached(["gtk-launch", launcher.stem])
         return f"Lancé {name} con {launcher.name}, patrón."
-    run_detached([
-        "gnome-terminal", "--working-directory", str(project),
-        "--", "bash", "-lc", f'"{launcher}"; exec bash',
-    ])
+    argv = terminal_exec(f'cd "{project}" && "{launcher}"; exec bash')
+    if argv is None:
+        return f"No encontré un terminal para lanzar {name}, patrón. Cablea uno en [apps]."
+    run_detached(argv)
     return f"Lancé {name} con {launcher.name}, patrón. Que el código tenga piedad."

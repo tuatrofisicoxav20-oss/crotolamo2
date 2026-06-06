@@ -44,6 +44,20 @@ max_iterations = 6
 # Ventana deslizante del historial conversacional (nº de turnos user+assistant).
 max_turns = 20
 
+# Apps que el patrón puede abrir por nombre (open_app). Edítalas para tu entorno
+# (Hyprland): clave = lista de argumentos del comando. El 'terminal' se AUTODETECTA
+# (kitty/foot/alacritty/...) si no lo defines aquí; el explorador de archivos también
+# puedes cablearlo en 'archivos'.
+[apps]
+opera         = ["flatpak", "run", "com.opera.opera-gx"]
+"opera gx"    = ["flatpak", "run", "com.opera.opera-gx"]
+blender       = ["blender"]
+vscode        = ["code"]
+geany         = ["geany"]
+libreoffice   = ["libreoffice"]
+calculadora   = ["gnome-calculator"]
+archivos      = ["nautilus"]
+
 [voice]
 # I3: 'base' es casi igual que 'small' en español y mucho más rápido en CPU.
 whisper_model      = "base"

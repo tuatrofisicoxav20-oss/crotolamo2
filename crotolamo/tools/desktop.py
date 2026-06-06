@@ -92,6 +92,60 @@ def run_detached(args: list[str]) -> None:
     )
 
 
+# M3: el patrón usa Hyprland (Wayland), no GNOME. Detectamos el terminal instalado
+# en vez de asumir gnome-terminal. Orden: terminales de tiling primero.
+_TERMINALS = ("kitty", "foot", "alacritty", "wezterm", "gnome-terminal", "konsole", "xterm")
+
+
+def _detect_terminal() -> list[str] | None:
+    for term in _TERMINALS:
+        if shutil.which(term):
+            return [term]
+    return None
+
+
+def terminal_exec(command: str) -> list[str] | None:
+    """Argv para correr `bash -lc command` en el terminal detectado.
+
+    La sintaxis para ejecutar un comando varía entre terminales (--, -e, start --);
+    aquí se normaliza. Devuelve None si no hay terminal instalado.
+    """
+    term = _detect_terminal()
+    if term is None:
+        return None
+    name = term[0]
+    inner = ["bash", "-lc", command]
+    if name == "gnome-terminal":
+        return [name, "--", *inner]
+    if name == "wezterm":
+        return [name, "start", "--", *inner]
+    if name in ("alacritty", "konsole", "xterm"):
+        return [name, "-e", *inner]
+    # kitty, foot: ejecutan los args directamente.
+    return [name, *inner]
+
+
+def _config_apps() -> dict[str, list[str]]:
+    """Apps definidas por el patrón en [apps] de la config (clave -> lista de args).
+
+    Permite a Emiliano cablear sus apps de Hyprland sin tocar código (M3). Se
+    superponen sobre APP_COMMANDS (defaults).
+    """
+    try:
+        from crotolamo.settings import get_settings
+
+        raw = get_settings().raw.get("apps", {})
+    except Exception:
+        return {}
+    apps: dict[str, list[str]] = {}
+    for name, cmd in raw.items():
+        if isinstance(cmd, str):
+            apps[normalize_key(name)] = cmd.split()
+        elif isinstance(cmd, list):
+            apps[normalize_key(name)] = [str(x) for x in cmd]
+    return apps
+
+
 def _open_local_browser(url: str) -> str:
     if shutil.which("flatpak"):
         try:
@@ -133,11 +187,23 @@ def open_app(name: str) -> str:
         name: nombre de la app.
     """
     key = normalize_key(name)
-    if key not in APP_COMMANDS:
-        disponibles = ", ".join(sorted(APP_COMMANDS))
+    config_apps = _config_apps()
+
+    # Precedencia: config del patrón > terminal detectado > defaults APP_COMMANDS.
+    if key in config_apps:
+        candidates = [config_apps[key]]
+    elif key == "terminal":
+        term = _detect_terminal()
+        if term is None:
+            return "No encontré ningún terminal instalado, patrón. Cablea uno en [apps]."
+        candidates = [term]
+    elif key in APP_COMMANDS:
+        candidates = APP_COMMANDS[key]
+    else:
+        disponibles = ", ".join(sorted(set(APP_COMMANDS) | set(config_apps)))
         return f"No tengo registrada la app '{name}', patrón. Conozco: {disponibles}."
 
-    for args in APP_COMMANDS[key]:
+    for args in candidates:
         try:
             run_detached(args)
             return f"{funny_line()}\nAbrí {name}, patrón."

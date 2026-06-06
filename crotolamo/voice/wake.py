@@ -17,17 +17,27 @@ from typing import Iterable
 
 WAKE_TARGET = "crotolamo"
 
-WAKE_VARIANTS = [
-    "crotolamo", "crótolamo", "coto y amo", "coto lamo", "coto amo",
-    "croto lamo", "croto el amo", "corto lamo", "corto la mano", "crotolo amo",
-    "control amo", "contro lamo", "cuatro lamo", "proto lamo", "troto lamo",
-    "cróto lamo",
-]
+# Fallback MÍNIMO. La fuente real de variantes es la config ([wake].variants);
+# WAKE_VARIANTS solo se usa si la config no está disponible (M5: una sola fuente).
+WAKE_VARIANTS = ["crotolamo", "croto lamo", "coto y amo", "control amo"]
 
 CONFIRM_VARIANTS = ["sí", "si", "confirmo", "ejecuta", "dale", "hazlo", "va", "correcto"]
 CANCEL_VARIANTS = ["no", "cancela", "cancelar", "nel", "no lo hagas"]
 
 DEFAULT_THRESHOLD = 0.67
+
+
+def _default_variants() -> list[str]:
+    """Variantes por defecto desde la config ([wake].variants); WAKE_VARIANTS de fallback."""
+    try:
+        from crotolamo.settings import get_settings
+
+        variants = get_settings().wake.get("variants")
+        if variants:
+            return list(variants)
+    except Exception:
+        pass
+    return WAKE_VARIANTS
 
 
 def normalize_for_wake(text: str) -> str:
@@ -50,7 +60,7 @@ def similarity(a: str, b: str) -> float:
 
 def wake_score(text: str, variants: Iterable[str] | None = None) -> tuple[float, str]:
     """Devuelve qué tan parecido fue lo escuchado a 'crotolamo'."""
-    variant_list = list(variants) if variants is not None else WAKE_VARIANTS
+    variant_list = list(variants) if variants is not None else _default_variants()
     comp = compact(normalize_for_wake(text))
     candidates = [compact(WAKE_TARGET)] + [compact(v) for v in variant_list]
 
@@ -78,7 +88,7 @@ def wake_score(text: str, variants: Iterable[str] | None = None) -> tuple[float,
 
 def is_wake_word(text: str, threshold: float = DEFAULT_THRESHOLD,
                  variants: Iterable[str] | None = None) -> bool:
-    variant_list = list(variants) if variants is not None else WAKE_VARIANTS
+    variant_list = list(variants) if variants is not None else _default_variants()
     norm = normalize_for_wake(text)
     for variant in variant_list:
         if normalize_for_wake(variant) in norm:
@@ -89,7 +99,7 @@ def is_wake_word(text: str, threshold: float = DEFAULT_THRESHOLD,
 
 def strip_wake_word(text: str, variants: Iterable[str] | None = None) -> str:
     """Quita la palabra de activación para dejar solo la orden."""
-    variant_list = list(variants) if variants is not None else WAKE_VARIANTS
+    variant_list = list(variants) if variants is not None else _default_variants()
     original = text.strip()
     lower = normalize_for_wake(original)
 
