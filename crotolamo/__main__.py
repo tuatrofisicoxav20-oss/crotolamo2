@@ -15,6 +15,9 @@ from crotolamo import __version__
 
 
 def main(argv: list[str] | None = None) -> int:
+    from crotolamo.logging_setup import setup_logging
+
+    setup_logging()
     argv = list(sys.argv[1:] if argv is None else argv)
 
     if not argv or argv[0] in {"--version", "-v", "version"}:

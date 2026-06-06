@@ -10,7 +10,10 @@ import re
 from typing import Any, Callable
 
 from crotolamo.core.llm import LLMClient, LLMError
+from crotolamo.logging_setup import get_logger
 from crotolamo.core.memory import Conversation
+
+log = get_logger("core.agent")
 
 
 def _coerce_text_tool_calls(content: str, known_names: set[str]) -> list[dict[str, Any]]:
@@ -157,7 +160,7 @@ class ToolAgent(Agent):
             try:
                 value = hook(value)
             except Exception as error:  # noqa: BLE001 - un hook roto no mata el turno
-                print(f"[hook falló: {error}]")
+                log.warning("hook falló: %s", error)
         return value
 
     def handle_turn(self, text: str, on_token=None) -> str:

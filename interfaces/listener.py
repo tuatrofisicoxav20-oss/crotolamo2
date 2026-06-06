@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import time
 
+from crotolamo.logging_setup import get_logger
 from crotolamo.settings import get_settings
 from crotolamo.voice import wake
 from crotolamo.voice.stt import STT, VoiceUnavailable
@@ -18,6 +19,8 @@ from crotolamo.voice.tts import TTS
 from crotolamo.voice.wakeword import WakeWordDetector
 
 from interfaces.shell import build_agent
+
+log = get_logger("listener")
 
 
 def run_listen(argv: list[str] | None = None) -> int:
@@ -42,7 +45,7 @@ def run_listen(argv: list[str] | None = None) -> int:
         try:
             tts.speak(text)
         except Exception as error:  # noqa: BLE001
-            print(f"[voz falló: {error}]", flush=True)
+            log.warning("voz falló: %s", error)
 
     def voice_confirm(reason: str) -> bool:
         say(reason + " Di 'confirmo' o 'cancela', patrón.")
@@ -104,7 +107,7 @@ def run_listen(argv: list[str] | None = None) -> int:
             try:
                 tts.speak_sentences(reply)  # Fase 6: TTS por frases
             except Exception as error:  # noqa: BLE001
-                print(f"[voz falló: {error}]", flush=True)
+                log.warning("voz falló: %s", error)
             time.sleep(0.5)
 
         except KeyboardInterrupt:

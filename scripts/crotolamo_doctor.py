@@ -202,7 +202,16 @@ def collect_checks() -> list[Check]:
 
 
 def run_doctor() -> int:
+    from crotolamo.logging_setup import get_logger, setup_logging
+
+    setup_logging()
+    log = get_logger("doctor")
+
     checks = collect_checks()
+    log.info("doctor: %d checks evaluados", len(checks))
+    for c in checks:
+        log.debug("check %-14s ok=%s :: %s", c.name, c.ok, c.detail)
+
     print("Doctor de Crotolamo 2\n" + "=" * 40)
 
     # Distinguimos checks obligatorios de opcionales para el código de salida.

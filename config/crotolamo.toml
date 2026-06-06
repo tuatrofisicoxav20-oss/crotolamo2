@@ -30,6 +30,10 @@ allowed_roots = [
 crotolamo  = "~/Documentos/crotolamo2"
 huevonitis = "~/Documentos/huevonitis 4"
 
+[logging]
+# Nivel de log de diagnóstico (DEBUG/INFO/WARNING/ERROR). La env CROTOLAMO_LOG manda.
+level = "INFO"
+
 [llm]
 host        = "http://localhost:11434"
 model       = "qwen2.5-coder:7b"

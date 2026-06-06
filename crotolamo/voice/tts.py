@@ -19,6 +19,10 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from crotolamo.logging_setup import get_logger
+
+log = get_logger("voice.tts")
+
 
 def split_sentences(text: str) -> list[str]:
     """Parte el texto en frases para hablarlas una por una (Fase 6, TTS por frases)."""
@@ -78,13 +82,13 @@ class TTS:
         try:
             import sounddevice as sd
         except ImportError:
-            print("[voz desactivada: falta sounddevice. Instala con pip install -e '.[voice]']")
+            log.warning("falta sounddevice; voz desactivada")
             return
 
         try:
             audio, sample_rate = self.synthesize_pcm(text)
         except Exception as error:  # noqa: BLE001 - una voz rota no debe matar el agente
-            print(f"[error sintetizando con Piper: {error}]")
+            log.warning("error sintetizando con Piper: %s", error)
             return
 
         if audio.size == 0:
@@ -93,7 +97,7 @@ class TTS:
             sd.play(audio, samplerate=sample_rate)
             sd.wait()
         except Exception as error:  # noqa: BLE001 - p.ej. sin dispositivo de audio en headless
-            print(f"[no pude reproducir el audio, patrón: {error}]")
+            log.warning("no pude reproducir el audio: %s", error)
 
     def speak_sentences(self, text: str) -> None:
         """Habla el texto frase por frase. Ya NO recarga el modelo: _get_voice() lo cachea."""

@@ -14,7 +14,10 @@ import tempfile
 import wave
 from pathlib import Path
 
+from crotolamo.logging_setup import get_logger
 from crotolamo.voice.normalize import normalize_text
+
+log = get_logger("voice.stt")
 
 _INITIAL_PROMPT = (
     "Comandos de voz en español mexicano para un asistente llamado Crotolamo. "
@@ -67,7 +70,7 @@ class STT:
     def _get_model(self):
         if self.model_size not in _models:
             faster_whisper = _require("faster_whisper")
-            print(f"Cargando Whisper '{self.model_size}', patrón. La primera vez tarda...")
+            log.info("Cargando Whisper '%s' (la primera vez tarda)", self.model_size)
             _models[self.model_size] = faster_whisper.WhisperModel(
                 self.model_size, device="cpu", compute_type="int8"
             )
@@ -100,7 +103,7 @@ class STT:
             except VoiceUnavailable:
                 raise
             except Exception as error:  # noqa: BLE001 - si silero falla, caemos a energía
-                print(f"[VAD silero falló ({error}); uso energía]")
+                log.warning("VAD silero falló (%s); uso energía", error)
         return self._record_energy(silence_ms, max_seconds, start_timeout_s)
 
     def _frames_to_wav(self, frames: list) -> Path:

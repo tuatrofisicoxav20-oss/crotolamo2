@@ -19,7 +19,10 @@ from __future__ import annotations
 import threading
 from queue import Empty, Queue
 
+from crotolamo.logging_setup import get_logger
 from crotolamo.voice.tts import split_sentences
+
+log = get_logger("voice.loop")
 
 
 class VoiceLoop:
@@ -105,7 +108,7 @@ class VoiceLoop:
                 if command.strip():
                     self.command_queue.put(command)
             except Exception as error:  # noqa: BLE001 - un fallo de mic no mata el loop
-                print(f"[escucha: {error}]")
+                log.warning("escucha: %s", error)
 
     # --- ciclo de vida ---
     def start(self) -> None:
