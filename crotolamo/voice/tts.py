@@ -17,6 +17,7 @@ importa sin la extra [voice].
 from __future__ import annotations
 
 import re
+import threading
 from pathlib import Path
 
 from crotolamo.logging_setup import get_logger
@@ -37,6 +38,7 @@ class TTS:
     def __init__(self, voice_model: Path) -> None:
         self.voice_model = Path(voice_model)
         self._voice = None  # PiperVoice perezoso, cargado una sola vez
+        self._stop_flag = threading.Event()  # M3.1: señal de corte thread-safe
 
     @classmethod
     def from_settings(cls, settings) -> "TTS":
@@ -79,9 +81,9 @@ class TTS:
             print(f"[voz desactivada: no encuentro {self.voice_model}]")
             return
 
-        try:
-            import sounddevice as sd
-        except ImportError:
+        import importlib.util
+
+        if importlib.util.find_spec("sounddevice") is None:
             log.warning("falta sounddevice; voz desactivada")
             return
 
@@ -94,10 +96,27 @@ class TTS:
         if audio.size == 0:
             return
         try:
-            sd.play(audio, samplerate=sample_rate)
-            sd.wait()
+            self._play_interruptible(audio, sample_rate)
         except Exception as error:  # noqa: BLE001 - p.ej. sin dispositivo de audio en headless
             log.warning("no pude reproducir el audio: %s", error)
+
+    def _play_interruptible(self, audio, sample_rate: int) -> bool:
+        """Reproduce vigilando el stop en pasos cortos (sd.wait() no es interrumpible).
+
+        Devuelve False si se cortó a media frase (M3.1).
+        """
+        import sounddevice as sd
+
+        self._stop_flag.clear()
+        sd.play(audio, samplerate=sample_rate)
+        stream = sd.get_stream()
+        while stream is not None and stream.active:
+            if self._stop_flag.is_set():
+                sd.stop()
+                return False
+            sd.sleep(20)  # ms
+            stream = sd.get_stream()
+        return not self._stop_flag.is_set()
 
     def speak_sentences(self, text: str) -> None:
         """Habla el texto frase por frase. Ya NO recarga el modelo: _get_voice() lo cachea."""
@@ -105,7 +124,8 @@ class TTS:
             self.speak(sentence)
 
     def stop(self) -> None:
-        """Corta la reproducción en curso (barge-in, M3). No-op si no hay audio."""
+        """Corta cualquier reproducción en curso (thread-safe, M3.1)."""
+        self._stop_flag.set()
         try:
             import sounddevice as sd
 
