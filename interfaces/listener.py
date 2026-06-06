@@ -63,13 +63,18 @@ def run_listen(argv: list[str] | None = None) -> int:
         print(f"No pude armar el agente, patrón: {error}")
         return 1
 
-    # M3: por defecto, loop concurrente con barge-in. --simple = modo secuencial viejo.
-    simple = "--simple" in (argv or [])
+    # M3: por defecto, loop concurrente. --simple = modo secuencial viejo (fallback).
+    # Barge-in conservador: half-duplex por defecto; --barge-in lo activa (auriculares).
+    argv = argv or []
+    simple = "--simple" in argv
+    allow_barge_in = ("--barge-in" in argv) and ("--no-barge-in" not in argv)
     if not simple and use_oww:
         from crotolamo.voice.loop import VoiceLoop
 
-        say("Crotolamo escuchando, patrón. (loop concurrente, interrumpible)")
-        VoiceLoop(agent, stt, tts, wake_detector, silence_ms=silence_ms).run_forever()
+        modo_bi = "barge-in (auriculares)" if allow_barge_in else "half-duplex"
+        say(f"Crotolamo escuchando, patrón. (concurrente, {modo_bi})")
+        VoiceLoop(agent, stt, tts, wake_detector,
+                  allow_barge_in=allow_barge_in, silence_ms=silence_ms).run()
         return 0
 
     modo = "openWakeWord" if use_oww else "wake difuso (Whisper)"

@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from dataclasses import dataclass
+from typing import Any
 
 from crotolamo.logging_setup import get_logger
 from crotolamo.voice.state import Mode, SharedState
@@ -198,6 +200,7 @@ class EarThread(threading.Thread):
         while not self.shutdown.is_set():
             chunk = self.mic.read()
             if chunk is None:
+                time.sleep(0.005)  # sin audio ahora mismo: no hacer busy-spin
                 continue
             mode = self.state.get_mode()
 
@@ -224,3 +227,104 @@ class EarThread(threading.Thread):
                     self._turn = self.state.new_turn()  # invalida turnos viejos
                     self.state.set_mode(Mode.LISTENING)
                     self._start_command(preroll=[chunk])
+
+
+# --- adapters reales (solo en hardware; los tests inyectan fakes) ---
+class _RealMic:
+    """Micrófono real: InputStream de sounddevice abierto perezosamente."""
+
+    def __init__(self, sample_rate: int = 16000, frame: int = 512) -> None:
+        self.sample_rate = sample_rate
+        self.frame = frame
+        self._stream = None
+
+    def read(self):
+        import numpy as np
+        import sounddevice as sd
+
+        if self._stream is None:
+            self._stream = sd.InputStream(
+                samplerate=self.sample_rate, channels=1, dtype="float32"
+            )
+            self._stream.start()
+        block, _ = self._stream.read(self.frame)
+        return np.squeeze(block)
+
+    def close(self) -> None:
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._stream = None
+
+
+class _SileroVad:
+    """Adapter de Silero VAD (M2) como vad_fn(chunk) -> prob."""
+
+    def __init__(self, sample_rate: int = 16000) -> None:
+        self.sample_rate = sample_rate
+        self._model: Any = None
+
+    def __call__(self, chunk) -> float:
+        import numpy as np
+        import torch
+        from silero_vad import load_silero_vad
+
+        if self._model is None:
+            self._model = load_silero_vad(onnx=True)
+        arr = np.asarray(chunk, dtype=np.float32)
+        return float(self._model(torch.from_numpy(arr.copy()), self.sample_rate))
+
+
+class VoiceLoop:
+    """Orquestador: arma los 4 threads y los apaga limpio (M3.7)."""
+
+    def __init__(self, agent, stt, tts, wake_detector, *, allow_barge_in: bool = False,
+                 silence_ms: int = 640, mic=None, wake_fn=None, vad_fn=None,
+                 to_wav=None) -> None:
+        self.state = SharedState()
+        self.shutdown = threading.Event()
+        self.stt_q: queue.Queue = queue.Queue()
+        self.cmd_q: queue.Queue = queue.Queue()
+        self.tts_q: queue.Queue = queue.Queue()
+        self.tts = tts
+        # Adapters reales por defecto; los tests inyectan fakes (no abre audio).
+        self._mic = mic or _RealMic()
+        ear = EarThread(
+            self._mic,
+            wake_fn or wake_detector.feed,
+            vad_fn or _SileroVad(),
+            to_wav or stt._frames_to_wav,
+            tts, self.stt_q, self.tts_q, self.state, self.shutdown,
+            allow_barge_in=allow_barge_in, silence_ms=silence_ms,
+        )
+        self.threads = [
+            ear,
+            SttThread(stt, self.stt_q, self.cmd_q, self.state, self.shutdown),
+            BrainThread(agent, self.cmd_q, self.tts_q, self.state, self.shutdown),
+            MouthThread(tts, self.tts_q, self.state, self.shutdown),
+        ]
+
+    def start(self) -> None:
+        for t in self.threads:
+            t.start()
+
+    def run(self) -> None:
+        self.start()
+        try:
+            while not self.shutdown.is_set():
+                self.shutdown.wait(0.3)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.stop()
+
+    def stop(self) -> None:
+        self.shutdown.set()                       # 1) avisar a todos
+        self.tts.stop()                           # 2) cortar audio en curso
+        if hasattr(self._mic, "close"):
+            self._mic.close()
+        for t in self.threads:                    # 3) esperar (todos miran shutdown)
+            t.join(timeout=2.0)

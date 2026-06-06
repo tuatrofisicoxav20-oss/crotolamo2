@@ -73,6 +73,19 @@ class WakeWordDetector:
         except ImportError:
             return False
 
+    def feed(self, chunk) -> bool:
+        """Alimenta un chunk al detector y devuelve True si supera el umbral (M3.6).
+
+        openWakeWord espera int16; convertimos si llega en float.
+        """
+        np = _require("numpy")
+        model = self._get_model()
+        arr = np.asarray(chunk)
+        if arr.dtype != np.int16:
+            arr = (arr * 32767).astype(np.int16)
+        scores = model.predict(arr)
+        return bool(scores and max(scores.values()) >= self.threshold)
+
     def listen_for_wake(self, timeout_s: float | None = None) -> bool:
         """Escucha el micrófono y devuelve True al detectar la palabra de activación.
 

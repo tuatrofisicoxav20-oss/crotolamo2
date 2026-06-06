@@ -17,6 +17,7 @@ from crotolamo.voice.loop import (
     MouthThread,
     SttThread,
     Utterance,
+    VoiceLoop,
 )
 from crotolamo.voice.state import Mode, SharedState
 
@@ -295,3 +296,17 @@ def test_ear_no_barge_in_when_disabled():
     finally:
         shutdown.set()
         ear.join(timeout=2.0)
+
+
+# --- M3.7: orquestador VoiceLoop (todos los componentes fake) ---
+def test_loop_starts_and_stops():
+    vl = VoiceLoop(
+        FakeAgent("hola, patrón."), FakeStt(), FakeTts(), None,
+        mic=FakeMic([]), wake_fn=lambda c: False,
+        vad_fn=lambda c: 0.0, to_wav=lambda f: _NO_WAV,
+    )
+    vl.start()
+    time.sleep(0.2)
+    vl.stop()
+    # Si algún thread no respeta shutdown, esto los caza (deadlock de apagado).
+    assert all(not t.is_alive() for t in vl.threads)
