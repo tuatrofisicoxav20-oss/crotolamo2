@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import inspect
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, get_type_hints
 
 # Mapeo de tipos Python -> tipos JSON-schema.

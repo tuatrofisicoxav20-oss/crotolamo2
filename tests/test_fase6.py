@@ -121,7 +121,7 @@ def test_send_hotkey_marked_unsafe():
 
 
 # --- búsqueda en proyecto ---
-def test_find_in_project_finds_symbol():
+def test_find_in_project_finds_symbol(fake_project):
     from crotolamo.tools import projects
 
     out = projects.find_in_project("crotolamo", "class ToolAgent")

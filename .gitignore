@@ -5,6 +5,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
+*.egg-info/
 
 # Artefactos de voz / modelos pesados
 *.onnx

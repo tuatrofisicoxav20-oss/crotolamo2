@@ -161,7 +161,7 @@ def search_files(query: str) -> str:
         return f"No encontré archivos con «{query}», patrón."
     shown = lines[:20]
     extra = f"\n...y {len(lines) - 20} más." if len(lines) > 20 else ""
-    return f"Encontré esto, patrón:\n" + "\n".join(shown) + extra
+    return "Encontré esto, patrón:\n" + "\n".join(shown) + extra
 
 
 @tool
