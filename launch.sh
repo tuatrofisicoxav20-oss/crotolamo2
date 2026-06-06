@@ -22,7 +22,7 @@ run() { echo "→ $PY -m crotolamo $*"; echo; "$PY" -m crotolamo "$@"; }
 case "${1:-}" in
     version) run --version ;;
     doctor)  run doctor ;;
-    shell)   run shell ;;
+    shell)   shift; run shell --stream "$@" ;;  # streaming: tokens en vivo
     listen)  shift; run listen "$@" ;;
     smoke)   echo "→ smoke de voz (TTS↔STT, sin micrófono)"; echo; "$PY" scripts/smoke_voz.py ;;
     "")
@@ -31,7 +31,7 @@ case "${1:-}" in
             echo "  Crotolamo 2  —  ¿qué probamos, patrón?"
             echo "=========================================="
             echo "  1) Doctor (chequeo de salud)"
-            echo "  2) Shell de texto (conversar + tools)"
+            echo "  2) Shell de texto (conversar + tools, streaming)"
             echo "  3) Voz — half-duplex (seguro)"
             echo "  4) Voz — barge-in (con auriculares)"
             echo "  5) Voz — modo simple (fallback)"
@@ -43,7 +43,7 @@ case "${1:-}" in
             echo
             case "$opt" in
                 1) run doctor ;;
-                2) run shell ;;
+                2) run shell --stream ;;
                 3) run listen --no-barge-in ;;
                 4) run listen --barge-in ;;
                 5) run listen --simple ;;
