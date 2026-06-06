@@ -41,8 +41,15 @@ por git) con solo las claves que quieras cambiar.
 - [x] **Fase 2** — tool-calling: el loop agéntico + tools de desktop/search seguras
 - [x] **Fase 3** — tools que leen/razonan sobre proyectos + archivos seguros
 - [x] **Fase 4** — memoria persistente (SQLite)
-- [x] **Fase 5** — voz (VAD real, latencia) sobre el agente nuevo
+- [x] **Fase 5** — voz: implementada y verificada por **smoke test circular** (`scripts/smoke_voz.py`: TTS→STT sin micrófono); falta validación de campo con micrófono real.
 - [x] **Fase 6** — extensiones: streaming token-a-token, TTS por frases, memoria fuzzy, búsqueda en proyectos, hotkeys
+
+### Notas de voz (honestas)
+- El **wake word** usa Whisper `tiny` (barato) y el **comando** usa `base`; ambos en CPU.
+- La **latencia depende del CPU**: en un i5 sin GPU, el smoke (TTS+STT de una frase) ronda
+  los ~12 s en frío (incluye carga de modelos); en caliente baja. Con GPU sería fluido.
+- La reproducción usa `sounddevice` (no ffplay). Requiere `portaudio` en el sistema.
+- Lo único no probado de forma automática es la captura por **micrófono real** (`--mic`).
 
 ## Procedencia (qué se migró de Crotolamo 1)
 

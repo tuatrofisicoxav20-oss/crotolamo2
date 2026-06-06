@@ -131,9 +131,10 @@ def collect_checks() -> list[Check]:
             )
         )
 
-    # Deps de voz (opcional, extra [voice]).
+    # Deps de voz (opcional, extra [voice]). La reproducción usa sounddevice
+    # (no ffplay), así que portaudio es lo que de verdad hace falta.
     missing_voice = []
-    for mod in ("faster_whisper", "sounddevice", "numpy", "piper"):
+    for mod in ("faster_whisper", "sounddevice", "numpy"):
         try:
             __import__(mod)
         except ImportError:
@@ -142,10 +143,38 @@ def collect_checks() -> list[Check]:
         Check(
             "voz-deps",
             not missing_voice,
-            "deps de voz importables" if not missing_voice else f"faltan: {', '.join(missing_voice)} (opcional hasta usar voz)",
+            "faster-whisper/sounddevice/numpy importables" if not missing_voice
+            else f"faltan: {', '.join(missing_voice)} (opcional hasta usar voz)",
             "Instala la voz: pip install -e '.[voice]'.",
         )
     )
+
+    # Piper como librería persistente (la API real que usa tts.py).
+    try:
+        from piper import PiperVoice  # noqa: F401
+
+        piper_ok, piper_detail = True, "piper (PiperVoice) importable"
+    except ImportError:
+        piper_ok, piper_detail = False, "falta piper (from piper import PiperVoice)"
+    checks.append(
+        Check("voz-piper-lib", piper_ok, piper_detail,
+              "Instala piper: pip install -e '.[voice]'.")
+    )
+
+    # portaudio: sin él, sounddevice no reproduce ni graba. Lo sondeamos vía sounddevice.
+    if "sounddevice" not in missing_voice:
+        try:
+            import sounddevice as _sd
+
+            _sd.query_devices()
+            portaudio_ok, portaudio_detail = True, "portaudio OK (sounddevice ve dispositivos)"
+        except Exception as error:  # noqa: BLE001
+            portaudio_ok = False
+            portaudio_detail = f"sounddevice no consultó dispositivos: {error}"
+        checks.append(
+            Check("portaudio", portaudio_ok, portaudio_detail,
+                  "Instala portaudio: sudo dnf install -y portaudio.")
+        )
 
     # Entorno Wayland / ydotool (opcional, para control de ventanas futuro).
     has_ydotool = shutil.which("ydotool") is not None
@@ -177,7 +206,7 @@ def run_doctor() -> int:
     print("Doctor de Crotolamo 2\n" + "=" * 40)
 
     # Distinguimos checks obligatorios de opcionales para el código de salida.
-    optional = {"voz-piper", "voz-deps", "ydotool"}
+    optional = {"voz-piper", "voz-deps", "voz-piper-lib", "portaudio", "ydotool"}
     hard_fail = False
 
     for c in checks:
