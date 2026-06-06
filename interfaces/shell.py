@@ -23,13 +23,9 @@ def build_agent(confirm_fn=None) -> tuple[Agent, Conversation]:
     pide confirmación para tools inseguras (texto o voz).
     """
     settings = get_settings()
-    # Fase 4: arrancar "sabiendo quién es el patrón" — inyectamos los hechos.
-    try:
-        contexto = facts.facts_context()
-    except Exception:
-        contexto = ""
+    # M4.2: los hechos ya NO se inyectan en el system prompt aquí, sino vía pre-hook.
     conversation = Conversation(
-        system_prompt(contexto),
+        system_prompt(),
         max_turns=settings.memory.get("max_turns", 20),
     )
     llm = LLMClient.from_settings(settings)
@@ -37,6 +33,7 @@ def build_agent(confirm_fn=None) -> tuple[Agent, Conversation]:
     # La Fase 2 cablea el registry de tools; si está disponible, lo usamos.
     try:
         from crotolamo.core.agent import ToolAgent  # type: ignore
+        from crotolamo.core.hooks import datetime_prehook, make_facts_prehook
         from crotolamo.tools import default_registry
         from crotolamo.safety.guard import Guard
 
@@ -47,6 +44,7 @@ def build_agent(confirm_fn=None) -> tuple[Agent, Conversation]:
             guard=Guard.from_settings(settings),
             max_iterations=settings.llm.get("max_iterations", 6),
             confirm_fn=confirm_fn or _text_confirm,
+            pre_hooks=[make_facts_prehook(), datetime_prehook],
         )
     except Exception:
         agent = Agent(llm, conversation)

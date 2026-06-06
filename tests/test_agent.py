@@ -31,7 +31,8 @@ def _tool_call(name, **args):
     return {"name": name, "arguments": args}
 
 
-def _make_agent(responses, allowed_roots=None, confirm_fn=None):
+def _make_agent(responses, allowed_roots=None, confirm_fn=None,
+                pre_hooks=None, post_hooks=None):
     conv = Conversation("SYS")
     guard = Guard(allowed_roots=allowed_roots or [])
     return ToolAgent(
@@ -41,7 +42,40 @@ def _make_agent(responses, allowed_roots=None, confirm_fn=None):
         guard=guard,
         max_iterations=6,
         confirm_fn=confirm_fn,
+        pre_hooks=pre_hooks,
+        post_hooks=post_hooks,
     ), conv
+
+
+def test_pre_and_post_hooks_applied_in_order():
+    order = []
+
+    def pre1(t):
+        order.append("pre1")
+        return t + " A"
+
+    def pre2(t):
+        order.append("pre2")
+        return t + " B"
+
+    def post1(r):
+        order.append("post1")
+        return r + " X"
+
+    def post2(r):
+        order.append("post2")
+        return r + " Y"
+
+    agent, conv = _make_agent(
+        [ChatResponse(content="reply")],
+        pre_hooks=[pre1, pre2], post_hooks=[post1, post2],
+    )
+    out = agent.handle_turn("hi")
+    assert order == ["pre1", "pre2", "post1", "post2"]
+    assert out == "reply X Y"
+    # El mensaje de usuario llevó los pre-hooks aplicados.
+    user_msgs = [m for m in conv.history if m.role == "user"]
+    assert user_msgs[0].content == "hi A B"
 
 
 def test_single_tool_then_final_answer():

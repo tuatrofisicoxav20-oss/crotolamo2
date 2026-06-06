@@ -126,12 +126,18 @@ class ToolAgent(Agent):
         guard,
         max_iterations: int = 6,
         confirm_fn: ConfirmFn | None = None,
+        pre_hooks: list[Callable[[str], str]] | None = None,
+        post_hooks: list[Callable[[str], str]] | None = None,
     ) -> None:
         super().__init__(llm, conversation)
         self.registry = registry
         self.guard = guard
         self.max_iterations = max_iterations
         self.confirm_fn = confirm_fn or _deny
+        # M4 (de Open WebUI pipelines): hooks que enriquecen la entrada (pre) y
+        # limpian/transforman la respuesta final (post). Se aplican en orden.
+        self.pre_hooks = pre_hooks or []
+        self.post_hooks = post_hooks or []
 
     def _execute_call(self, name: str, arguments: dict) -> str:
         tool = self.registry.get(name)
@@ -146,7 +152,17 @@ class ToolAgent(Agent):
 
         return self.registry.run(name, arguments)
 
+    def _apply(self, hooks, value: str) -> str:
+        for hook in hooks:
+            try:
+                value = hook(value)
+            except Exception as error:  # noqa: BLE001 - un hook roto no mata el turno
+                print(f"[hook falló: {error}]")
+        return value
+
     def handle_turn(self, text: str, on_token=None) -> str:
+        # M4: pre-hooks enriquecen la entrada antes de llegar al LLM.
+        text = self._apply(self.pre_hooks, text)
         self.conversation.add_user(text)
         schemas = self.registry.schemas()
         known = set(self.registry.names())
@@ -171,6 +187,8 @@ class ToolAgent(Agent):
 
             if not calls:
                 reply = response.content or "Listo, patrón."
+                # M4: post-hooks transforman/limpian la respuesta final.
+                reply = self._apply(self.post_hooks, reply)
                 # Si retuvimos por sospecha de tool-call pero era texto, lo soltamos ahora.
                 if streamer is not None:
                     streamer.flush_if_held(reply)
