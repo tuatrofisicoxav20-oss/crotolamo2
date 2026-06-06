@@ -1,0 +1,17 @@
+{
+  "id": "20260508_230349_crotolamo_plan",
+  "title": "Propuesta: limpiar estructura de crotolamo",
+  "project": "crotolamo",
+  "project_root": "/home/exitili/Documentos/chapi_assistant",
+  "created_at": "2026-05-08T23:03:49",
+  "status": "preview",
+  "objective": "limpiar estructura de crotolamo",
+  "changes": [],
+  "notes": [
+    "Propuesta sin cambios todavía.",
+    "Para cambio real usa: patch replace <archivo> ::: <actual> ::: <nuevo>",
+    "Entrypoints: core/chapi_shell.py, launch_orbital_ui.py, launch_runtime_shell.py, tools/crotolamo_context_cli.py, tools/crotolamo_memory_cli.py",
+    "Archivos candidatos: launch_runtime_shell.py, core/crotolamo_runtime.py, core/plugin_registry.py, plugins/__init__.py, plugins/base_plugin.py, plugins/context_plugin.py, plugins/fedora_actions.py, plugins/fedora_plugin.py"
+  ],
+  "diff": ""
+}

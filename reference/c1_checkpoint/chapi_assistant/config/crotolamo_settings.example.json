@@ -1,0 +1,13 @@
+{
+  "model": "qwen2.5-coder:7b",
+  "user_alias": "Caos Orbital",
+  "project_paths": {
+    "crotolamo": "~/Documentos/chapi_assistant",
+    "huevonitis": "~/Documentos/huevonitis version 2.1",
+    "tletl": "~/Documentos/tletl_control_v4_1_ai_integrado"
+  },
+  "execution": {
+    "timeout_seconds": 45,
+    "working_directory": "~/Documentos/chapi_assistant"
+  }
+}

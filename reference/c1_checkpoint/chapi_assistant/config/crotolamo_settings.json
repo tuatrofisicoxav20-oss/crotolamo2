@@ -1,0 +1,36 @@
+{
+  "model": "qwen2.5-coder:7b",
+  "user_alias": "Caos Orbital",
+  "project_paths": {
+    "crotolamo": "~/Documentos/chapi_assistant",
+    "huevonitis": "~/Documentos/huevonitis version 2.1",
+    "tletl": "~/Documentos/tletl_control_v4_1_ai_integrado"
+  },
+  "execution": {
+    "timeout_seconds": 45,
+    "working_directory": "~/Documentos/chapi_assistant"
+  },
+  "version": 8,
+  "ollama": {
+    "model": "qwen2.5-coder:7b",
+    "fallback_model": "llama3.2:latest",
+    "timeout_seconds": 30,
+    "use_context_engine": true
+  },
+  "runtime": {
+    "default_mode": "general",
+    "save_history": true,
+    "max_history_events_for_context": 8,
+    "max_notes_for_context": 8
+  },
+  "ui": {
+    "theme": "orbital-neon",
+    "show_context_panel": true,
+    "show_memes": true
+  },
+  "voice": {
+    "enabled_by_default": false,
+    "push_to_talk": true
+  },
+  "updated_at": "2026-05-08T02:11:13"
+}

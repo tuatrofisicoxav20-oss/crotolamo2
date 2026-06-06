@@ -1,0 +1,183 @@
+{
+  "project": "crotolamo",
+  "root": "/home/exitili/Documentos/chapi_assistant",
+  "created_at": "2026-05-08T23:04:23",
+  "total_python_files": 42,
+  "likely_entrypoints": [
+    "core/chapi_shell.py",
+    "launch_orbital_ui.py",
+    "launch_runtime_shell.py",
+    "tools/crotolamo_context_cli.py",
+    "tools/crotolamo_memory_cli.py",
+    "tools/crotolamo_project_index_cli.py",
+    "core/listener.py",
+    "core/voice_in.py",
+    "tools/check_orbital_connections.py",
+    "tools/crotolamo_doctor.py",
+    "ui/crotolamo_orbital_ui.py",
+    "core/ollama_client.py"
+  ],
+  "important_python_files": [
+    "launch_runtime_shell.py",
+    "core/crotolamo_runtime.py",
+    "core/plugin_registry.py",
+    "plugins/__init__.py",
+    "plugins/base_plugin.py",
+    "plugins/context_plugin.py",
+    "plugins/fedora_actions.py",
+    "plugins/fedora_plugin.py",
+    "plugins/general_actions.py",
+    "plugins/huevonitis_plugin.py",
+    "plugins/laboratory_plugin.py",
+    "plugins/memory_plugin.py",
+    "plugins/project_index_plugin.py",
+    "plugins/projects_plugin.py",
+    "plugins/school_plugin.py",
+    "plugins/tletl_plugin.py",
+    "tools/crotolamo_doctor.py",
+    "tools/crotolamo_doctor_v10_extra.py",
+    "tools/crotolamo_doctor_v7_extra.py",
+    "tools/crotolamo_doctor_v8_extra.py",
+    "launch_orbital_ui.py",
+    "core/chapi_shell.py",
+    "core/voice_in.py",
+    "core/voice_out.py",
+    "ui/__init__.py",
+    "ui/crotolamo_orbital_ui.py"
+  ],
+  "external_imports": [
+    "chapi_shell",
+    "command_safety",
+    "difflib",
+    "faster_whisper",
+    "numpy",
+    "plugin_registry",
+    "project_modes",
+    "shlex",
+    "skills",
+    "sounddevice",
+    "system_probe",
+    "unicodedata",
+    "voice_in",
+    "voice_out"
+  ],
+  "todo_hits": [
+    {
+      "file": "core/skills.py",
+      "line": 98,
+      "text": "\"xxx\","
+    },
+    {
+      "file": "core/skills.py",
+      "line": 101,
+      "text": "\"hackear contraseña\","
+    },
+    {
+      "file": "core/skills.py",
+      "line": 115,
+      "text": "\"Abriendo, patrón. Fedora sigue vivo, contra todo pronóstico.\","
+    },
+    {
+      "file": "core/command_safety.py",
+      "line": 104,
+      "text": "\"\"\"Carga config/security_policy.json si existe. Todo es opcional.\"\"\""
+    },
+    {
+      "file": "core/project_modes.py",
+      "line": 78,
+      "text": "\"No tocar todo el extractor a ciegas: aislar traceback, módulo y función.\","
+    },
+    {
+      "file": "config/crotolamo_modes.json",
+      "line": 42,
+      "text": "\"No tocar todo el extractor a ciegas: aislar traceback, módulo y función.\","
+    },
+    {
+      "file": "ui/crotolamo_orbital_ui.py",
+      "line": 379,
+      "text": "self._log(\"SISTEMA\", \"Crotolamo Orbital UI v6 cargado. Modos de proyecto y contexto local activados, porque responder todo en genérico era demasiado siglo pasado.\")"
+    },
+    {
+      "file": "ui/crotolamo_orbital_ui.py",
+      "line": 424,
+      "text": "meme_wall.create_text(130, 78, text=\"NO ES BUG\\nES FUNCIÓN\", fill=THEME.yellow, font=(\"JetBrains Mono\", 8, \"bold\"), anchor=\"center\")"
+    },
+    {
+      "file": "ui/crotolamo_orbital_ui.py",
+      "line": 461,
+      "text": "tk.Label(op.body, text=\"Hackeando el sistema\\ncomo si fuera un juego.\", bg=THEME.panel, fg=THEME.text, font=(\"JetBrains Mono\", 9), justify=\"left\").pack(anchor=\"w\")"
+    },
+    {
+      "file": "ui/crotolamo_orbital_ui.py",
+      "line": 469,
+      "text": "hacker = OrbitalPanel(left_stack, \"HACKER MODE\", accent=THEME.green)"
+    },
+    {
+      "file": "ui/crotolamo_orbital_ui.py",
+      "line": 470,
+      "text": "hacker.pack(fill=\"x\")"
+    },
+    {
+      "file": "ui/crotolamo_orbital_ui.py",
+      "line": 471,
+      "text": "hcan = tk.Canvas(hacker.body, width=270, height=118, bg=\"#03130a\", highlightthickness=0)"
+    },
+    {
+      "file": "ui/crotolamo_orbital_ui.py",
+      "line": 473,
+      "text": "self._draw_hacker_meme(hcan)"
+    },
+    {
+      "file": "ui/crotolamo_orbital_ui.py",
+      "line": 711,
+      "text": "def _draw_hacker_meme(self, c: tk.Canvas) -> None:"
+    },
+    {
+      "file": "ui/crotolamo_orbital_ui.py",
+      "line": 756,
+      "text": "c.create_text(80, 74, text=\"☆  λ  BUG\\nROMPER\\nPARA CREAR\", fill=\"#1a1712\", font=(\"JetBrains Mono\", 12, \"bold\"), anchor=\"center\")"
+    }
+  ],
+  "large_files": [],
+  "top_dirs": [
+    {
+      "dir": "core",
+      "files": 31
+    },
+    {
+      "dir": "plugins",
+      "files": 17
+    },
+    {
+      "dir": "tools",
+      "files": 10
+    },
+    {
+      "dir": ".",
+      "files": 7
+    },
+    {
+      "dir": "config",
+      "files": 7
+    },
+    {
+      "dir": "ui",
+      "files": 6
+    },
+    {
+      "dir": "data",
+      "files": 4
+    },
+    {
+      "dir": "voices",
+      "files": 1
+    }
+  ],
+  "warnings": [],
+  "recommendations": [
+    "Entrypoint más probable: `core/chapi_shell.py`. Úsalo como punto de prueba principal.",
+    "Genera o actualiza `requirements.txt` con las dependencias externas detectadas.",
+    "Hay TODO/FIXME/HACK pendientes. No todos son urgentes, pero conviene revisar los primeros antes de seguir metiendo features.",
+    "Siguiente paso sensato: correr inspección, elegir entrypoint principal y luego compilar solo archivos críticos."
+  ]
+}

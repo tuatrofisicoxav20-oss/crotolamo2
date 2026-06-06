@@ -1,0 +1,88 @@
+from pathlib import Path
+import tempfile
+
+import numpy as np
+import sounddevice as sd
+from scipy.io.wavfile import write
+from faster_whisper import WhisperModel
+
+
+SAMPLE_RATE = 16000
+SECONDS = 8
+MODEL_SIZE = "small"
+LANGUAGE = "es"
+
+_model = None
+
+
+def get_model() -> WhisperModel:
+    global _model
+
+    if _model is None:
+        print("Cargando modelo Whisper. La primera vez puede tardar, patrón...")
+        _model = WhisperModel(
+            MODEL_SIZE,
+            device="cpu",
+            compute_type="int8",
+        )
+
+    return _model
+
+
+def record_audio(seconds: int = SECONDS) -> Path:
+    print(f"Escuchando durante {seconds} segundos, patrón...")
+
+    audio = sd.rec(
+        int(seconds * SAMPLE_RATE),
+        samplerate=SAMPLE_RATE,
+        channels=1,
+        dtype="float32",
+    )
+
+    sd.wait()
+
+    audio = np.squeeze(audio)
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        path = Path(tmp.name)
+
+    audio_int16 = np.int16(audio * 32767)
+    write(path, SAMPLE_RATE, audio_int16)
+
+    return path
+
+
+def transcribe_audio(path: Path) -> str:
+    model = get_model()
+
+    segments, info = model.transcribe(
+        str(path),
+        language=LANGUAGE,
+        beam_size=5,
+        vad_filter=True,
+    )
+
+    text_parts = []
+
+    for segment in segments:
+        text_parts.append(segment.text.strip())
+
+    return " ".join(text_parts).strip()
+
+
+def listen_once(seconds: int = SECONDS) -> str:
+    path = record_audio(seconds)
+
+    try:
+        text = transcribe_audio(path)
+        return text
+    finally:
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    text = listen_once()
+    print(f"Transcripción: {text}")

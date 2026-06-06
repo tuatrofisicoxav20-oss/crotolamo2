@@ -1,0 +1,34 @@
+{
+  "version": 7,
+  "profile": {
+    "display_name": "Caos Orbital",
+    "assistant_name": "Crotolamo",
+    "tone": "directo, útil, con humor, sin dar la razón si no la tiene",
+    "default_mode": "general",
+    "preferred_model": "qwen2.5-coder:7b"
+  },
+  "preferences": {
+    "voice_enabled": false,
+    "confirm_risky_commands": true,
+    "save_history": true,
+    "show_memes": true,
+    "ui_theme": "orbital-neon"
+  },
+  "project_paths": {
+    "crotolamo": "~/Documentos/chapi_assistant",
+    "huevonitis": "~/Documentos/huevonitis version 2.1",
+    "tletl": "~/Documentos/tletl_control_v4_1_ai_integrado"
+  },
+  "aliases": {
+    "doctor": "accion general.doctor",
+    "diag": "accion general.doctor",
+    "huevo": "modo huevonitis",
+    "tletl": "modo tletl",
+    "fedora": "modo fedora",
+    "escuela": "modo escuela",
+    "lab": "modo laboratorio"
+  },
+  "notes": [],
+  "facts": {},
+  "updated_at": "2026-05-08T01:56:15"
+}

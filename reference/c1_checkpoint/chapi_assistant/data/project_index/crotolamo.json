@@ -1,0 +1,734 @@
+{
+  "name": "crotolamo",
+  "root": "/home/exitili/Documentos/chapi_assistant",
+  "created_at": "2026-05-08T02:31:50",
+  "total_files": 83,
+  "total_dirs": 13,
+  "indexed_files": [
+    {
+      "relpath": "install_ollama.sh",
+      "size": 15902,
+      "ext": ".sh",
+      "mtime": "2026-05-04T23:18:43",
+      "kind": "script",
+      "important": false
+    },
+    {
+      "relpath": "es_MX-ald-medium.onnx.json",
+      "size": 4878,
+      "ext": ".json",
+      "mtime": "2026-05-05T00:28:14",
+      "kind": "config",
+      "important": false
+    },
+    {
+      "relpath": "launch_orbital_ui.py",
+      "size": 80,
+      "ext": ".py",
+      "mtime": "2026-05-08T01:00:55",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "launch_orbital_ui.sh",
+      "size": 87,
+      "ext": ".sh",
+      "mtime": "2026-05-08T01:00:55",
+      "kind": "script",
+      "important": false
+    },
+    {
+      "relpath": "launch_runtime_shell.py",
+      "size": 2001,
+      "ext": ".py",
+      "mtime": "2026-05-08T01:14:34",
+      "kind": "python",
+      "important": true
+    },
+    {
+      "relpath": "run_runtime_doctor.sh",
+      "size": 92,
+      "ext": ".sh",
+      "mtime": "2026-05-08T00:50:16",
+      "kind": "script",
+      "important": true
+    },
+    {
+      "relpath": "launch_runtime_shell.py.bak_runtime_v3_20260508_005016",
+      "size": 1638,
+      "ext": ".bak_runtime_v3_20260508_005016",
+      "mtime": "2026-05-08T00:50:16",
+      "kind": "bak_runtime_v3_20260508_005016",
+      "important": true
+    },
+    {
+      "relpath": "core/chapi_shell.py",
+      "size": 8269,
+      "ext": ".py",
+      "mtime": "2026-05-08T02:06:36",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "core/chapi_shell.py.bak",
+      "size": 2580,
+      "ext": ".bak",
+      "mtime": "2026-05-05T00:31:28",
+      "kind": "bak",
+      "important": false
+    },
+    {
+      "relpath": "core/voice_out.py",
+      "size": 1228,
+      "ext": ".py",
+      "mtime": "2026-05-05T01:01:17",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "core/chapi_shell.py.bak_sin_voz",
+      "size": 5977,
+      "ext": ".bak_sin_voz",
+      "mtime": "2026-05-05T01:02:25",
+      "kind": "bak_sin_voz",
+      "important": false
+    },
+    {
+      "relpath": "core/chapi_shell.py.bak_funcionando",
+      "size": 5977,
+      "ext": ".bak_funcionando",
+      "mtime": "2026-05-05T01:06:38",
+      "kind": "bak_funcionando",
+      "important": false
+    },
+    {
+      "relpath": "core/voice_in.py",
+      "size": 4122,
+      "ext": ".py",
+      "mtime": "2026-05-08T00:55:27",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "core/chapi_shell.py.bak_oido",
+      "size": 6860,
+      "ext": ".bak_oido",
+      "mtime": "2026-05-05T01:15:18",
+      "kind": "bak_oido",
+      "important": false
+    },
+    {
+      "relpath": "core/chapi_shell.py.bak_antes_oido",
+      "size": 6860,
+      "ext": ".bak_antes_oido",
+      "mtime": "2026-05-05T01:16:39",
+      "kind": "bak_antes_oido",
+      "important": false
+    },
+    {
+      "relpath": "core/voice_in.py.bak_limpieza",
+      "size": 1755,
+      "ext": ".bak_limpieza",
+      "mtime": "2026-05-05T01:24:19",
+      "kind": "bak_limpieza",
+      "important": false
+    },
+    {
+      "relpath": "core/skills.py",
+      "size": 24495,
+      "ext": ".py",
+      "mtime": "2026-05-05T21:46:15",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "core/chapi_shell.py.bak_skills",
+      "size": 7467,
+      "ext": ".bak_skills",
+      "mtime": "2026-05-05T01:35:47",
+      "kind": "bak_skills",
+      "important": false
+    },
+    {
+      "relpath": "core/skills.py.bak_browser",
+      "size": 4827,
+      "ext": ".bak_browser",
+      "mtime": "2026-05-05T01:40:14",
+      "kind": "bak_browser",
+      "important": false
+    },
+    {
+      "relpath": "core/listener.py",
+      "size": 7494,
+      "ext": ".py",
+      "mtime": "2026-05-05T01:58:48",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "core/listener.py.bak_wake_v1",
+      "size": 4291,
+      "ext": ".bak_wake_v1",
+      "mtime": "2026-05-05T01:58:48",
+      "kind": "bak_wake_v1",
+      "important": false
+    },
+    {
+      "relpath": "core/skills.py.bak_skills_v2",
+      "size": 13341,
+      "ext": ".bak_skills_v2",
+      "mtime": "2026-05-05T12:45:09",
+      "kind": "bak_skills_v2",
+      "important": false
+    },
+    {
+      "relpath": "core/skills.py.bak_fix_spotify_tletl",
+      "size": 23908,
+      "ext": ".bak_fix_spotify_tletl",
+      "mtime": "2026-05-05T12:56:52",
+      "kind": "bak_fix_spotify_tletl",
+      "important": false
+    },
+    {
+      "relpath": "core/command_safety.py",
+      "size": 10565,
+      "ext": ".py",
+      "mtime": "2026-05-08T01:09:02",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "core/system_probe.py",
+      "size": 10486,
+      "ext": ".py",
+      "mtime": "2026-05-08T00:59:12",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "core/crotolamo_runtime.py",
+      "size": 30340,
+      "ext": ".py",
+      "mtime": "2026-05-08T02:30:40",
+      "kind": "python",
+      "important": true
+    },
+    {
+      "relpath": "core/command_safety.py.bak_runtime_v3_20260508_005016",
+      "size": 5387,
+      "ext": ".bak_runtime_v3_20260508_005016",
+      "mtime": "2026-05-08T00:50:16",
+      "kind": "bak_runtime_v3_20260508_005016",
+      "important": true
+    },
+    {
+      "relpath": "core/system_probe.py.bak_runtime_v3_20260508_005016",
+      "size": 4338,
+      "ext": ".bak_runtime_v3_20260508_005016",
+      "mtime": "2026-05-08T00:50:16",
+      "kind": "bak_runtime_v3_20260508_005016",
+      "important": true
+    },
+    {
+      "relpath": "core/crotolamo_runtime.py.bak_runtime_v3_20260508_005016",
+      "size": 15144,
+      "ext": ".bak_runtime_v3_20260508_005016",
+      "mtime": "2026-05-08T00:50:16",
+      "kind": "bak_runtime_v3_20260508_005016",
+      "important": true
+    },
+    {
+      "relpath": "core/voice_in.py.bak_no_scipy_20260508_005527",
+      "size": 3724,
+      "ext": ".bak_no_scipy_20260508_005527",
+      "mtime": "2026-05-08T00:55:27",
+      "kind": "bak_no_scipy_20260508_005527",
+      "important": false
+    },
+    {
+      "relpath": "core/project_modes.py",
+      "size": 14802,
+      "ext": ".py",
+      "mtime": "2026-05-08T01:08:50",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "core/plugin_registry.py",
+      "size": 8896,
+      "ext": ".py",
+      "mtime": "2026-05-08T01:13:53",
+      "kind": "python",
+      "important": true
+    },
+    {
+      "relpath": "core/local_memory.py",
+      "size": 8509,
+      "ext": ".py",
+      "mtime": "2026-05-08T07:52:42",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "core/session_history.py",
+      "size": 2457,
+      "ext": ".py",
+      "mtime": "2026-05-08T07:52:42",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "core/ollama_client.py",
+      "size": 2752,
+      "ext": ".py",
+      "mtime": "2026-05-08T08:04:40",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "core/config_manager.py",
+      "size": 6465,
+      "ext": ".py",
+      "mtime": "2026-05-08T08:08:44",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "core/context_engine.py",
+      "size": 8956,
+      "ext": ".py",
+      "mtime": "2026-05-08T08:08:44",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "core/project_indexer.py",
+      "size": 13777,
+      "ext": ".py",
+      "mtime": "2026-05-08T08:27:48",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "voices/es_MX-ald-medium.onnx.json",
+      "size": 4878,
+      "ext": ".json",
+      "mtime": "2026-05-05T01:00:41",
+      "kind": "config",
+      "important": false
+    },
+    {
+      "relpath": "config/crotolamo_settings.json",
+      "size": 892,
+      "ext": ".json",
+      "mtime": "2026-05-08T02:11:13",
+      "kind": "config",
+      "important": false
+    },
+    {
+      "relpath": "config/crotolamo_settings.example.json",
+      "size": 363,
+      "ext": ".json",
+      "mtime": "2026-05-08T00:50:16",
+      "kind": "config",
+      "important": false
+    },
+    {
+      "relpath": "config/security_policy.example.json",
+      "size": 253,
+      "ext": ".json",
+      "mtime": "2026-05-08T01:00:45",
+      "kind": "config",
+      "important": false
+    },
+    {
+      "relpath": "config/crotolamo_modes.json",
+      "size": 4746,
+      "ext": ".json",
+      "mtime": "2026-05-08T02:25:40",
+      "kind": "config",
+      "important": false
+    },
+    {
+      "relpath": "config/crotolamo_v7_notes.md",
+      "size": 544,
+      "ext": ".md",
+      "mtime": "2026-05-08T07:52:42",
+      "kind": "docs",
+      "important": false
+    },
+    {
+      "relpath": "config/crotolamo_v8_notes.md",
+      "size": 476,
+      "ext": ".md",
+      "mtime": "2026-05-08T08:08:44",
+      "kind": "docs",
+      "important": false
+    },
+    {
+      "relpath": "config/crotolamo_v10_notes.md",
+      "size": 549,
+      "ext": ".md",
+      "mtime": "2026-05-08T08:27:48",
+      "kind": "docs",
+      "important": false
+    },
+    {
+      "relpath": "ui/crotolamo_orbital_ui.py",
+      "size": 57656,
+      "ext": ".py",
+      "mtime": "2026-05-08T01:14:34",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "ui/__init__.py",
+      "size": 0,
+      "ext": ".py",
+      "mtime": "2026-05-07T22:19:33",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "ui/crotolamo_orbital_ui.py.bak-20260508-000300",
+      "size": 32317,
+      "ext": ".bak-20260508-000300",
+      "mtime": "2026-05-08T00:03:00",
+      "kind": "bak-20260508-000300",
+      "important": false
+    },
+    {
+      "relpath": "ui/crotolamo_orbital_ui.py.bak-20260508-002802",
+      "size": 42203,
+      "ext": ".bak-20260508-002802",
+      "mtime": "2026-05-08T00:28:02",
+      "kind": "bak-20260508-002802",
+      "important": false
+    },
+    {
+      "relpath": "ui/crotolamo_orbital_ui.py.bak_runtime_v3_20260508_005002",
+      "size": 42203,
+      "ext": ".bak_runtime_v3_20260508_005002",
+      "mtime": "2026-05-08T00:50:02",
+      "kind": "bak_runtime_v3_20260508_005002",
+      "important": true
+    },
+    {
+      "relpath": "ui/crotolamo_orbital_ui.py.bak_runtime_v3_20260508_005016",
+      "size": 45608,
+      "ext": ".bak_runtime_v3_20260508_005016",
+      "mtime": "2026-05-08T00:50:16",
+      "kind": "bak_runtime_v3_20260508_005016",
+      "important": true
+    },
+    {
+      "relpath": "tools/check_orbital_connections.py",
+      "size": 2552,
+      "ext": ".py",
+      "mtime": "2026-05-08T00:28:02",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "tools/crotolamo_doctor.py",
+      "size": 3782,
+      "ext": ".py",
+      "mtime": "2026-05-08T02:30:40",
+      "kind": "python",
+      "important": true
+    },
+    {
+      "relpath": "tools/crotolamo_doctor.py.bak_runtime_v3_20260508_005016",
+      "size": 1267,
+      "ext": ".bak_runtime_v3_20260508_005016",
+      "mtime": "2026-05-08T00:50:16",
+      "kind": "bak_runtime_v3_20260508_005016",
+      "important": true
+    },
+    {
+      "relpath": "tools/crotolamo_memory_cli.py",
+      "size": 705,
+      "ext": ".py",
+      "mtime": "2026-05-08T07:52:42",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "tools/crotolamo_doctor_v7_extra.py",
+      "size": 953,
+      "ext": ".py",
+      "mtime": "2026-05-08T07:52:42",
+      "kind": "python",
+      "important": true
+    },
+    {
+      "relpath": "tools/test_ollama_fast.py",
+      "size": 557,
+      "ext": ".py",
+      "mtime": "2026-05-08T08:04:40",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "tools/crotolamo_context_cli.py",
+      "size": 774,
+      "ext": ".py",
+      "mtime": "2026-05-08T08:08:44",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "tools/crotolamo_doctor_v8_extra.py",
+      "size": 998,
+      "ext": ".py",
+      "mtime": "2026-05-08T08:08:44",
+      "kind": "python",
+      "important": true
+    },
+    {
+      "relpath": "tools/crotolamo_project_index_cli.py",
+      "size": 790,
+      "ext": ".py",
+      "mtime": "2026-05-08T08:27:48",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "tools/crotolamo_doctor_v10_extra.py",
+      "size": 857,
+      "ext": ".py",
+      "mtime": "2026-05-08T08:27:48",
+      "kind": "python",
+      "important": true
+    },
+    {
+      "relpath": "data/orbital_logs/orbital_ui_20260508_005751.log",
+      "size": 1311,
+      "ext": ".log",
+      "mtime": "2026-05-08T00:59:45",
+      "kind": "log",
+      "important": false
+    },
+    {
+      "relpath": "data/orbital_logs/orbital_ui_20260508_010345.log",
+      "size": 276,
+      "ext": ".log",
+      "mtime": "2026-05-08T01:03:46",
+      "kind": "log",
+      "important": false
+    },
+    {
+      "relpath": "data/runtime_logs/runtime_20260508.jsonl",
+      "size": 1620,
+      "ext": ".jsonl",
+      "mtime": "2026-05-08T02:02:09",
+      "kind": "jsonl",
+      "important": true
+    },
+    {
+      "relpath": "data/memory/local_memory.json",
+      "size": 932,
+      "ext": ".json",
+      "mtime": "2026-05-08T01:56:15",
+      "kind": "config",
+      "important": false
+    },
+    {
+      "relpath": "plugins/__init__.py",
+      "size": 31,
+      "ext": ".py",
+      "mtime": "2026-05-08T01:13:53",
+      "kind": "python",
+      "important": true
+    },
+    {
+      "relpath": "plugins/base_plugin.py",
+      "size": 564,
+      "ext": ".py",
+      "mtime": "2026-05-08T00:17:07",
+      "kind": "python",
+      "important": true
+    },
+    {
+      "relpath": "plugins/projects_plugin.py",
+      "size": 1059,
+      "ext": ".py",
+      "mtime": "2026-05-08T00:17:07",
+      "kind": "python",
+      "important": true
+    },
+    {
+      "relpath": "plugins/fedora_plugin.py",
+      "size": 890,
+      "ext": ".py",
+      "mtime": "2026-05-08T00:17:07",
+      "kind": "python",
+      "important": true
+    },
+    {
+      "relpath": "plugins/__init__.py.bak_runtime_v3_20260508_005016",
+      "size": 0,
+      "ext": ".bak_runtime_v3_20260508_005016",
+      "mtime": "2026-05-08T00:50:16",
+      "kind": "bak_runtime_v3_20260508_005016",
+      "important": true
+    },
+    {
+      "relpath": "plugins/base_plugin.py.bak_runtime_v3_20260508_005016",
+      "size": 564,
+      "ext": ".bak_runtime_v3_20260508_005016",
+      "mtime": "2026-05-08T00:50:16",
+      "kind": "bak_runtime_v3_20260508_005016",
+      "important": true
+    },
+    {
+      "relpath": "plugins/projects_plugin.py.bak_runtime_v3_20260508_005016",
+      "size": 1059,
+      "ext": ".bak_runtime_v3_20260508_005016",
+      "mtime": "2026-05-08T00:50:16",
+      "kind": "bak_runtime_v3_20260508_005016",
+      "important": true
+    },
+    {
+      "relpath": "plugins/fedora_plugin.py.bak_runtime_v3_20260508_005016",
+      "size": 890,
+      "ext": ".bak_runtime_v3_20260508_005016",
+      "mtime": "2026-05-08T00:50:16",
+      "kind": "bak_runtime_v3_20260508_005016",
+      "important": true
+    },
+    {
+      "relpath": "plugins/fedora_actions.py",
+      "size": 1151,
+      "ext": ".py",
+      "mtime": "2026-05-08T01:13:53",
+      "kind": "python",
+      "important": true
+    },
+    {
+      "relpath": "plugins/general_actions.py",
+      "size": 2310,
+      "ext": ".py",
+      "mtime": "2026-05-08T01:13:53",
+      "kind": "python",
+      "important": true
+    },
+    {
+      "relpath": "plugins/huevonitis_plugin.py",
+      "size": 1623,
+      "ext": ".py",
+      "mtime": "2026-05-08T01:15:16",
+      "kind": "python",
+      "important": true
+    },
+    {
+      "relpath": "plugins/laboratory_plugin.py",
+      "size": 1055,
+      "ext": ".py",
+      "mtime": "2026-05-08T01:13:53",
+      "kind": "python",
+      "important": true
+    },
+    {
+      "relpath": "plugins/school_plugin.py",
+      "size": 629,
+      "ext": ".py",
+      "mtime": "2026-05-08T01:13:53",
+      "kind": "python",
+      "important": true
+    },
+    {
+      "relpath": "plugins/tletl_plugin.py",
+      "size": 1445,
+      "ext": ".py",
+      "mtime": "2026-05-08T01:15:16",
+      "kind": "python",
+      "important": true
+    },
+    {
+      "relpath": "plugins/memory_plugin.py",
+      "size": 2192,
+      "ext": ".py",
+      "mtime": "2026-05-08T07:52:42",
+      "kind": "python",
+      "important": true
+    },
+    {
+      "relpath": "plugins/context_plugin.py",
+      "size": 1840,
+      "ext": ".py",
+      "mtime": "2026-05-08T08:08:44",
+      "kind": "python",
+      "important": true
+    },
+    {
+      "relpath": "plugins/project_index_plugin.py",
+      "size": 2201,
+      "ext": ".py",
+      "mtime": "2026-05-08T08:27:48",
+      "kind": "python",
+      "important": true
+    }
+  ],
+  "skipped_files": 2,
+  "ext_counts": {
+    ".py": 42,
+    ".bak_runtime_v3_20260508_005016": 10,
+    ".json": 7,
+    ".md": 3,
+    ".sh": 3,
+    ".log": 2,
+    ".bak": 1,
+    ".bak-20260508-000300": 1,
+    ".bak-20260508-002802": 1,
+    ".bak_antes_oido": 1,
+    ".bak_browser": 1,
+    ".bak_fix_spotify_tletl": 1,
+    ".bak_funcionando": 1,
+    ".bak_limpieza": 1,
+    ".bak_no_scipy_20260508_005527": 1,
+    ".bak_oido": 1,
+    ".bak_runtime_v3_20260508_005002": 1,
+    ".bak_sin_voz": 1,
+    ".bak_skills": 1,
+    ".bak_skills_v2": 1,
+    ".bak_wake_v1": 1,
+    ".jsonl": 1
+  },
+  "important_files": [
+    "launch_runtime_shell.py",
+    "run_runtime_doctor.sh",
+    "launch_runtime_shell.py.bak_runtime_v3_20260508_005016",
+    "core/crotolamo_runtime.py",
+    "core/command_safety.py.bak_runtime_v3_20260508_005016",
+    "core/system_probe.py.bak_runtime_v3_20260508_005016",
+    "core/crotolamo_runtime.py.bak_runtime_v3_20260508_005016",
+    "core/plugin_registry.py",
+    "ui/crotolamo_orbital_ui.py.bak_runtime_v3_20260508_005002",
+    "ui/crotolamo_orbital_ui.py.bak_runtime_v3_20260508_005016",
+    "tools/crotolamo_doctor.py",
+    "tools/crotolamo_doctor.py.bak_runtime_v3_20260508_005016",
+    "tools/crotolamo_doctor_v7_extra.py",
+    "tools/crotolamo_doctor_v8_extra.py",
+    "tools/crotolamo_doctor_v10_extra.py",
+    "data/runtime_logs/runtime_20260508.jsonl",
+    "plugins/__init__.py",
+    "plugins/base_plugin.py",
+    "plugins/projects_plugin.py",
+    "plugins/fedora_plugin.py",
+    "plugins/__init__.py.bak_runtime_v3_20260508_005016",
+    "plugins/base_plugin.py.bak_runtime_v3_20260508_005016",
+    "plugins/projects_plugin.py.bak_runtime_v3_20260508_005016",
+    "plugins/fedora_plugin.py.bak_runtime_v3_20260508_005016",
+    "plugins/fedora_actions.py",
+    "plugins/general_actions.py",
+    "plugins/huevonitis_plugin.py",
+    "plugins/laboratory_plugin.py",
+    "plugins/school_plugin.py",
+    "plugins/tletl_plugin.py",
+    "plugins/memory_plugin.py",
+    "plugins/context_plugin.py",
+    "plugins/project_index_plugin.py"
+  ],
+  "warnings": []
+}

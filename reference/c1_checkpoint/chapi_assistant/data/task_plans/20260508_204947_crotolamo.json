@@ -1,0 +1,103 @@
+{
+  "title": "Plan v12: probar planificador de crotolamo",
+  "project": "crotolamo",
+  "objective": "probar planificador de crotolamo",
+  "created_at": "2026-05-08T20:49:47",
+  "risk_summary": "Bajo/medio: el plan principalmente lee archivos. Los pasos con git o cambios requieren confirmación.",
+  "assumptions": [
+    "El plan solo propone pasos; no modifica archivos por sí mismo.",
+    "Se asume que las rutas guardadas en memoria local son correctas.",
+    "Si el proyecto no existe o no está actualizado, primero hay que corregir la ruta."
+  ],
+  "steps": [
+    {
+      "id": 1,
+      "title": "Confirmar ruta y estado del proyecto",
+      "why": "No se puede diagnosticar bien una carpeta que Crotolamo no puede leer.",
+      "commands": [
+        "python tools/crotolamo_project_index_cli.py proyectos",
+        "python tools/crotolamo_project_index_cli.py mapa crotolamo"
+      ],
+      "risk": "safe",
+      "expected_result": "Ruta confirmada y mapa básico disponible."
+    },
+    {
+      "id": 2,
+      "title": "Reindexar proyecto",
+      "why": "El índice debe estar fresco antes de tomar decisiones.",
+      "commands": [
+        "python tools/crotolamo_project_index_cli.py indexar crotolamo"
+      ],
+      "risk": "safe",
+      "expected_result": "Índice actualizado en data/project_index/."
+    },
+    {
+      "id": 3,
+      "title": "Inspeccionar estructura y dependencias",
+      "why": "Esto detecta entrypoints, imports externos, TODOs y archivos grandes.",
+      "commands": [
+        "python tools/crotolamo_project_inspector_cli.py inspeccionar crotolamo"
+      ],
+      "risk": "safe",
+      "expected_result": "Reporte guardado en data/project_reports/."
+    },
+    {
+      "id": 4,
+      "title": "Revisar módulos críticos del proyecto",
+      "why": "El objetivo parece general, así que conviene ubicar núcleo, launchers y plugins.",
+      "commands": [
+        "python tools/crotolamo_project_index_cli.py mapa crotolamo",
+        "python tools/crotolamo_project_inspector_cli.py entradas crotolamo",
+        "python tools/crotolamo_project_inspector_cli.py dependencias crotolamo"
+      ],
+      "risk": "safe",
+      "expected_result": "Mapa técnico y puntos de entrada."
+    },
+    {
+      "id": 5,
+      "title": "Compilar entrypoints principales",
+      "why": "Esto atrapa errores tontos antes de perseguir fantasmas.",
+      "commands": [
+        "python -m py_compile /home/exitili/Documentos/chapi_assistant/core/chapi_shell.py",
+        "python -m py_compile /home/exitili/Documentos/chapi_assistant/launch_orbital_ui.py",
+        "python -m py_compile /home/exitili/Documentos/chapi_assistant/launch_runtime_shell.py"
+      ],
+      "risk": "safe",
+      "expected_result": "Sin errores de sintaxis en entrypoints."
+    },
+    {
+      "id": 6,
+      "title": "Elegir cambio mínimo y crear checkpoint",
+      "why": "Antes de editar, hay que decidir el cambio más pequeño que mejora el proyecto y guardar respaldo.",
+      "commands": [
+        "git status --short",
+        "git diff --stat"
+      ],
+      "risk": "confirm",
+      "expected_result": "Estado limpio o cambios identificados antes de modificar."
+    },
+    {
+      "id": 7,
+      "title": "Aplicar cambios en una rama o backup",
+      "why": "Modificar directo sobre la carpeta principal sin control es invocar al payaso del caos.",
+      "commands": [
+        "git checkout -b mejora-crotolamo-planificada"
+      ],
+      "risk": "confirm",
+      "expected_result": "Rama de trabajo creada si el proyecto usa git."
+    }
+  ],
+  "validation": [
+    "Correr el doctor correspondiente si existe.",
+    "Compilar archivos Python principales con `python -m py_compile ...`.",
+    "Abrir la UI o launcher principal después de cambios.",
+    "Comparar reporte antes/después si se modificó estructura."
+  ],
+  "rollback": [
+    "No aplicar comandos de modificación sin revisar `git status`.",
+    "Si se creó rama git, volver con `git checkout main` o la rama anterior.",
+    "Si hay backup en `backups/`, restaurar solo el archivo afectado.",
+    "No usar `rm -rf` como rollback. Eso no es rollback, es crimen digital."
+  ],
+  "next_action": "Ejecuta primero: python tools/crotolamo_project_inspector_cli.py inspeccionar crotolamo"
+}

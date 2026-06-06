@@ -1,0 +1,191 @@
+import os
+import subprocess
+from pathlib import Path
+
+
+HOME = Path.home()
+
+PROJECTS = {
+    "tletl": HOME / "Documentos" / "tletl_control_v4_1_ai_integrado",
+    "huevonitis": HOME / "Documentos" / "huevonitis version 2.1",
+    "crotolamo": HOME / "Documentos" / "chapi_assistant",
+    "chapi": HOME / "Documentos" / "chapi_assistant",
+}
+
+APP_COMMANDS = {
+    "opera": "flatpak run com.opera.opera-gx",
+    "opera gx": "flatpak run com.opera.opera-gx",
+    "terminal": "gnome-terminal",
+    "archivos": "nautilus",
+    "nautilus": "nautilus",
+    "blender": "blender",
+    "vscode": "code",
+    "visual studio code": "code",
+    "geany": "geany",
+}
+
+
+def run_detached(command: str) -> None:
+    subprocess.Popen(
+        command,
+        shell=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def open_app(name: str) -> str:
+    key = name.strip().lower()
+
+    if key not in APP_COMMANDS:
+        return f"No tengo registrada la app '{name}', patrón."
+
+    run_detached(APP_COMMANDS[key])
+    return f"Abrí {name}, patrón."
+
+
+def open_path(path: Path) -> str:
+    expanded = path.expanduser()
+
+    if not expanded.exists():
+        return f"No encontré la ruta: {expanded}"
+
+    run_detached(f'xdg-open "{expanded}"')
+    return f"Abrí {expanded}, patrón."
+
+
+def open_project(name: str) -> str:
+    key = name.strip().lower()
+
+    if key not in PROJECTS:
+        return f"No tengo registrado el proyecto '{name}', patrón."
+
+    return open_path(PROJECTS[key])
+
+
+def search_files(query: str, base: Path | None = None) -> str:
+    base = base or (HOME / "Documentos")
+    query = query.strip()
+
+    if not query:
+        return "Necesito algo que buscar, patrón."
+
+    if not base.exists():
+        return f"No existe la carpeta base: {base}"
+
+    cmd = [
+        "find",
+        str(base),
+        "-iname",
+        f"*{query}*",
+        "-print",
+    ]
+
+    result = subprocess.run(
+        cmd,
+        text=True,
+        capture_output=True,
+        timeout=20,
+    )
+
+    lines = result.stdout.strip().splitlines()
+
+    if not lines:
+        return f"No encontré archivos con '{query}' en {base}, patrón."
+
+    limited = lines[:15]
+    output = "\n".join(limited)
+
+    if len(lines) > 15:
+        output += f"\n...y {len(lines) - 15} resultados más."
+
+    return f"Encontré esto, patrón:\n{output}"
+
+
+def create_note(title: str, content: str = "") -> str:
+    notes_dir = HOME / "Documentos" / "crotolamo_notas"
+    notes_dir.mkdir(parents=True, exist_ok=True)
+
+    clean_title = "".join(
+        c if c.isalnum() or c in (" ", "_", "-") else "_"
+        for c in title
+    ).strip().replace(" ", "_")
+
+    if not clean_title:
+        clean_title = "nota"
+
+    path = notes_dir / f"{clean_title}.md"
+
+    if not content.strip():
+        content = f"# {title}\n\n"
+
+    path.write_text(content, encoding="utf-8")
+
+    return f"Nota creada, patrón: {path}"
+
+
+def system_status() -> str:
+    commands = {
+        "Disco": "df -h ~ | tail -n 1",
+        "RAM": "free -h | awk '/Mem:/ {print $3 \" usados de \" $2}'",
+        "Carga": "uptime",
+    }
+
+    parts = []
+
+    for label, cmd in commands.items():
+        result = subprocess.run(
+            cmd,
+            shell=True,
+            text=True,
+            capture_output=True,
+            executable="/bin/bash",
+        )
+        value = result.stdout.strip() or result.stderr.strip()
+        parts.append(f"{label}: {value}")
+
+    return "Estado del sistema, patrón:\n" + "\n".join(parts)
+
+
+def handle_direct_skill(text: str) -> str | None:
+    """
+    Detecta órdenes comunes sin pasar por comandos generados por IA.
+    Esto hace a Crotolamo más confiable y menos propenso a inventar bash.
+    """
+    raw = text.strip()
+    lower = raw.lower()
+
+    if lower in {"estado", "estado del sistema", "cómo está la laptop", "como esta la laptop"}:
+        return system_status()
+
+    if lower.startswith("abre "):
+        target = lower.replace("abre ", "", 1).strip()
+
+        if target in APP_COMMANDS:
+            return open_app(target)
+
+        if target in PROJECTS:
+            return open_project(target)
+
+        # Abrir rutas explícitas
+        if target.startswith("~/") or target.startswith("/"):
+            return open_path(Path(target))
+
+    if lower.startswith("abre proyecto "):
+        name = lower.replace("abre proyecto ", "", 1).strip()
+        return open_project(name)
+
+    if lower.startswith("busca "):
+        query = raw[6:].strip()
+        return search_files(query)
+
+    if lower.startswith("busca archivo "):
+        query = raw.replace("busca archivo ", "", 1).strip()
+        return search_files(query)
+
+    if lower.startswith("crea nota "):
+        title = raw.replace("crea nota ", "", 1).strip()
+        return create_note(title)
+
+    return None

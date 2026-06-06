@@ -1,0 +1,638 @@
+"""
+Crotolamo Runtime v6.
+
+Fase 6: centro de acciones/plugins por modo. La UI, la terminal, la voz y los comandos
+siguen pasando por este tronco común, pero ahora Crotolamo sabe si estás en Huevonitis,
+Tletl, Fedora, Escuela o Laboratorio. Contexto: ese lujo extravagante que evita romper
+cosas por andar contestando genérico.
+"""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+import time
+import urllib.request
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Any, Iterable
+
+try:
+    from core.command_safety import evaluate_commands, safety_text
+except Exception:  # pragma: no cover
+    from command_safety import evaluate_commands, safety_text  # type: ignore
+
+try:
+    from core.system_probe import snapshot_text, system_snapshot
+except Exception:  # pragma: no cover
+    from system_probe import snapshot_text, system_snapshot  # type: ignore
+
+try:
+    from core.project_modes import ModeManager
+except Exception:  # pragma: no cover
+    from project_modes import ModeManager  # type: ignore
+
+try:
+    from core.plugin_registry import PluginRegistry
+except Exception:  # pragma: no cover
+    from plugin_registry import PluginRegistry  # type: ignore
+
+
+@dataclass
+class RuntimeResult:
+    kind: str
+    text: str
+    safe: bool = True
+    commands: list[str] | None = None
+    risk: str = "safe"
+    explanation: str = ""
+    meta: dict[str, Any] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        data = asdict(self)
+        if data["commands"] is None:
+            data["commands"] = []
+        if data["meta"] is None:
+            data["meta"] = {}
+        return data
+
+
+DEFAULT_SETTINGS = {
+    "model": "qwen2.5-coder:7b",
+    "user_alias": "Caos Orbital",
+    "project_paths": {
+        "crotolamo": "~/Documentos/chapi_assistant",
+        "huevonitis": "~/Documentos/huevonitis version 2.1",
+        "tletl": "~/Documentos/tletl_control_v4_1_ai_integrado",
+    },
+    "execution": {
+        "timeout_seconds": 45,
+        "working_directory": "~/Documentos/chapi_assistant",
+        "allow_confirm_from_ui": True,
+    },
+    "context": {
+        "inject_mode_context": True,
+        "auto_switch_mode_from_prompt": False,
+    },
+}
+
+
+class CrotolamoRuntime:
+    version = "v6"
+
+    def __init__(self, project_root: str | Path | None = None) -> None:
+        self.project_root = Path(project_root).expanduser().resolve() if project_root else Path.cwd().resolve()
+        self.config_dir = self.project_root / "config"
+        self.data_dir = self.project_root / "data"
+        self.log_dir = self.data_dir / "runtime_logs"
+        self.settings_path = self.config_dir / "crotolamo_settings.json"
+        self.config_dir.mkdir(parents=True, exist_ok=True)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.settings = self._load_settings()
+        self.mode_manager = ModeManager(self.project_root)
+        self._sync_project_paths_to_modes()
+        self.plugin_registry = PluginRegistry(self.project_root, self.mode_manager, self.settings)
+
+        self._import_errors: dict[str, str] = {}
+        self._load_core_functions()
+
+    # -------------------------
+    # Configuración y logs
+    # -------------------------
+    def _deep_merge(self, base: dict[str, Any], loaded: dict[str, Any]) -> dict[str, Any]:
+        merged = dict(base)
+        for key, value in loaded.items():
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                merged[key] = self._deep_merge(merged[key], value)
+            else:
+                merged[key] = value
+        return merged
+
+    def _load_settings(self) -> dict[str, Any]:
+        if not self.settings_path.exists():
+            self.settings_path.write_text(json.dumps(DEFAULT_SETTINGS, indent=2, ensure_ascii=False), encoding="utf-8")
+            return dict(DEFAULT_SETTINGS)
+        try:
+            loaded = json.loads(self.settings_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                return self._deep_merge(DEFAULT_SETTINGS, loaded)
+        except Exception:
+            pass
+        return dict(DEFAULT_SETTINGS)
+
+    def _save_settings(self) -> None:
+        self.settings_path.write_text(json.dumps(self.settings, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    def _sync_project_paths_to_modes(self) -> None:
+        """Si el usuario ya personalizó project_paths, los reflejamos en modos."""
+        paths = self.settings.get("project_paths") if isinstance(self.settings.get("project_paths"), dict) else {}
+        modes = self.mode_manager.data.get("modes", {})
+        changed = False
+        for key, path in paths.items():
+            if key in modes and isinstance(path, str) and path.strip():
+                if modes[key].get("path") != path:
+                    modes[key]["path"] = path
+                    changed = True
+        if changed:
+            self.mode_manager.save()
+
+    def log_event(self, kind: str, payload: Any) -> None:
+        stamp = time.strftime("%Y%m%d")
+        path = self.log_dir / f"runtime_{stamp}.jsonl"
+        record = {
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "runtime": self.version,
+            "mode": self.mode_manager.active_key() if hasattr(self, "mode_manager") else None,
+            "kind": kind,
+            "payload": payload,
+        }
+        try:
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+    # -------------------------
+    # Integración con core viejo
+    # -------------------------
+    def _load_core_functions(self) -> None:
+        self.ask_ollama = None
+        self.normalize_plan = None
+        self.handle_direct_skill = None
+        self.listen_once = None
+        self.speak = None
+
+        if str(self.project_root) not in sys.path:
+            sys.path.insert(0, str(self.project_root))
+
+        try:
+            from core.chapi_shell import ask_ollama, normalize_plan  # type: ignore
+            self.ask_ollama = ask_ollama
+            self.normalize_plan = normalize_plan
+        except Exception as error:
+            self._import_errors["core.chapi_shell"] = str(error)
+            self.ask_ollama = self._ask_ollama_fallback
+            self.normalize_plan = self._normalize_plan_fallback
+
+        try:
+            from core.skills import handle_direct_skill  # type: ignore
+            self.handle_direct_skill = handle_direct_skill
+        except Exception as error:
+            self._import_errors["core.skills"] = str(error)
+
+        try:
+            from core.voice_in import listen_once  # type: ignore
+            self.listen_once = listen_once
+        except Exception as error:
+            self._import_errors["core.voice_in"] = str(error)
+
+        try:
+            from core.voice_out import speak  # type: ignore
+            self.speak = speak
+        except Exception as error:
+            self._import_errors["core.voice_out"] = str(error)
+
+    @property
+    def import_errors(self) -> dict[str, str]:
+        return dict(self._import_errors)
+
+    def _extract_json(self, text: str) -> dict[str, Any]:
+        text = str(text or "").strip()
+        if not text:
+            raise ValueError("Ollama respondió vacío.")
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict):
+                return data
+        except json.JSONDecodeError:
+            pass
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise ValueError(f"No encontré JSON válido en la respuesta: {text[:500]}")
+        data = json.loads(text[start:end + 1])
+        if not isinstance(data, dict):
+            raise ValueError("El JSON de Ollama no fue un objeto.")
+        return data
+
+    def _normalize_plan_fallback(self, plan: dict[str, Any]) -> dict[str, Any]:
+        commands = plan.get("commands", [])
+        if commands is None:
+            commands = []
+        if isinstance(commands, str):
+            commands = [commands]
+        if not isinstance(commands, list):
+            commands = []
+        commands = [str(cmd).strip() for cmd in commands if str(cmd).strip()]
+        return {
+            "safe": bool(plan.get("safe", True)),
+            "explanation": str(plan.get("explanation", "Sin explicación, patrón.")).strip(),
+            "commands": commands,
+        }
+
+    def _ask_ollama_fallback(self, prompt: str) -> dict[str, Any]:
+        model = str(self.settings.get("model") or DEFAULT_SETTINGS["model"])
+        system = (
+            "Eres Crotolamo, asistente local de Emiliano/Caos Orbital. "
+            "Eres directo, útil y no ejecutas acciones peligrosas. "
+            "Responde SIEMPRE solo JSON válido con este formato: "
+            "{\"safe\": true, \"explanation\": \"texto breve\", \"commands\": []}. "
+            "Si propones comandos bash, ponlos en commands. "
+            "Marca safe=false si hay sudo peligroso, borrado, formateo, permisos recursivos, discos o acciones destructivas. "
+            "Prefiere comandos de diagnóstico antes que comandos que modifiquen el sistema. "
+            "Usa el contexto del modo activo si aparece en el mensaje del usuario."
+        )
+        data = {
+            "model": model,
+            "stream": False,
+            "format": "json",
+            "options": {"temperature": 0.1},
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ],
+        }
+        req = urllib.request.Request(
+            "http://localhost:11434/api/chat",
+            data=json.dumps(data).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=120) as response:
+            raw = json.loads(response.read().decode("utf-8"))
+        content = raw.get("message", {}).get("content", "")
+        return self._normalize_plan_fallback(self._extract_json(content))
+
+    # -------------------------
+    # Modos/contexto
+    # -------------------------
+    def mode_payload(self) -> dict[str, Any]:
+        mode = self.mode_manager.get_mode()
+        return {
+            "active": self.mode_manager.active_key(),
+            "mode": mode,
+            "modes": self.mode_manager.list_modes(),
+            "summary": self.mode_manager.summary_text(),
+            "context": self.mode_manager.mode_context_text(),
+        }
+
+    def actions_payload(self) -> dict[str, Any]:
+        try:
+            return self.plugin_registry.payload()
+        except Exception as error:
+            return {"version": "v6", "error": str(error), "active_actions": []}
+
+    def set_mode(self, key: str) -> dict[str, Any]:
+        ok, resolved = self.mode_manager.set_active_mode(key)
+        if ok:
+            self.log_event("mode", {"active": resolved})
+            return RuntimeResult(kind="direct", text="Modo cambiado.\n\n" + self.mode_manager.status_text(), meta={"mode": self.mode_payload()}).to_dict()
+        return RuntimeResult(kind="direct", text=f"No reconocí el modo: {key}\n\n" + self.mode_manager.summary_text(), safe=False, risk="safe", meta={"mode": self.mode_payload()}).to_dict()
+
+    def _prompt_with_mode_context(self, prompt: str) -> str:
+        ctx_cfg = self.settings.get("context") if isinstance(self.settings.get("context"), dict) else {}
+        if not bool(ctx_cfg.get("inject_mode_context", True)):
+            return prompt
+        return (
+            "CONTEXTO LOCAL DE CROTOLAMO v6:\n"
+            + self.mode_manager.mode_context_text()
+            + "\n\nPETICIÓN DEL USUARIO:\n"
+            + prompt
+        )
+
+    # -------------------------
+    # Procesamiento principal
+    # -------------------------
+    def process_text(self, prompt: str) -> dict[str, Any]:
+        prompt = str(prompt or "").strip()
+        if not prompt:
+            return RuntimeResult(kind="direct", text="Escribe algo, patrón. Todavía no leo mentes, tragedia tecnológica.", meta={"mode": self.mode_payload()}).to_dict()
+
+        self.log_event("prompt", prompt)
+        lower = prompt.lower().strip()
+
+        # Comandos de modo antes que skills/IA.
+        mode_response = self.mode_manager.handle_mode_command(prompt)
+        if mode_response is not None:
+            if mode_response.get("kind") == "plan":
+                plan = self.harden_plan(mode_response)
+                return RuntimeResult(
+                    kind="plan",
+                    text=str(plan.get("explanation", "Plan generado.")),
+                    safe=bool(plan.get("safe", False)),
+                    commands=list(plan.get("commands", [])),
+                    risk=str(plan.get("risk", "safe")),
+                    explanation=str(plan.get("explanation", "")),
+                    meta={"source": "modes", "mode": self.mode_payload(), "safety": plan.get("safety", {})},
+                ).to_dict()
+            return RuntimeResult(kind="direct", text=str(mode_response.get("text", "")), meta={"source": "modes", "mode": self.mode_payload()}).to_dict()
+
+        # Centro de acciones/plugins v6 antes que skills/IA.
+        try:
+            plugin_response = self.plugin_registry.handle_command(prompt)
+        except Exception as error:
+            plugin_response = {"kind": "direct", "text": f"Plugin registry v6 falló: {error}", "safe": False}
+        if plugin_response is not None:
+            if plugin_response.get("kind") == "plan":
+                plan = self.harden_plan(plugin_response)
+                return RuntimeResult(
+                    kind="plan",
+                    text=str(plan.get("explanation", "Acción generada.")),
+                    safe=bool(plan.get("safe", False)),
+                    commands=list(plan.get("commands", [])),
+                    risk=str(plan.get("risk", "safe")),
+                    explanation=str(plan.get("explanation", "")),
+                    meta={"source": "plugins", "mode": self.mode_payload(), "plugins": self.actions_payload(), "safety": plan.get("safety", {})},
+                ).to_dict()
+            return RuntimeResult(kind="direct", text=str(plugin_response.get("text", "")), meta={"source": "plugins", "mode": self.mode_payload(), "plugins": self.actions_payload()}).to_dict()
+
+        # Autodetección opcional: si el prompt menciona con claridad otro proyecto, cambia de modo.
+        ctx_cfg = self.settings.get("context") if isinstance(self.settings.get("context"), dict) else {}
+        if bool(ctx_cfg.get("auto_switch_mode_from_prompt", False)):
+            inferred = self.mode_manager.infer_mode_from_text(prompt)
+            if inferred and inferred != self.mode_manager.active_key():
+                self.mode_manager.set_active_mode(inferred)
+
+        if lower in {"runtime", "diagnostico runtime", "diagnóstico runtime", "estado runtime"}:
+            return RuntimeResult(kind="direct", text=self.diagnostics_text(), meta={"source": "runtime", "mode": self.mode_payload()}).to_dict()
+
+        if lower in {"seguridad", "seguridad comandos", "safety", "politica seguridad", "política seguridad"}:
+            return RuntimeResult(kind="direct", text=self.security_summary(), meta={"source": "security", "mode": self.mode_payload()}).to_dict()
+
+        # Skills directas existentes.
+        if callable(self.handle_direct_skill):
+            direct = self.handle_direct_skill(prompt)
+            if direct is not None:
+                self.log_event("direct", direct)
+                return RuntimeResult(kind="direct", text=str(direct), meta={"source": "skills", "mode": self.mode_payload()}).to_dict()
+
+        if not callable(self.ask_ollama):
+            msg = "No tengo ask_ollama disponible. Revisa core/chapi_shell.py con tools/crotolamo_doctor.py."
+            self.log_event("error", msg)
+            return RuntimeResult(kind="direct", text=msg, safe=False, risk="blocked", meta={"mode": self.mode_payload()}).to_dict()
+
+        effective_prompt = self._prompt_with_mode_context(prompt)
+        plan = self.ask_ollama(effective_prompt)
+        if callable(self.normalize_plan):
+            plan = self.normalize_plan(plan)
+        plan = self.harden_plan(plan)
+        self.log_event("plan", plan)
+        return RuntimeResult(
+            kind="plan",
+            text=str(plan.get("explanation", "Plan generado.")),
+            safe=bool(plan.get("safe", False)),
+            commands=list(plan.get("commands", [])),
+            risk=str(plan.get("risk", "safe")),
+            explanation=str(plan.get("explanation", "")),
+            meta={"source": "ollama", "mode": self.mode_payload(), "safety": plan.get("safety", {})},
+        ).to_dict()
+
+    def harden_plan(self, plan: dict[str, Any]) -> dict[str, Any]:
+        commands = plan.get("commands", []) or []
+        if isinstance(commands, str):
+            commands = [commands]
+        commands = [str(cmd).strip() for cmd in commands if str(cmd).strip()]
+
+        safety = evaluate_commands(commands, project_root=self.project_root)
+        original_safe = bool(plan.get("safe", True))
+        safe = original_safe and safety.safe
+
+        explanation = str(plan.get("explanation", "Sin explicación, patrón.")).strip()
+        mode = self.mode_manager.get_mode()
+        if mode:
+            explanation += f"\n\nModo activo v6: {mode.get('title')} ({mode.get('key')})."
+        if safety.risk == "blocked":
+            explanation += "\n\nSeguridad v6: bloqueé el plan porque detecté comandos peligrosos."
+        elif safety.risk == "confirm" and commands:
+            explanation += "\n\nSeguridad v6: permitido solo con confirmación fuerte. Lee antes de ejecutar, criatura del sudo."
+        elif commands:
+            explanation += "\n\nSeguridad v6: comandos clasificados como bajo riesgo."
+
+        return {
+            "safe": safe,
+            "risk": safety.risk,
+            "explanation": explanation,
+            "commands": commands,
+            "safety": safety.to_dict(),
+        }
+
+    # -------------------------
+    # Ejecución controlada
+    # -------------------------
+    def execute_commands(self, commands: Iterable[str], allow_confirm: bool = False) -> list[dict[str, Any]]:
+        commands = [str(cmd).strip() for cmd in commands if str(cmd).strip()]
+        safety = evaluate_commands(commands, project_root=self.project_root)
+        if not safety.safe:
+            return [{"label": "SEGURIDAD", "text": safety_text(safety), "returncode": None}]
+        if safety.risk == "confirm" and not allow_confirm:
+            return [{"label": "SEGURIDAD", "text": "Requiere confirmación fuerte. No ejecuté nada.\n" + safety_text(safety), "returncode": None}]
+
+        timeout = int(self.settings.get("execution", {}).get("timeout_seconds", 45))
+        cwd_raw = self.settings.get("execution", {}).get("working_directory", str(self.project_root))
+        cwd = Path(str(cwd_raw)).expanduser()
+        if not cwd.exists():
+            cwd = self.project_root
+
+        events: list[dict[str, Any]] = []
+        events.append({"label": "SEGURIDAD", "text": safety_text(safety), "returncode": None})
+        for cmd in commands:
+            events.append({"label": "$", "text": cmd, "returncode": None})
+            try:
+                result = subprocess.run(
+                    cmd,
+                    shell=True,
+                    text=True,
+                    capture_output=True,
+                    executable="/bin/bash",
+                    timeout=timeout,
+                    cwd=str(cwd),
+                )
+            except subprocess.TimeoutExpired:
+                events.append({"label": "ERROR", "text": f"Timeout tras {timeout}s", "returncode": None})
+                break
+            except Exception as error:
+                events.append({"label": "ERROR", "text": str(error), "returncode": None})
+                break
+
+            if result.stdout.strip():
+                events.append({"label": "OUT", "text": result.stdout.rstrip(), "returncode": result.returncode})
+            if result.stderr.strip():
+                events.append({"label": "ERR", "text": result.stderr.rstrip(), "returncode": result.returncode})
+            if result.returncode != 0:
+                events.append({"label": "ERROR", "text": f"Comando terminó con código {result.returncode}", "returncode": result.returncode})
+                break
+
+        self.log_event("execution", {"allow_confirm": allow_confirm, "events": events})
+        return events
+
+    # -------------------------
+    # Voz, estado y diagnóstico
+    # -------------------------
+    def listen(self, seconds: int = 8) -> str:
+        if not callable(self.listen_once):
+            raise RuntimeError("Entrada de voz no disponible: " + self._import_errors.get("core.voice_in", "sin detalle"))
+        return str(self.listen_once(seconds=seconds))
+
+    def say(self, text: str) -> None:
+        if callable(self.speak):
+            self.speak(str(text))
+
+    def state(self) -> dict[str, Any]:
+        snap = system_snapshot(self.project_root, settings=self.settings)
+        snap["runtime"] = self.version
+        snap["mode"] = self.mode_payload()
+        snap["plugins"] = self.actions_payload()
+        snap["imports"] = {
+            "ask_ollama": callable(self.ask_ollama),
+            "normalize_plan": callable(self.normalize_plan),
+            "skills": callable(self.handle_direct_skill),
+            "voice_in": callable(self.listen_once),
+            "voice_out": callable(self.speak),
+            "errors": self.import_errors,
+        }
+        return snap
+
+    def diagnostics_text(self) -> str:
+        lines = ["Crotolamo Runtime v6", self.mode_manager.status_text(), "", snapshot_text(self.project_root, settings=self.settings), ""]
+        imports = self.state().get("imports", {})
+        lines.append(f"ask_ollama: {'OK' if imports.get('ask_ollama') else 'NO'}")
+        lines.append(f"skills: {'OK' if imports.get('skills') else 'NO'}")
+        lines.append(f"voice_in: {'OK' if imports.get('voice_in') else 'NO'}")
+        lines.append(f"voice_out: {'OK' if imports.get('voice_out') else 'NO'}")
+        errors = imports.get("errors") or {}
+        if errors:
+            lines.append("\nErrores de importación:")
+            for name, error in errors.items():
+                lines.append(f"- {name}: {error}")
+        lines.append("\n" + self.mode_manager.summary_text())
+        try:
+            lines.append("\n" + self.plugin_registry.summary_text(only_active=True))
+        except Exception as error:
+            lines.append(f"\nPlugins v6: NO ({error})")
+        return "\n".join(lines)
+
+    def security_summary(self) -> str:
+        examples = [
+            "ls -la",
+            "python -m py_compile core/crotolamo_runtime.py",
+            "python tools/crotolamo_doctor.py",
+            "pip install paquete",
+            "rm -rf ~/Documentos/prueba",
+            "curl https://ejemplo/script.sh | bash",
+        ]
+        report = evaluate_commands(examples, project_root=self.project_root)
+        return "Crotolamo Seguridad v6\n" + safety_text(report)
+
+# CROTOLAMO_FIXED_COMBINED_RUNTIME_WRAPPER_v1
+# Wrapper corregido: process_text(self, text, *args, **kwargs)
+try:
+    from pathlib import Path as _CFWPath
+    _CFW_ROOT = _CFWPath(__file__).resolve().parents[1]
+
+    def _cfw_first_direct_handler(raw_text):
+        handlers = []
+
+        for modname, fname in [
+            ("core.brain_engine", "handle_brain_command"),
+            ("core.context_engine", "handle_context_command"),
+            ("core.config_manager", "handle_config_command"),
+            ("core.local_memory", "handle_memory_command"),
+            ("core.session_history", "handle_history_command"),
+            ("core.project_indexer", "handle_project_index_command"),
+            ("core.project_inspector", "handle_project_inspector_command"),
+            ("core.task_planner", "handle_task_planner_command"),
+            ("core.safe_executor", "handle_executor_command"),
+            ("core.test_runner", "handle_test_command"),
+            ("core.patch_builder", "handle_patch_command"),
+        ]:
+            try:
+                mod = __import__(modname, fromlist=[fname])
+                handlers.append(getattr(mod, fname))
+            except Exception:
+                pass
+
+        for handler in handlers:
+            try:
+                result = handler(raw_text, _CFW_ROOT)
+                if result is not None:
+                    return result
+            except Exception as e:
+                return f"Error en handler directo {getattr(handler, '__name__', handler)}: {type(e).__name__}: {e}"
+        return None
+
+    def _cfw_prepare_text(raw_text):
+        text = str(raw_text or "")
+
+        try:
+            from core.local_memory import get_alias
+            alias = get_alias(text, _CFW_ROOT)
+            if alias:
+                text = alias
+        except Exception:
+            pass
+
+        try:
+            from core.brain_engine import brain_config, is_internal_or_direct, build_brain_prompt
+            cfg = brain_config(_CFW_ROOT)
+            if bool(cfg.get("enabled", True)) and not is_internal_or_direct(text):
+                text = build_brain_prompt(text, _CFW_ROOT)
+        except Exception as e:
+            text = f"{text}\n\n[AVISO: falló brain_engine: {type(e).__name__}: {e}]"
+
+        try:
+            from core.config_manager import get_value
+            from core.context_engine import should_skip_context, build_enriched_prompt
+            enabled = bool(get_value("ollama.use_context_engine", True, _CFW_ROOT))
+            if enabled and not should_skip_context(text):
+                text = build_enriched_prompt(text, _CFW_ROOT)
+        except Exception as e:
+            text = f"{text}\n\n[AVISO: falló context_engine: {type(e).__name__}: {e}]"
+
+        return text
+
+    def _cfw_wrap_method(original):
+        def _wrapped(self, text, *args, **kwargs):
+            raw_text = str(text or "")
+
+            try:
+                from core.session_history import log_event
+                log_event("user", raw_text, _CFW_ROOT)
+            except Exception:
+                pass
+
+            try:
+                direct = _cfw_first_direct_handler(raw_text)
+                if direct is not None:
+                    try:
+                        from core.session_history import log_event
+                        log_event("assistant", str(direct), _CFW_ROOT, {"source": "direct_handler"})
+                    except Exception:
+                        pass
+                    return direct
+
+                prepared = _cfw_prepare_text(raw_text)
+                result = original(self, prepared, *args, **kwargs)
+
+                try:
+                    from core.session_history import log_event
+                    log_event("assistant", str(result), _CFW_ROOT)
+                except Exception:
+                    pass
+
+                return result
+
+            except KeyboardInterrupt:
+                return "Operación cancelada con Ctrl+C. Crotolamo dejó de esperar sin vomitar traceback."
+            except Exception as e:
+                return f"Error en runtime wrapper corregido: {type(e).__name__}: {e}"
+
+        _wrapped._crotolamo_fixed_wrapper = True
+        return _wrapped
+
+    if "CrotolamoRuntime" in globals():
+        _cls = globals()["CrotolamoRuntime"]
+        if hasattr(_cls, "process_text") and not getattr(_cls.process_text, "_crotolamo_fixed_wrapper", False):
+            _cls.process_text = _cfw_wrap_method(_cls.process_text)
+
+except Exception:
+    pass

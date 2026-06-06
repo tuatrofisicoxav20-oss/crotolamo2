@@ -1,0 +1,322 @@
+import json
+import subprocess
+import urllib.request
+from typing import Any
+try:
+    from core.skills import handle_direct_skill
+except ImportError:
+    from skills import handle_direct_skill
+
+try:
+    from voice_out import speak
+except ImportError:
+    from core.voice_out import speak
+
+try:
+    from voice_in import listen_once
+except ImportError:
+    from core.voice_in import listen_once
+
+
+MODEL = "qwen2.5-coder:7b"
+
+SYSTEM = """
+Eres Crotolamo, un asistente local personalizado para Emiliano, también llamado Caos Orbital.
+
+Debes llamarlo "patrón" de forma natural.
+
+Personalidad:
+- Directo, inteligente, sarcástico y útil.
+- No le das la razón si está equivocado.
+- Ayudas con Fedora, programación, Tletl, Huevonitis, electrónica, estudio y proyectos personales.
+- Priorizas seguridad antes de ejecutar comandos.
+- Si una acción puede borrar archivos, mover muchas cosas, modificar permisos o usar sudo, debes marcarla como insegura salvo que el usuario lo pida explícitamente.
+
+Reglas de escritorio:
+- Cuando el usuario diga "escritorio", usa ~/Escritorio.
+- Si necesitas máxima compatibilidad, puedes usar una condición bash para detectar ~/Escritorio o ~/Desktop.
+
+Tu trabajo:
+- Convertir solicitudes del usuario en comandos bash seguros cuando haga falta.
+- Si el usuario solo saluda o conversa, responde sin comandos.
+- Responde SIEMPRE SOLO JSON válido.
+- No uses markdown.
+- No uses bloques de código.
+
+Formato obligatorio:
+{
+  "safe": true,
+  "explanation": "explicación breve para el patrón",
+  "commands": []
+}
+
+Si sí hay comandos:
+{
+  "safe": true,
+  "explanation": "qué vas a hacer",
+  "commands": ["comando 1", "comando 2"]
+}
+
+Comandos prohibidos salvo confirmación explícita del usuario:
+- rm -rf
+- mkfs
+- dd
+- shutdown
+- reboot
+- chmod -R
+- chown -R
+- sudo sin que el usuario lo pida
+"""
+
+
+DANGEROUS_PATTERNS = [
+    "rm -rf",
+    "mkfs",
+    "dd if=",
+    "chmod -R",
+    "chown -R",
+    "> /dev/sd",
+    "shutdown",
+    "reboot",
+    ":(){",
+]
+
+
+def say(text: str) -> None:
+    try:
+        speak(text)
+    except Exception as error:
+        print(f"[voz desactivada por error: {error}]")
+
+
+def extract_json(text: str) -> dict[str, Any]:
+    text = text.strip()
+
+    if not text:
+        raise ValueError("Ollama respondió vacío.")
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    start = text.find("{")
+    end = text.rfind("}")
+
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError(f"No encontré JSON válido en la respuesta:\n{text}")
+
+    return json.loads(text[start:end + 1])
+
+
+def normalize_plan(plan: dict[str, Any]) -> dict[str, Any]:
+    safe = bool(plan.get("safe", True))
+    explanation = str(plan.get("explanation", "Sin explicación, patrón.")).strip()
+    commands = plan.get("commands", [])
+
+    if commands is None:
+        commands = []
+
+    if isinstance(commands, str):
+        commands = [commands]
+
+    if not isinstance(commands, list):
+        commands = []
+
+    clean_commands = []
+
+    for cmd in commands:
+        if not isinstance(cmd, str):
+            continue
+
+        cmd = cmd.strip()
+
+        if not cmd:
+            continue
+
+        lower_cmd = cmd.lower()
+
+        for dangerous in DANGEROUS_PATTERNS:
+            if dangerous.lower() in lower_cmd:
+                safe = False
+                explanation = (
+                    "Patrón, detecté un comando peligroso. "
+                    "No lo ejecuto sin revisión explícita."
+                )
+
+        if lower_cmd.startswith("sudo "):
+            safe = False
+            explanation = (
+                "Patrón, esto intenta usar sudo. "
+                "No lo ejecuto sin confirmación explícita."
+            )
+
+        clean_commands.append(cmd)
+
+    return {
+        "safe": safe,
+        "explanation": explanation,
+        "commands": clean_commands,
+    }
+
+
+def ask_ollama(prompt: str) -> dict[str, Any]:
+    data = {
+        "model": MODEL,
+        "stream": False,
+        "format": "json",
+        "options": {
+            "temperature": 0.1
+        },
+        "messages": [
+            {"role": "system", "content": SYSTEM},
+            {"role": "user", "content": prompt}
+        ]
+    }
+
+    req = urllib.request.Request(
+        "http://localhost:11434/api/chat",
+        data=json.dumps(data).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+
+    with urllib.request.urlopen(req, timeout=120) as response:
+        raw = json.loads(response.read().decode("utf-8"))
+
+    content = raw.get("message", {}).get("content", "").strip()
+    plan = extract_json(content)
+    return normalize_plan(plan)
+
+
+def run_command(cmd: str) -> None:
+    print(f"\n$ {cmd}")
+
+    result = subprocess.run(
+        cmd,
+        shell=True,
+        text=True,
+        capture_output=True,
+        executable="/bin/bash",
+    )
+
+    if result.stdout:
+        print(result.stdout.rstrip())
+
+    if result.stderr:
+        print(result.stderr.rstrip())
+
+
+def get_user_input() -> str:
+    user = input("Patrón > ").strip()
+
+    if user.lower() in {"voz", "/voz", "escucha"}:
+        say("Te escucho, patrón.")
+
+        try:
+            spoken = listen_once()
+        except Exception as error:
+            print(f"Error escuchando: {error}")
+            say("No pude escuchar bien, patrón.")
+            return ""
+
+        if not spoken:
+            print("No escuché nada claro.")
+            say("No escuché nada claro, patrón.")
+            return ""
+
+        print(f"Escuché: {spoken}")
+        say(f"Escuché: {spoken}")
+        return spoken
+
+    return user
+
+
+def main() -> None:
+    print("Crotolamo Shell local. Escribe 'salir' para terminar. Escribe 'voz' para hablar.\n")
+    say("Crotolamo activo, patrón.")
+
+    while True:
+        try:
+            user = get_user_input()
+        except KeyboardInterrupt:
+            print("\nCrotolamo apagado, patrón.")
+            say("Crotolamo apagado, patrón.")
+            break
+
+        if not user:
+            continue
+
+        if user.lower() in {"salir", "exit", "quit"}:
+            print("Crotolamo apagado, patrón.")
+            say("Crotolamo apagado, patrón.")
+            break
+
+        direct_result = handle_direct_skill(user)
+        if direct_result is not None:
+            print("\n" + direct_result)
+            say(direct_result)
+            continue
+
+        try:
+            plan = ask_ollama(user)
+        except KeyboardInterrupt:
+            print("\nPetición cancelada, patrón.")
+            say("Petición cancelada, patrón.")
+            continue
+        except Exception as e:
+            print(f"\nError interpretando respuesta: {e}")
+            say("Tuve un error interpretando la respuesta, patrón.")
+            continue
+
+        explanation = plan.get("explanation", "Sin explicación, patrón.")
+        commands = plan.get("commands", [])
+        safe = plan.get("safe", False)
+
+        print("\nPlan:")
+        print(explanation)
+        say(explanation)
+
+        if not commands:
+            print("No propuso comandos.")
+            say("No propuse comandos, patrón.")
+            continue
+
+        if not safe:
+            print("No lo ejecuto porque fue marcado como inseguro.")
+            say("No ejecuto eso, patrón. Huele a desastre.")
+            continue
+
+        print("\nComandos propuestos:")
+        for cmd in commands:
+            print(f"  {cmd}")
+
+        confirm = input("\n¿Ejecutar? [y/N] ").strip().lower()
+
+        if confirm != "y":
+            print("Cancelado, patrón.")
+            say("Cancelado, patrón.")
+            continue
+
+        for cmd in commands:
+            run_command(cmd)
+
+        print("\nHecho, patrón.")
+        say("Hecho, patrón.")
+
+
+if __name__ == "__main__":
+    main()
+
+# CROTOLAMO_SAFE_OLLAMA_PATCH_v7_1
+# Sobrescribe ask_ollama con un cliente más seguro y timeout razonable.
+try:
+    from core.ollama_client import ask_ollama_text as _crotolamo_ask_ollama_text
+
+    def ask_ollama(prompt, *args, **kwargs):
+        timeout = kwargs.pop("timeout", 30)
+        model = kwargs.pop("model", None)
+        return _crotolamo_ask_ollama_text(str(prompt or ""), model=model, timeout=timeout)
+
+except Exception:
+    # Si algo falla, no destruimos importación del shell.
+    pass

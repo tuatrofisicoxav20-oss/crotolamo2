@@ -1,0 +1,106 @@
+import json
+import subprocess
+import urllib.request
+
+MODEL = "qwen2.5-coder:7b"
+
+SYSTEM = """
+Eres Chapi, un asistente local para Fedora.
+Tu trabajo es convertir solicitudes del usuario en comandos bash seguros.
+
+Reglas:
+- Responde SOLO JSON válido.
+- No uses markdown.
+- No inventes rutas destructivas.
+- No uses sudo salvo que el usuario lo pida explícitamente.
+- No uses rm -rf, mkfs, dd, chmod -R, chown -R ni comandos peligrosos.
+- Si la tarea es peligrosa, pon "safe": false.
+- Formato exacto:
+{
+  "safe": true,
+  "explanation": "explicación breve",
+  "commands": ["comando 1", "comando 2"]
+}
+"""
+
+def ask_ollama(prompt: str) -> dict:
+    data = {
+        "model": MODEL,
+        "stream": False,
+        "messages": [
+            {"role": "system", "content": SYSTEM},
+            {"role": "user", "content": prompt}
+        ]
+    }
+
+    req = urllib.request.Request(
+        "http://localhost:11434/api/chat",
+        data=json.dumps(data).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+
+    with urllib.request.urlopen(req) as response:
+        raw = json.loads(response.read().decode("utf-8"))
+
+    content = raw["message"]["content"].strip()
+    return json.loads(content)
+
+def run_command(cmd: str):
+    print(f"\n$ {cmd}")
+    result = subprocess.run(
+        cmd,
+        shell=True,
+        text=True,
+        capture_output=True,
+        executable="/bin/bash",
+    )
+
+    if result.stdout:
+        print(result.stdout)
+
+    if result.stderr:
+        print(result.stderr)
+
+def main():
+    print("Chapi Shell local. Escribe 'salir' para terminar.\n")
+
+    while True:
+        user = input("Tú > ").strip()
+
+        if user.lower() in {"salir", "exit", "quit"}:
+            break
+
+        try:
+            plan = ask_ollama(user)
+        except Exception as e:
+            print(f"Error interpretando respuesta: {e}")
+            continue
+
+        print("\nPlan:")
+        print(plan.get("explanation", "Sin explicación."))
+
+        if not plan.get("safe", False):
+            print("No lo ejecuto porque lo marcó como inseguro.")
+            continue
+
+        commands = plan.get("commands", [])
+
+        if not commands:
+            print("No propuso comandos.")
+            continue
+
+        print("\nComandos propuestos:")
+        for cmd in commands:
+            print(f"  {cmd}")
+
+        confirm = input("\n¿Ejecutar? [y/N] ").strip().lower()
+
+        if confirm != "y":
+            print("Cancelado.")
+            continue
+
+        for cmd in commands:
+            run_command(cmd)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,493 @@
+import re
+import shutil
+import subprocess
+from pathlib import Path
+from urllib.parse import quote_plus
+
+
+HOME = Path.home()
+
+PROJECTS = {
+    "tletl": HOME / "Documentos" / "tletl_control_v4_1_ai_integrado",
+    "huevonitis": HOME / "Documentos" / "huevonitis version 2.1",
+    "crotolamo": HOME / "Documentos" / "chapi_assistant",
+    "chapi": HOME / "Documentos" / "chapi_assistant",
+}
+
+FOLDERS = {
+    "documentos": HOME / "Documentos",
+    "descargas": HOME / "Descargas",
+    "escritorio": HOME / "Escritorio",
+    "desktop": HOME / "Desktop",
+    "imagenes": HOME / "Imágenes",
+    "imágenes": HOME / "Imágenes",
+    "musica": HOME / "Música",
+    "música": HOME / "Música",
+    "videos": HOME / "Vídeos",
+    "vídeos": HOME / "Vídeos",
+}
+
+COMMON_SITES = {
+    "google": "https://www.google.com",
+    "youtube": "https://www.youtube.com",
+    "github": "https://github.com",
+    "chatgpt": "https://chatgpt.com",
+    "gmail": "https://mail.google.com",
+    "drive": "https://drive.google.com",
+    "google drive": "https://drive.google.com",
+    "docs": "https://docs.google.com",
+    "google docs": "https://docs.google.com",
+    "sheets": "https://sheets.google.com",
+    "google sheets": "https://sheets.google.com",
+    "classroom": "https://classroom.google.com",
+    "whatsapp": "https://web.whatsapp.com",
+    "whatsapp web": "https://web.whatsapp.com",
+    "wikipedia": "https://www.wikipedia.org",
+    "stack overflow": "https://stackoverflow.com",
+    "ollama": "https://ollama.com",
+    "hugging face": "https://huggingface.co",
+}
+
+SEARCH_ENGINES = {
+    "google": "https://www.google.com/search?q={query}",
+    "youtube": "https://www.youtube.com/results?search_query={query}",
+    "github": "https://github.com/search?q={query}",
+    "wikipedia": "https://es.wikipedia.org/wiki/Special:Search?search={query}",
+    "duckduckgo": "https://duckduckgo.com/?q={query}",
+}
+
+APP_COMMANDS = {
+    "opera": [["flatpak", "run", "com.opera.opera-gx"]],
+    "opera gx": [["flatpak", "run", "com.opera.opera-gx"]],
+    "terminal": [["gnome-terminal"]],
+    "archivos": [["nautilus"]],
+    "nautilus": [["nautilus"]],
+    "blender": [["blender"]],
+    "vscode": [["code"]],
+    "visual studio code": [["code"]],
+    "geany": [["geany"]],
+    "libreoffice": [["libreoffice"]],
+    "calculadora": [["gnome-calculator"]],
+}
+
+BLOCKED_SEARCH_TERMS = [
+    "porn",
+    "porno",
+    "xxx",
+    "xvideos",
+    "pornhub",
+    "hackear contraseña",
+    "robar contraseña",
+    "malware",
+    "ransomware",
+    "exploit para romper",
+    "bomba",
+    "arma casera",
+]
+
+
+def is_blocked_query(text: str) -> bool:
+    lower = text.lower()
+    return any(term in lower for term in BLOCKED_SEARCH_TERMS)
+
+
+def run_detached(args: list[str]) -> None:
+    subprocess.Popen(
+        args,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def run_detached_shell(command: str) -> None:
+    subprocess.Popen(
+        command,
+        shell=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def clean_activation(text: str) -> str:
+    """
+    Quita la palabra de activación y errores comunes de Whisper.
+    Porque aparentemente 'Crotolamo' le parece demasiado arte moderno.
+    """
+    text = text.strip()
+    text = re.sub(r"\s+", " ", text)
+
+    lower = text.lower()
+
+    wake_words = [
+        "crotolamo",
+        "coto y amo",
+        "coto lamo",
+        "croto lamo",
+        "corto lamo",
+        "coto amo",
+    ]
+
+    for wake in wake_words:
+        if lower.startswith(wake):
+            text = text[len(wake):].strip(" ,.:;-")
+            break
+
+    return text.strip()
+
+
+def normalize(text: str) -> str:
+    text = clean_activation(text)
+    text = text.strip()
+
+    replacements = {
+        "habré ": "abre ",
+        "ábre ": "abre ",
+        "habre ": "abre ",
+        "buscar ": "busca ",
+        "búsca ": "busca ",
+        "ópera": "opera",
+        "you tube": "youtube",
+        "yutub": "youtube",
+        "git hub": "github",
+        "guit hub": "github",
+        "gijub": "github",
+        "pestaña": "pestana",
+        "pestañas": "pestanas",
+        "vídeos": "videos",
+    }
+
+    lower = text.lower()
+
+    for wrong, right in replacements.items():
+        lower = lower.replace(wrong, right)
+
+    return lower.strip()
+
+
+def open_url(url: str) -> str:
+    url = url.strip()
+
+    if not url:
+        return "No recibí una URL, patrón."
+
+    if not re.match(r"^https?://", url):
+        if "." in url and " " not in url:
+            url = "https://" + url
+        else:
+            url = build_search_url("google", url)
+
+    # Preferimos Opera GX Flatpak porque tú ya lo traes así.
+    if shutil.which("flatpak"):
+        try:
+            run_detached(["flatpak", "run", "com.opera.opera-gx", url])
+            return f"Abrí esta pestaña, patrón: {url}"
+        except Exception:
+            pass
+
+    # Fallback al navegador predeterminado.
+    run_detached(["xdg-open", url])
+    return f"Abrí esta URL con el navegador predeterminado, patrón: {url}"
+
+
+def build_search_url(engine: str, query: str) -> str:
+    engine = engine.strip().lower()
+    query = query.strip()
+
+    if engine not in SEARCH_ENGINES:
+        engine = "google"
+
+    return SEARCH_ENGINES[engine].format(query=quote_plus(query))
+
+
+def search_web(query: str, engine: str = "google") -> str:
+    query = query.strip()
+
+    if not query:
+        return "Necesito algo que buscar, patrón."
+
+    if is_blocked_query(query):
+        return "No voy a abrir ni buscar eso, patrón. Huele a desastre."
+
+    url = build_search_url(engine, query)
+    return open_url(url)
+
+
+def open_app(name: str) -> str:
+    key = name.strip().lower()
+
+    if key not in APP_COMMANDS:
+        return f"No tengo registrada la app '{name}', patrón."
+
+    candidates = APP_COMMANDS[key]
+
+    for args in candidates:
+        try:
+            run_detached(args)
+            return f"Abrí {name}, patrón."
+        except Exception:
+            continue
+
+    return f"No pude abrir {name}, patrón."
+
+
+def open_path(path: Path) -> str:
+    expanded = path.expanduser()
+
+    if not expanded.exists():
+        return f"No encontré la ruta: {expanded}"
+
+    run_detached(["xdg-open", str(expanded)])
+    return f"Abrí {expanded}, patrón."
+
+
+def open_project(name: str) -> str:
+    key = name.strip().lower()
+
+    if key not in PROJECTS:
+        return f"No tengo registrado el proyecto '{name}', patrón."
+
+    return open_path(PROJECTS[key])
+
+
+def open_folder(name: str) -> str:
+    key = name.strip().lower()
+
+    if key not in FOLDERS:
+        return f"No tengo registrada la carpeta '{name}', patrón."
+
+    folder = FOLDERS[key]
+
+    # Si Escritorio no existe, cae a Desktop.
+    if key == "escritorio" and not folder.exists():
+        folder = HOME / "Desktop"
+
+    return open_path(folder)
+
+
+def search_files(query: str, base: Path | None = None) -> str:
+    base = base or (HOME / "Documentos")
+    query = query.strip()
+
+    if not query:
+        return "Necesito algo que buscar, patrón."
+
+    if not base.exists():
+        return f"No existe la carpeta base: {base}"
+
+    cmd = [
+        "find",
+        str(base),
+        "-iname",
+        f"*{query}*",
+        "-print",
+    ]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            text=True,
+            capture_output=True,
+            timeout=20,
+        )
+    except subprocess.TimeoutExpired:
+        return "La búsqueda tardó demasiado, patrón. No voy a quedarme excavando como topo."
+
+    lines = result.stdout.strip().splitlines()
+
+    if not lines:
+        return f"No encontré archivos con '{query}' en {base}, patrón."
+
+    limited = lines[:15]
+    output = "\n".join(limited)
+
+    if len(lines) > 15:
+        output += f"\n...y {len(lines) - 15} resultados más."
+
+    return f"Encontré esto, patrón:\n{output}"
+
+
+def create_note(title: str, content: str = "") -> str:
+    notes_dir = HOME / "Documentos" / "crotolamo_notas"
+    notes_dir.mkdir(parents=True, exist_ok=True)
+
+    clean_title = "".join(
+        c if c.isalnum() or c in (" ", "_", "-") else "_"
+        for c in title
+    ).strip().replace(" ", "_")
+
+    if not clean_title:
+        clean_title = "nota"
+
+    path = notes_dir / f"{clean_title}.md"
+
+    if not content.strip():
+        content = f"# {title}\n\n"
+
+    path.write_text(content, encoding="utf-8")
+
+    return f"Nota creada, patrón: {path}"
+
+
+def system_status() -> str:
+    commands = {
+        "Disco": "df -h ~ | tail -n 1",
+        "RAM": "free -h | awk '/Mem:/ {print $3 \" usados de \" $2}'",
+        "Carga": "uptime",
+    }
+
+    parts = []
+
+    for label, cmd in commands.items():
+        result = subprocess.run(
+            cmd,
+            shell=True,
+            text=True,
+            capture_output=True,
+            executable="/bin/bash",
+        )
+        value = result.stdout.strip() or result.stderr.strip()
+        parts.append(f"{label}: {value}")
+
+    return "Estado del sistema, patrón:\n" + "\n".join(parts)
+
+
+def parse_search_command(text: str) -> str | None:
+    lower = normalize(text)
+
+    # abre youtube y busca videos de gatitos tiernos
+    match = re.match(r"^abre (google|youtube|github|wikipedia|duckduckgo) y busca (.+)$", lower)
+    if match:
+        engine, query = match.groups()
+        return search_web(query, engine)
+
+    # abre una pestana en youtube y busca videos de gatitos tiernos
+    match = re.match(r"^abre (?:una )?pestana en (google|youtube|github|wikipedia|duckduckgo) y busca (.+)$", lower)
+    if match:
+        engine, query = match.groups()
+        return search_web(query, engine)
+
+    # abre youtube para buscar videos de gatitos tiernos
+    match = re.match(r"^abre (google|youtube|github|wikipedia|duckduckgo) para buscar (.+)$", lower)
+    if match:
+        engine, query = match.groups()
+        return search_web(query, engine)
+
+    # busca en google motores cohete
+    match = re.match(r"^busca en (google|youtube|github|wikipedia|duckduckgo) (.+)$", lower)
+    if match:
+        engine, query = match.groups()
+        return search_web(query, engine)
+
+    # busca motores cohete en google
+    match = re.match(r"^busca (.+) en (google|youtube|github|wikipedia|duckduckgo)$", lower)
+    if match:
+        query, engine = match.groups()
+        return search_web(query, engine)
+
+    # googlea motores cohete
+    match = re.match(r"^googlea (.+)$", lower)
+    if match:
+        return search_web(match.group(1), "google")
+
+    # youtube motores cohete
+    match = re.match(r"^youtube (.+)$", lower)
+    if match:
+        return search_web(match.group(1), "youtube")
+
+    # abre opera y busca motores cohete
+    match = re.match(r"^abre opera y busca (.+)$", lower)
+    if match:
+        return search_web(match.group(1), "google")
+
+    # busca motores cohete
+    match = re.match(r"^busca (.+)$", lower)
+    if match:
+        return search_web(match.group(1), "google")
+
+    return None
+
+
+def parse_open_tab_command(text: str) -> str | None:
+    lower = normalize(text)
+
+    # abre pestaña de youtube
+    match = re.match(r"^abre (?:una )?pestana(?: de)? (.+)$", lower)
+    if match:
+        target = match.group(1).strip()
+
+        if target in COMMON_SITES:
+            return open_url(COMMON_SITES[target])
+
+        return open_url(target)
+
+    # abre google / abre youtube / abre github
+    match = re.match(r"^abre (.+)$", lower)
+    if match:
+        target = match.group(1).strip()
+
+        if target in COMMON_SITES:
+            return open_url(COMMON_SITES[target])
+
+        if target in APP_COMMANDS:
+            return open_app(target)
+
+        if target in PROJECTS:
+            return open_project(target)
+
+        if target in FOLDERS:
+            return open_folder(target)
+
+        if target.startswith("~/") or target.startswith("/"):
+            return open_path(Path(target))
+
+    return None
+
+
+def handle_direct_skill(text: str) -> str | None:
+    raw = clean_activation(text)
+    lower = normalize(raw)
+
+    if not lower:
+        return None
+
+    if lower in {"estado", "estado del sistema", "como esta la laptop", "cómo está la laptop"}:
+        return system_status()
+
+    # Búsquedas en navegador
+    result = parse_search_command(raw)
+    if result is not None:
+        return result
+
+    # Abrir pestañas, URLs, sitios, apps, proyectos, carpetas
+    result = parse_open_tab_command(raw)
+    if result is not None:
+        return result
+
+    if lower.startswith("abre proyecto "):
+        name = lower.replace("abre proyecto ", "", 1).strip()
+        return open_project(name)
+
+    if lower.startswith("busca archivo "):
+        query = raw.replace("busca archivo ", "", 1).strip()
+        return search_files(query)
+
+    if lower.startswith("encuentra archivo "):
+        query = raw.replace("encuentra archivo ", "", 1).strip()
+        return search_files(query)
+
+    if lower.startswith("crea nota "):
+        title = raw.replace("crea nota ", "", 1).strip()
+        return create_note(title)
+
+    if lower in {"abre mis documentos", "abre documentos"}:
+        return open_folder("documentos")
+
+    if lower in {"abre descargas", "abre mis descargas"}:
+        return open_folder("descargas")
+
+    if lower in {"abre escritorio", "abre mi escritorio"}:
+        return open_folder("escritorio")
+
+    return None

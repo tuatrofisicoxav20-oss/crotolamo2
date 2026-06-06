@@ -1,0 +1,182 @@
+import time
+from typing import Iterable
+
+try:
+    from core.voice_in import listen_once
+    from core.voice_out import speak
+    from core.skills import handle_direct_skill
+    from core.chapi_shell import ask_ollama, run_command
+except ImportError:
+    from voice_in import listen_once
+    from voice_out import speak
+    from skills import handle_direct_skill
+    from chapi_shell import ask_ollama, run_command
+
+
+WAKE_VARIANTS = [
+    "crotolamo",
+    "coto y amo",
+    "coto lamo",
+    "croto lamo",
+    "corto lamo",
+    "coto amo",
+    "crótolamo",
+]
+
+CONFIRM_VARIANTS = [
+    "sí",
+    "si",
+    "confirmo",
+    "ejecuta",
+    "dale",
+    "hazlo",
+    "va",
+    "correcto",
+]
+
+CANCEL_VARIANTS = [
+    "no",
+    "cancela",
+    "cancelar",
+    "nel",
+    "no lo hagas",
+]
+
+
+def say(text: str) -> None:
+    print(text, flush=True)
+    try:
+        speak(text)
+    except Exception as error:
+        print(f"[voz falló: {error}]", flush=True)
+
+
+def contains_any(text: str, variants: Iterable[str]) -> bool:
+    lower = text.lower()
+    return any(v in lower for v in variants)
+
+
+def strip_wake_word(text: str) -> str:
+    lower = text.lower().strip()
+
+    for wake in WAKE_VARIANTS:
+        if lower.startswith(wake):
+            return text[len(wake):].strip(" ,.:;-")
+
+    return text.strip()
+
+
+def ask_voice_confirmation() -> bool:
+    say("Patrón, necesito confirmación. Di confirmo para ejecutar o cancela para cancelar.")
+
+    try:
+        answer = listen_once(seconds=4)
+    except Exception as error:
+        print(f"Error escuchando confirmación: {error}", flush=True)
+        say("No pude escuchar la confirmación, patrón.")
+        return False
+
+    print(f"Confirmación escuchada: {answer}", flush=True)
+
+    if contains_any(answer, CANCEL_VARIANTS):
+        say("Cancelado, patrón.")
+        return False
+
+    if contains_any(answer, CONFIRM_VARIANTS):
+        return True
+
+    say("No escuché una confirmación clara, patrón. Cancelo por seguridad.")
+    return False
+
+
+def process_command(command: str) -> None:
+    command = command.strip()
+
+    if not command:
+        say("No escuché una orden clara, patrón.")
+        return
+
+    print(f"Orden: {command}", flush=True)
+
+    direct_result = handle_direct_skill(command)
+
+    if direct_result is not None:
+        print(direct_result, flush=True)
+        say(direct_result)
+        return
+
+    try:
+        plan = ask_ollama(command)
+    except Exception as error:
+        print(f"Error con Ollama: {error}", flush=True)
+        say("Tuve un error pensando la orden, patrón.")
+        return
+
+    explanation = plan.get("explanation", "Tengo un plan, patrón.")
+    commands = plan.get("commands", [])
+    safe = plan.get("safe", False)
+
+    print("\nPlan:", flush=True)
+    print(explanation, flush=True)
+    say(explanation)
+
+    if not commands:
+        say("No propuse comandos, patrón.")
+        return
+
+    if not safe:
+        say("No ejecuto eso, patrón. Huele a desastre.")
+        return
+
+    print("\nComandos propuestos:", flush=True)
+    for cmd in commands:
+        print(f"  {cmd}", flush=True)
+
+    if not ask_voice_confirmation():
+        return
+
+    for cmd in commands:
+        run_command(cmd)
+
+    say("Hecho, patrón.")
+
+
+def main() -> None:
+    say("Crotolamo listener activo, patrón.")
+
+    while True:
+        try:
+            print("\nEsperando palabra de activación...", flush=True)
+            heard = listen_once(seconds=4)
+            print(f"Escuché ambiente: {heard}", flush=True)
+
+            if not heard:
+                continue
+
+            if not contains_any(heard, WAKE_VARIANTS):
+                continue
+
+            possible_inline_command = strip_wake_word(heard)
+
+            say("Te escucho, patrón.")
+
+            if possible_inline_command:
+                command = possible_inline_command
+            else:
+                command = listen_once(seconds=7)
+
+            process_command(command)
+
+            time.sleep(1)
+
+        except KeyboardInterrupt:
+            say("Crotolamo listener apagado, patrón.")
+            break
+        except Exception as error:
+            print(f"Error en listener: {error}", flush=True)
+            say("Tuve un error en el listener, patrón.")
+            time.sleep(2)
+
+
+if __name__ == "__main__":
+    main()

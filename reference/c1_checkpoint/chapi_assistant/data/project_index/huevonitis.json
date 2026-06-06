@@ -1,0 +1,2931 @@
+{
+  "name": "huevonitis",
+  "root": "/home/exitili/Documentos/huevonitis version 2.1",
+  "created_at": "2026-05-08T15:40:14",
+  "total_files": 362,
+  "total_dirs": 40,
+  "indexed_files": [
+    {
+      "relpath": "app_state.py",
+      "size": 1091,
+      "ext": ".py",
+      "mtime": "2026-04-13T05:01:12",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "config.py",
+      "size": 1216,
+      "ext": ".py",
+      "mtime": "2026-05-06T15:21:17",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "main.py",
+      "size": 343,
+      "ext": ".py",
+      "mtime": "2026-04-19T12:49:14",
+      "kind": "python",
+      "important": true
+    },
+    {
+      "relpath": "README_RESTAURADO.txt",
+      "size": 248,
+      "ext": ".txt",
+      "mtime": "2026-04-13T05:01:12",
+      "kind": "docs",
+      "important": false
+    },
+    {
+      "relpath": ".gitignore",
+      "size": 384,
+      "ext": "<sin_ext>",
+      "mtime": "2026-05-06T15:36:25",
+      "kind": "sin_ext",
+      "important": false
+    },
+    {
+      "relpath": "bootstrap_refactor_structure.sh",
+      "size": 1100,
+      "ext": ".sh",
+      "mtime": "2026-04-23T09:47:35",
+      "kind": "script",
+      "important": false
+    },
+    {
+      "relpath": "Mi_cuaderno_c972c9b9.json",
+      "size": 6030,
+      "ext": ".json",
+      "mtime": "2026-04-25T20:31:41",
+      "kind": "config",
+      "important": false
+    },
+    {
+      "relpath": "requirements.txt",
+      "size": 127,
+      "ext": ".txt",
+      "mtime": "2026-05-06T15:36:10",
+      "kind": "docs",
+      "important": true
+    },
+    {
+      "relpath": "assets/__init__.py",
+      "size": 0,
+      "ext": ".py",
+      "mtime": "2026-04-13T05:01:12",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "core/features.py",
+      "size": 67975,
+      "ext": ".py",
+      "mtime": "2026-04-20T20:46:15",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "core/models.py",
+      "size": 9878,
+      "ext": ".py",
+      "mtime": "2026-04-20T17:21:20",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "core/notes_ai.py",
+      "size": 3945,
+      "ext": ".py",
+      "mtime": "2026-04-13T05:01:12",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "core/project_manager.py",
+      "size": 3053,
+      "ext": ".py",
+      "mtime": "2026-04-20T08:57:27",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "core/serializer.py",
+      "size": 4824,
+      "ext": ".py",
+      "mtime": "2026-04-20T17:21:20",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "core/__init__.py",
+      "size": 23,
+      "ext": ".py",
+      "mtime": "2026-04-13T05:01:12",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "data/autosave/Mi_cuaderno_7df79a2f_autosave.json",
+      "size": 8222,
+      "ext": ".json",
+      "mtime": "2026-04-21T07:22:20",
+      "kind": "config",
+      "important": false
+    },
+    {
+      "relpath": "data/autosave/Mi_cuaderno_5a1009da_autosave.json",
+      "size": 9444,
+      "ext": ".json",
+      "mtime": "2026-04-22T10:01:17",
+      "kind": "config",
+      "important": false
+    },
+    {
+      "relpath": "data/autosave/Mi_cuaderno_7abde7e1_autosave.json",
+      "size": 8719,
+      "ext": ".json",
+      "mtime": "2026-04-23T19:38:40",
+      "kind": "config",
+      "important": false
+    },
+    {
+      "relpath": "data/autosave/Mi_cuaderno_c2f5b985_autosave.json",
+      "size": 6573,
+      "ext": ".json",
+      "mtime": "2026-04-23T23:10:37",
+      "kind": "config",
+      "important": false
+    },
+    {
+      "relpath": "data/autosave/Mi_cuaderno_310de249_autosave.json",
+      "size": 6602,
+      "ext": ".json",
+      "mtime": "2026-04-23T23:11:29",
+      "kind": "config",
+      "important": false
+    },
+    {
+      "relpath": "data/autosave/Mi_cuaderno_a41210f1_autosave.json",
+      "size": 6575,
+      "ext": ".json",
+      "mtime": "2026-04-24T17:55:21",
+      "kind": "config",
+      "important": false
+    },
+    {
+      "relpath": "data/autosave/Mi_cuaderno_8e2f515c_autosave.json",
+      "size": 6422,
+      "ext": ".json",
+      "mtime": "2026-04-25T20:47:12",
+      "kind": "config",
+      "important": false
+    },
+    {
+      "relpath": "data/autosave/Mi_cuaderno_7e08554b_autosave.json",
+      "size": 6570,
+      "ext": ".json",
+      "mtime": "2026-04-26T08:53:29",
+      "kind": "config",
+      "important": false
+    },
+    {
+      "relpath": "data/autosave/Mi_cuaderno_0c130568_autosave.json",
+      "size": 6564,
+      "ext": ".json",
+      "mtime": "2026-04-26T12:11:05",
+      "kind": "config",
+      "important": false
+    },
+    {
+      "relpath": "data/autosave/Mi_cuaderno_0deea413_autosave.json",
+      "size": 6568,
+      "ext": ".json",
+      "mtime": "2026-04-26T12:17:43",
+      "kind": "config",
+      "important": false
+    },
+    {
+      "relpath": "data/autosave/Mi_cuaderno_86b92375_autosave.json",
+      "size": 6570,
+      "ext": ".json",
+      "mtime": "2026-04-26T17:38:38",
+      "kind": "config",
+      "important": false
+    },
+    {
+      "relpath": "data/autosave/Mi_cuaderno_0fb252ec_autosave.json",
+      "size": 6570,
+      "ext": ".json",
+      "mtime": "2026-04-26T18:18:21",
+      "kind": "config",
+      "important": false
+    },
+    {
+      "relpath": "data/autosave/Mi_cuaderno_9be13439_autosave.json",
+      "size": 23400,
+      "ext": ".json",
+      "mtime": "2026-04-26T18:27:48",
+      "kind": "config",
+      "important": false
+    },
+    {
+      "relpath": "data/generated_handwriting/hand_1.png",
+      "size": 16370,
+      "ext": ".png",
+      "mtime": "2026-04-25T20:43:44",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "data/autosave_guardadas/Mi_cuaderno_22b634f8_autosave.json",
+      "size": 9281,
+      "ext": ".json",
+      "mtime": "2026-04-20T10:45:24",
+      "kind": "config",
+      "important": false
+    },
+    {
+      "relpath": "data/autosave_guardadas/Mi_cuaderno_960c462f_autosave.json",
+      "size": 6433,
+      "ext": ".json",
+      "mtime": "2026-04-20T09:04:05",
+      "kind": "config",
+      "important": false
+    },
+    {
+      "relpath": "data/autosave_guardadas/Mi_cuaderno_dffe435d_autosave.json",
+      "size": 3858,
+      "ext": ".json",
+      "mtime": "2026-04-19T16:23:56",
+      "kind": "config",
+      "important": false
+    },
+    {
+      "relpath": "data/autosave_guardadas/Mi_cuaderno_f559cfcf_autosave.json",
+      "size": 6842,
+      "ext": ".json",
+      "mtime": "2026-04-20T16:31:59",
+      "kind": "config",
+      "important": false
+    },
+    {
+      "relpath": "editor/canvas_editor.py",
+      "size": 15934,
+      "ext": ".py",
+      "mtime": "2026-04-20T18:50:30",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "editor/selection_tool.py",
+      "size": 4123,
+      "ext": ".py",
+      "mtime": "2026-04-16T20:34:00",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "editor/__init__.py",
+      "size": 0,
+      "ext": ".py",
+      "mtime": "2026-04-13T05:01:12",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_manifest_WhatsApp Image 2026-04-20 at 9.22.19 AM.json",
+      "size": 3900,
+      "ext": ".json",
+      "mtime": "2026-04-20T09:36:02",
+      "kind": "config",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_manifest_batch.json",
+      "size": 694,
+      "ext": ".json",
+      "mtime": "2026-04-22T10:17:21",
+      "kind": "config",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_manifest_WhatsApp Image 2026-04-20 at 9.40.51 AM.json",
+      "size": 2527,
+      "ext": ".json",
+      "mtime": "2026-04-20T10:17:44",
+      "kind": "config",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_duplicate_report.json",
+      "size": 13598,
+      "ext": ".json",
+      "mtime": "2026-04-20T16:01:55",
+      "kind": "config",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_bank_cleanup_report.json",
+      "size": 3809,
+      "ext": ".json",
+      "mtime": "2026-04-21T11:45:18",
+      "kind": "config",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_glyph_manifest.json",
+      "size": 169168,
+      "ext": ".json",
+      "mtime": "2026-04-22T10:17:21",
+      "kind": "config",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_review_queue.json",
+      "size": 68488,
+      "ext": ".json",
+      "mtime": "2026-04-22T10:18:16",
+      "kind": "config",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_review_log.jsonl",
+      "size": 21995,
+      "ext": ".jsonl",
+      "mtime": "2026-04-22T10:18:16",
+      "kind": "jsonl",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/a_001.png",
+      "size": 656,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:17:20",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/b_001.png",
+      "size": 674,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:17:20",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/c_001.png",
+      "size": 633,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:17:20",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/d_001.png",
+      "size": 708,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:17:20",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/e_001.png",
+      "size": 525,
+      "ext": ".png",
+      "mtime": "2026-04-21T12:30:08",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/f_001.png",
+      "size": 690,
+      "ext": ".png",
+      "mtime": "2026-04-21T12:30:08",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/g_001.png",
+      "size": 683,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:17:20",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/h_001.png",
+      "size": 672,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:17:20",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/k_001.png",
+      "size": 757,
+      "ext": ".png",
+      "mtime": "2026-04-21T12:30:08",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/m_001.png",
+      "size": 542,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:17:20",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/o_001.png",
+      "size": 622,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:08:05",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/u_001.png",
+      "size": 556,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:08:05",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/x_001.png",
+      "size": 194,
+      "ext": ".png",
+      "mtime": "2026-04-21T12:30:08",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_preview_sheet.png",
+      "size": 41412,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:17:21",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/l_accepted.png",
+      "size": 757,
+      "ext": ".png",
+      "mtime": "2026-04-21T12:29:18",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/n_accepted.png",
+      "size": 745,
+      "ext": ".png",
+      "mtime": "2026-04-21T12:29:18",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/p_001.png",
+      "size": 567,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:08:05",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/r_001.png",
+      "size": 606,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:08:05",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/s_001.png",
+      "size": 596,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:08:05",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/t_001.png",
+      "size": 488,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:08:05",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/v_001.png",
+      "size": 585,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:08:05",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/w_001.png",
+      "size": 660,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:08:05",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/y_001.png",
+      "size": 527,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:08:05",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/z_001.png",
+      "size": 583,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:08:05",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/j_001.png",
+      "size": 753,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:17:20",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/i_accepted.png",
+      "size": 1051,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:17:20",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/n_accepted_02.png",
+      "size": 910,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:17:20",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/q_accepted.png",
+      "size": 388,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:08:05",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/e_accepted.png",
+      "size": 1160,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:17:20",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/f_accepted.png",
+      "size": 1146,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:17:20",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/_bank_cleanup_report.json",
+      "size": 246,
+      "ext": ".json",
+      "mtime": "2026-04-21T10:40:59",
+      "kind": "config",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/a_001.png",
+      "size": 751,
+      "ext": ".png",
+      "mtime": "2026-04-22T09:38:50",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/_glyph_manifest.json",
+      "size": 332515,
+      "ext": ".json",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "config",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/b_001.png",
+      "size": 160,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:15",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/c_001.png",
+      "size": 717,
+      "ext": ".png",
+      "mtime": "2026-04-22T09:38:50",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/d_001.png",
+      "size": 249,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:15",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/e_001.png",
+      "size": 273,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:15",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/f_001.png",
+      "size": 283,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:15",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/_review_queue.json",
+      "size": 67580,
+      "ext": ".json",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "config",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/h_001.png",
+      "size": 476,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:15",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/j_001.png",
+      "size": 431,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:15",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/k_001.png",
+      "size": 151,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:31",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/_preview_sheet.png",
+      "size": 45781,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/_manifest_batch.json",
+      "size": 2506,
+      "ext": ".json",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "config",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/m_001.png",
+      "size": 180,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:31",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/o_001.png",
+      "size": 288,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:31",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/p_001.png",
+      "size": 202,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:31",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/q_001.png",
+      "size": 219,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:31",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/y_001.png",
+      "size": 162,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/g_001.png",
+      "size": 340,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:15",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/u_001.png",
+      "size": 139,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/x_001.png",
+      "size": 410,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:15",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/i_001.png",
+      "size": 484,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:15",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/n_001.png",
+      "size": 212,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:31",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/r_001.png",
+      "size": 490,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:31",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/t_001.png",
+      "size": 198,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/v_001.png",
+      "size": 242,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/w_001.png",
+      "size": 664,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:15",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/z_001.png",
+      "size": 238,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/A_001.png",
+      "size": 313,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/B_001.png",
+      "size": 534,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/C_001.png",
+      "size": 288,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/E_001.png",
+      "size": 196,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/G_001.png",
+      "size": 303,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/H_001.png",
+      "size": 155,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/I_001.png",
+      "size": 316,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/J_001.png",
+      "size": 249,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/K_001.png",
+      "size": 272,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/L_001.png",
+      "size": 761,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/M_001.png",
+      "size": 319,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/N_001.png",
+      "size": 209,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/O_001.png",
+      "size": 208,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/P_001.png",
+      "size": 285,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/Q_001.png",
+      "size": 244,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/R_001.png",
+      "size": 237,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/U_001.png",
+      "size": 699,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:15",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/W_001.png",
+      "size": 317,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/1_001.png",
+      "size": 277,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/3_001.png",
+      "size": 275,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/_grid_overlay_preview.png",
+      "size": 252397,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/l_001.png",
+      "size": 238,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:31",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/s_001.png",
+      "size": 214,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/D_001.png",
+      "size": 212,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/F_001.png",
+      "size": 279,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/S_001.png",
+      "size": 218,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/T_001.png",
+      "size": 285,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/V_001.png",
+      "size": 779,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/X_001.png",
+      "size": 223,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/Y_001.png",
+      "size": 175,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/Z_001.png",
+      "size": 285,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/0_001.png",
+      "size": 305,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/2_001.png",
+      "size": 279,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/4_001.png",
+      "size": 192,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/7_001.png",
+      "size": 135,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/a_acute_001.png",
+      "size": 247,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/i_acute_001.png",
+      "size": 158,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/o_acute_001.png",
+      "size": 146,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/u_acute_001.png",
+      "size": 163,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/A_acute_001.png",
+      "size": 748,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/O_acute_001.png",
+      "size": 231,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/U_acute_001.png",
+      "size": 320,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/n_tilde_001.png",
+      "size": 289,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/N_tilde_001.png",
+      "size": 274,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/u_dieresis_001.png",
+      "size": 158,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/U_dieresis_001.png",
+      "size": 271,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/dot_001.png",
+      "size": 326,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/comma_001.png",
+      "size": 771,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/semicolon_001.png",
+      "size": 202,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/colon_001.png",
+      "size": 147,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/exclamation_001.png",
+      "size": 202,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/question_001.png",
+      "size": 295,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/open_question_001.png",
+      "size": 272,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/open_exclamation_001.png",
+      "size": 294,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/paren_left_001.png",
+      "size": 218,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/paren_right_001.png",
+      "size": 357,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/bracket_left_001.png",
+      "size": 265,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/bracket_right_001.png",
+      "size": 778,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/brace_left_001.png",
+      "size": 174,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/plus_001.png",
+      "size": 199,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/minus_001.png",
+      "size": 275,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/slash_001.png",
+      "size": 217,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/general/base/apostrophe_001.png",
+      "size": 169,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:16:32",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_rejected_manual/i_review_001.png",
+      "size": 1302,
+      "ext": ".png",
+      "mtime": "2026-04-21T11:47:31",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_rejected_manual/j_review_001.png",
+      "size": 1364,
+      "ext": ".png",
+      "mtime": "2026-04-21T11:47:31",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_rejected_manual/l_review_001.png",
+      "size": 757,
+      "ext": ".png",
+      "mtime": "2026-04-21T11:47:31",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_rejected_manual/n_review_001.png",
+      "size": 745,
+      "ext": ".png",
+      "mtime": "2026-04-21T11:47:31",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_rejected_manual/p_review_001.png",
+      "size": 149,
+      "ext": ".png",
+      "mtime": "2026-04-21T11:47:31",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_rejected_manual/q_review_001.png",
+      "size": 150,
+      "ext": ".png",
+      "mtime": "2026-04-21T11:47:31",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_rejected_manual/r_review_001.png",
+      "size": 360,
+      "ext": ".png",
+      "mtime": "2026-04-21T11:47:31",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_rejected_manual/s_review_001.png",
+      "size": 363,
+      "ext": ".png",
+      "mtime": "2026-04-21T11:47:31",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_rejected_manual/t_review_001.png",
+      "size": 386,
+      "ext": ".png",
+      "mtime": "2026-04-21T11:47:31",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_rejected_manual/v_review_001.png",
+      "size": 252,
+      "ext": ".png",
+      "mtime": "2026-04-21T11:47:31",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_rejected_manual/w_review_001.png",
+      "size": 146,
+      "ext": ".png",
+      "mtime": "2026-04-21T11:47:31",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_rejected_manual/y_review_001.png",
+      "size": 139,
+      "ext": ".png",
+      "mtime": "2026-04-21T11:47:31",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_rejected_manual/z_review_001.png",
+      "size": 193,
+      "ext": ".png",
+      "mtime": "2026-04-21T11:47:31",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_rejected_manual/i_review_001_02.png",
+      "size": 1302,
+      "ext": ".png",
+      "mtime": "2026-04-21T12:29:18",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_rejected_manual/j_review_001_02.png",
+      "size": 1364,
+      "ext": ".png",
+      "mtime": "2026-04-21T12:29:18",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_rejected_manual/p_review_001_02.png",
+      "size": 149,
+      "ext": ".png",
+      "mtime": "2026-04-21T12:29:18",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_rejected_manual/q_review_001_02.png",
+      "size": 150,
+      "ext": ".png",
+      "mtime": "2026-04-21T12:29:18",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_rejected_manual/r_review_001_02.png",
+      "size": 360,
+      "ext": ".png",
+      "mtime": "2026-04-21T12:29:18",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_rejected_manual/s_review_001_02.png",
+      "size": 363,
+      "ext": ".png",
+      "mtime": "2026-04-21T12:29:18",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_rejected_manual/t_review_001_02.png",
+      "size": 386,
+      "ext": ".png",
+      "mtime": "2026-04-21T12:29:18",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_rejected_manual/v_review_001_02.png",
+      "size": 252,
+      "ext": ".png",
+      "mtime": "2026-04-21T12:29:18",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_rejected_manual/w_review_001_02.png",
+      "size": 146,
+      "ext": ".png",
+      "mtime": "2026-04-21T12:29:18",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_rejected_manual/y_review_001_02.png",
+      "size": 139,
+      "ext": ".png",
+      "mtime": "2026-04-21T12:29:18",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_rejected_manual/z_review_001_02.png",
+      "size": 193,
+      "ext": ".png",
+      "mtime": "2026-04-21T12:29:18",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_rejected_manual/j_review_001_03.png",
+      "size": 123,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:08:05",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_rejected_manual/l_review_001_02.png",
+      "size": 566,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:17:20",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_rejected_manual/p_review_001_03.png",
+      "size": 149,
+      "ext": ".png",
+      "mtime": "2026-04-21T12:30:08",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_rejected_manual/r_review_001_03.png",
+      "size": 360,
+      "ext": ".png",
+      "mtime": "2026-04-21T12:30:08",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_rejected_manual/s_review_001_03.png",
+      "size": 363,
+      "ext": ".png",
+      "mtime": "2026-04-21T12:30:08",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_rejected_manual/t_review_001_03.png",
+      "size": 386,
+      "ext": ".png",
+      "mtime": "2026-04-21T12:30:08",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_rejected_manual/v_review_001_03.png",
+      "size": 252,
+      "ext": ".png",
+      "mtime": "2026-04-21T12:30:08",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_rejected_manual/w_review_001_03.png",
+      "size": 146,
+      "ext": ".png",
+      "mtime": "2026-04-21T12:30:08",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_rejected_manual/y_review_001_03.png",
+      "size": 139,
+      "ext": ".png",
+      "mtime": "2026-04-21T12:30:08",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_rejected_manual/z_review_001_03.png",
+      "size": 193,
+      "ext": ".png",
+      "mtime": "2026-04-21T12:30:08",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_rejected_manual/a_review_001.png",
+      "size": 200,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:08:05",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_rejected_manual/d_review_001.png",
+      "size": 135,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:08:05",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_rejected_manual/k_review_001.png",
+      "size": 647,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:17:20",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_rejected_manual/m_review_001.png",
+      "size": 152,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:08:05",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_rejected_manual/x_review_001.png",
+      "size": 598,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:08:05",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/2_grid.png",
+      "size": 1431,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:02",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/0_grid.png",
+      "size": 1460,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:56:56",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/1_grid.png",
+      "size": 1435,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:56:57",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/3_grid.png",
+      "size": 1435,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:03",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/4_grid.png",
+      "size": 1371,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:04",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/7_grid.png",
+      "size": 1340,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:04",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/A_grid.png",
+      "size": 1469,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:04",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/A_acute_grid.png",
+      "size": 3389,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:04",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/B_grid.png",
+      "size": 2895,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:04",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/C_grid.png",
+      "size": 1451,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:05",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/D_grid.png",
+      "size": 1400,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:05",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/E_grid.png",
+      "size": 1376,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:05",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/F_grid.png",
+      "size": 1419,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:05",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/G_grid.png",
+      "size": 1460,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:05",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/H_grid.png",
+      "size": 1361,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:05",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/I_grid.png",
+      "size": 1472,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:05",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/J_grid.png",
+      "size": 1424,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:05",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/K_grid.png",
+      "size": 1434,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:05",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/L_grid.png",
+      "size": 3524,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:05",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/M_grid.png",
+      "size": 1484,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:05",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/N_grid.png",
+      "size": 1396,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:05",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/N_tilde_grid.png",
+      "size": 1417,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:06",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/O_grid.png",
+      "size": 1396,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:06",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/O_acute_grid.png",
+      "size": 1403,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:06",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/P_grid.png",
+      "size": 1431,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:06",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/Q_grid.png",
+      "size": 1404,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:06",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/R_grid.png",
+      "size": 1375,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:06",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/S_grid.png",
+      "size": 1392,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:06",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/T_grid.png",
+      "size": 1462,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:06",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/U_grid.png",
+      "size": 4399,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:06",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/U_acute_grid.png",
+      "size": 1467,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:06",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/U_dieresis_grid.png",
+      "size": 1406,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:06",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/V_grid.png",
+      "size": 3519,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:06",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/W_grid.png",
+      "size": 1468,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:06",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/X_grid.png",
+      "size": 1405,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:07",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/Y_grid.png",
+      "size": 1372,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:07",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/Z_grid.png",
+      "size": 1433,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:10",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/a_grid.png",
+      "size": 2181,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:10",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/a_acute_grid.png",
+      "size": 1394,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:11",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/apostrophe_grid.png",
+      "size": 1364,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:11",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/b_grid.png",
+      "size": 1817,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:11",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/brace_left_grid.png",
+      "size": 1345,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:11",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/bracket_left_grid.png",
+      "size": 1419,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:11",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/bracket_right_grid.png",
+      "size": 3215,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:11",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/c_grid.png",
+      "size": 2060,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:11",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/colon_grid.png",
+      "size": 1591,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:11",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/comma_grid.png",
+      "size": 3217,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:11",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/d_grid.png",
+      "size": 2855,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:11",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/dot_grid.png",
+      "size": 1496,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:12",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/e_grid.png",
+      "size": 2722,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:16",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/e_accepted_grid.png",
+      "size": 6360,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:16",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/exclamation_grid.png",
+      "size": 1386,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:12",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/f_grid.png",
+      "size": 3022,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:16",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/f_accepted_grid.png",
+      "size": 6477,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:16",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/g_grid.png",
+      "size": 2698,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:16",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/h_grid.png",
+      "size": 3110,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:16",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/i_grid.png",
+      "size": 2751,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:16",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/i_accepted_grid.png",
+      "size": 2106,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:16",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/i_acute_grid.png",
+      "size": 1357,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:16",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/j_grid.png",
+      "size": 2903,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:16",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/k_grid.png",
+      "size": 2211,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:16",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/l_grid.png",
+      "size": 1384,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:16",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/l_accepted_grid.png",
+      "size": 1791,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:16",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/m_grid.png",
+      "size": 1706,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:16",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/minus_grid.png",
+      "size": 1409,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:16",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/n_grid.png",
+      "size": 1391,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:16",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/n_accepted_grid.png",
+      "size": 2433,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:13",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/n_tilde_grid.png",
+      "size": 1428,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:57:13",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/o_grid.png",
+      "size": 1853,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:56:53",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/o_acute_grid.png",
+      "size": 1352,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:56:53",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/open_exclamation_grid.png",
+      "size": 1438,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:56:53",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/open_question_grid.png",
+      "size": 1436,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:56:53",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/p_grid.png",
+      "size": 1726,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:56:53",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/paren_left_grid.png",
+      "size": 1406,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:56:53",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/paren_right_grid.png",
+      "size": 1511,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:56:53",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/plus_grid.png",
+      "size": 1382,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:56:53",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/q_grid.png",
+      "size": 1403,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:56:53",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/q_accepted_grid.png",
+      "size": 1508,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:56:53",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/question_grid.png",
+      "size": 1445,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:56:53",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/r_grid.png",
+      "size": 3153,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:56:53",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/s_grid.png",
+      "size": 1769,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:56:53",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/semicolon_grid.png",
+      "size": 1384,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:56:52",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/slash_grid.png",
+      "size": 1410,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:56:52",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/t_grid.png",
+      "size": 1638,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:56:52",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/u_grid.png",
+      "size": 1734,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:56:52",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/u_acute_grid.png",
+      "size": 1364,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:56:52",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/u_dieresis_grid.png",
+      "size": 1359,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:56:52",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/v_grid.png",
+      "size": 1732,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:56:52",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/w_grid.png",
+      "size": 4010,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:56:52",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/x_grid.png",
+      "size": 2490,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:56:52",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/y_grid.png",
+      "size": 1731,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:56:52",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tipografia/_analysis_grids/z_grid.png",
+      "size": 1823,
+      "ext": ".png",
+      "mtime": "2026-04-22T10:56:50",
+      "kind": "asset",
+      "important": false
+    },
+    {
+      "relpath": "tools/handwriting_extractor_pro.py",
+      "size": 70839,
+      "ext": ".py",
+      "mtime": "2026-04-22T10:40:36",
+      "kind": "python",
+      "important": true
+    },
+    {
+      "relpath": "tools/glyph_bank_manager.py",
+      "size": 23038,
+      "ext": ".py",
+      "mtime": "2026-04-20T16:31:51",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "tools/detector_core_v1.py",
+      "size": 24793,
+      "ext": ".py",
+      "mtime": "2026-04-22T10:07:28",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "tools/review_queue_bridge_v1.py",
+      "size": 9997,
+      "ext": ".py",
+      "mtime": "2026-04-22T10:40:36",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "tools/glyph_editor_ops_v1.py",
+      "size": 3902,
+      "ext": ".py",
+      "mtime": "2026-04-22T10:50:18",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "tools/bank_analyzer_v1.py",
+      "size": 12224,
+      "ext": ".py",
+      "mtime": "2026-04-22T10:55:55",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "tools/style_profiler_v1.py",
+      "size": 10286,
+      "ext": ".py",
+      "mtime": "2026-05-06T15:29:57",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "tools/glyph_bank_manager_v6.py",
+      "size": 12248,
+      "ext": ".py",
+      "mtime": "2026-05-06T15:29:57",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "tools/master_dashboard_v1.py",
+      "size": 9784,
+      "ext": ".py",
+      "mtime": "2026-04-22T11:14:37",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "tools/detector_grid_v1.py",
+      "size": 9982,
+      "ext": ".py",
+      "mtime": "2026-04-22T11:33:34",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "tools/handwriting_extractor_pro.py.OK_FINAL",
+      "size": 70839,
+      "ext": ".ok_final",
+      "mtime": "2026-04-22T12:02:16",
+      "kind": "ok_final",
+      "important": true
+    },
+    {
+      "relpath": "tools/glyph_bank_manager.py.OK_FINAL",
+      "size": 23038,
+      "ext": ".ok_final",
+      "mtime": "2026-04-22T12:02:16",
+      "kind": "ok_final",
+      "important": false
+    },
+    {
+      "relpath": "tools/detector_core_v1.py.OK_FINAL",
+      "size": 24793,
+      "ext": ".ok_final",
+      "mtime": "2026-04-22T12:02:16",
+      "kind": "ok_final",
+      "important": false
+    },
+    {
+      "relpath": "tools/detector_grid_v1.py.OK_FINAL",
+      "size": 9982,
+      "ext": ".ok_final",
+      "mtime": "2026-04-22T12:02:16",
+      "kind": "ok_final",
+      "important": false
+    },
+    {
+      "relpath": "tools/review_queue_bridge_v1.py.OK_FINAL",
+      "size": 9997,
+      "ext": ".ok_final",
+      "mtime": "2026-04-22T12:02:16",
+      "kind": "ok_final",
+      "important": false
+    },
+    {
+      "relpath": "tools/glyph_bank_manager_v6.py.bak_importfix",
+      "size": 12248,
+      "ext": ".bak_importfix",
+      "mtime": "2026-05-06T15:29:57",
+      "kind": "bak_importfix",
+      "important": false
+    },
+    {
+      "relpath": "tools/style_profiler_v1.py.bak_importfix",
+      "size": 10286,
+      "ext": ".bak_importfix",
+      "mtime": "2026-05-06T15:29:57",
+      "kind": "bak_importfix",
+      "important": false
+    },
+    {
+      "relpath": "tools/_legacy_auto_20260422_112229/glyph_bank_manager_v2.py",
+      "size": 15985,
+      "ext": ".py",
+      "mtime": "2026-04-22T10:34:27",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "tools/_legacy_auto_20260422_112229/glyph_bank_manager_v3.py",
+      "size": 25092,
+      "ext": ".py",
+      "mtime": "2026-04-22T10:50:18",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "tools/_legacy_auto_20260422_112229/glyph_bank_manager_v4.py",
+      "size": 11243,
+      "ext": ".py",
+      "mtime": "2026-04-22T10:55:55",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "tools/_legacy_auto_20260422_112229/glyph_bank_manager_v5.py",
+      "size": 11389,
+      "ext": ".py",
+      "mtime": "2026-04-22T11:06:01",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "tools/_legacy_auto_20260422_112229/handwriting_extractor_pro_S3_bridge.py",
+      "size": 6348,
+      "ext": ".py",
+      "mtime": "2026-04-22T08:56:44",
+      "kind": "python",
+      "important": true
+    },
+    {
+      "relpath": "tools/_legacy_auto_20260422_112644/glyph_bank_manager_S3.py",
+      "size": 30650,
+      "ext": ".py",
+      "mtime": "2026-04-22T08:56:44",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "tools/_legacy_auto_20260422_112644/review_queue_bridge.py",
+      "size": 6786,
+      "ext": ".py",
+      "mtime": "2026-04-22T08:56:44",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "tools/_legacy_final/glyph_bank_manager.py.pre_consolidation_backup",
+      "size": 23038,
+      "ext": ".pre_consolidation_backup",
+      "mtime": "2026-04-22T11:55:52",
+      "kind": "pre_consolidation_backup",
+      "important": false
+    },
+    {
+      "relpath": "tools/_legacy_final/handwriting_extractor_pro.py.pre_consolidation_backup",
+      "size": 70839,
+      "ext": ".pre_consolidation_backup",
+      "mtime": "2026-04-22T11:55:52",
+      "kind": "pre_consolidation_backup",
+      "important": true
+    },
+    {
+      "relpath": "ui/main_window.py",
+      "size": 29455,
+      "ext": ".py",
+      "mtime": "2026-04-26T18:25:11",
+      "kind": "python",
+      "important": true
+    },
+    {
+      "relpath": "ui/main_window_before_indent_fix.py",
+      "size": 128680,
+      "ext": ".py",
+      "mtime": "2026-04-20T17:46:24",
+      "kind": "python",
+      "important": true
+    },
+    {
+      "relpath": "ui/__init__.py",
+      "size": 0,
+      "ext": ".py",
+      "mtime": "2026-04-13T05:01:12",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "ui/views/__init__.py",
+      "size": 370,
+      "ext": ".py",
+      "mtime": "2026-04-26T11:58:09",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "ui/views/topbar_view.py",
+      "size": 2079,
+      "ext": ".py",
+      "mtime": "2026-04-23T23:04:22",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "ui/views/pages_panel_view.py",
+      "size": 7332,
+      "ext": ".py",
+      "mtime": "2026-04-23T23:05:43",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "ui/views/text_panel_view.py",
+      "size": 4103,
+      "ext": ".py",
+      "mtime": "2026-04-23T23:06:46",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "ui/views/properties_panel_view.py",
+      "size": 8172,
+      "ext": ".py",
+      "mtime": "2026-04-23T23:04:22",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "ui/views/canvas_workspace_view.py",
+      "size": 0,
+      "ext": ".py",
+      "mtime": "2026-04-23T09:47:35",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "ui/views/statusbar_view.py",
+      "size": 1113,
+      "ext": ".py",
+      "mtime": "2026-04-23T23:04:22",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "ui/views/command_palette_dialog.py",
+      "size": 3321,
+      "ext": ".py",
+      "mtime": "2026-04-24T15:45:24",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "ui/views/command_center_view.py",
+      "size": 10676,
+      "ext": ".py",
+      "mtime": "2026-04-26T01:22:54",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "ui/views/right_canvas_view.py",
+      "size": 6346,
+      "ext": ".py",
+      "mtime": "2026-04-26T09:15:53",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "ui/views/left_workspace_view.py",
+      "size": 3515,
+      "ext": ".py",
+      "mtime": "2026-04-26T11:57:59",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "RUTA_DEL_BANCO/_style_profile_report.json",
+      "size": 442,
+      "ext": ".json",
+      "mtime": "2026-04-22T11:07:26",
+      "kind": "config",
+      "important": false
+    },
+    {
+      "relpath": "_legacy_root_20260422_112644/integrar_s3_main_window.py",
+      "size": 4020,
+      "ext": ".py",
+      "mtime": "2026-04-22T08:56:45",
+      "kind": "python",
+      "important": true
+    },
+    {
+      "relpath": "_legacy_root_20260422_112644/apply_extractor_s1_patch.py",
+      "size": 29926,
+      "ext": ".py",
+      "mtime": "2026-04-21T10:15:02",
+      "kind": "python",
+      "important": true
+    },
+    {
+      "relpath": "_legacy_root_20260422_112644/apply_review_queue_phase4_integration.py",
+      "size": 71505,
+      "ext": ".py",
+      "mtime": "2026-04-22T10:40:36",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "controllers/__init__.py",
+      "size": 0,
+      "ext": ".py",
+      "mtime": "2026-04-23T09:47:35",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "controllers/project_controller.py",
+      "size": 8559,
+      "ext": ".py",
+      "mtime": "2026-04-23T22:16:31",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "controllers/pages_controller.py",
+      "size": 11679,
+      "ext": ".py",
+      "mtime": "2026-04-26T18:18:25",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "controllers/canvas_controller.py",
+      "size": 2638,
+      "ext": ".py",
+      "mtime": "2026-04-24T15:51:27",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "controllers/typography_controller.py",
+      "size": 31965,
+      "ext": ".py",
+      "mtime": "2026-04-26T18:06:09",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "controllers/study_controller.py",
+      "size": 12051,
+      "ext": ".py",
+      "mtime": "2026-04-25T02:54:33",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "controllers/delivery_controller.py",
+      "size": 9966,
+      "ext": ".py",
+      "mtime": "2026-04-25T03:12:55",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "controllers/command_palette_controller.py",
+      "size": 5599,
+      "ext": ".py",
+      "mtime": "2026-04-24T15:45:45",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "controllers/export_controller.py",
+      "size": 1566,
+      "ext": ".py",
+      "mtime": "2026-04-26T16:57:36",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "controllers/element_properties_controller.py",
+      "size": 7521,
+      "ext": ".py",
+      "mtime": "2026-04-25T20:06:59",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "controllers/element_actions_controller.py",
+      "size": 6381,
+      "ext": ".py",
+      "mtime": "2026-04-25T20:42:54",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "controllers/history_controller.py",
+      "size": 3569,
+      "ext": ".py",
+      "mtime": "2026-04-26T12:16:49",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "controllers/selection_controller.py",
+      "size": 1000,
+      "ext": ".py",
+      "mtime": "2026-04-26T01:09:09",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "controllers/template_controller.py",
+      "size": 1655,
+      "ext": ".py",
+      "mtime": "2026-04-26T21:48:30",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "controllers/preview_controller.py",
+      "size": 1647,
+      "ext": ".py",
+      "mtime": "2026-04-26T18:04:36",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "services/__init__.py",
+      "size": 0,
+      "ext": ".py",
+      "mtime": "2026-04-23T09:47:35",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "services/project_service.py",
+      "size": 0,
+      "ext": ".py",
+      "mtime": "2026-04-23T09:47:35",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "services/handwriting_service.py",
+      "size": 0,
+      "ext": ".py",
+      "mtime": "2026-04-23T09:47:35",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "services/typography_bank_service.py",
+      "size": 0,
+      "ext": ".py",
+      "mtime": "2026-04-23T09:47:35",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "services/export_service.py",
+      "size": 0,
+      "ext": ".py",
+      "mtime": "2026-04-23T09:47:35",
+      "kind": "python",
+      "important": false
+    },
+    {
+      "relpath": "services/review_service.py",
+      "size": 0,
+      "ext": ".py",
+      "mtime": "2026-04-23T09:47:35",
+      "kind": "python",
+      "important": false
+    }
+  ],
+  "skipped_files": 0,
+  "ext_counts": {
+    ".png": 250,
+    ".py": 68,
+    ".json": 30,
+    ".ok_final": 5,
+    ".bak_importfix": 2,
+    ".pre_consolidation_backup": 2,
+    ".txt": 2,
+    ".jsonl": 1,
+    ".sh": 1,
+    "<sin_ext>": 1
+  },
+  "important_files": [
+    "main.py",
+    "requirements.txt",
+    "tools/handwriting_extractor_pro.py",
+    "tools/handwriting_extractor_pro.py.OK_FINAL",
+    "tools/_legacy_auto_20260422_112229/handwriting_extractor_pro_S3_bridge.py",
+    "tools/_legacy_final/handwriting_extractor_pro.py.pre_consolidation_backup",
+    "ui/main_window.py",
+    "ui/main_window_before_indent_fix.py",
+    "_legacy_root_20260422_112644/integrar_s3_main_window.py",
+    "_legacy_root_20260422_112644/apply_extractor_s1_patch.py"
+  ],
+  "warnings": []
+}

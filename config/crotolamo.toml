@@ -29,6 +29,8 @@ allowed_roots = [
 [projects]
 crotolamo  = "~/Documentos/crotolamo2"
 huevonitis = "~/Documentos/huevonitis 4"
+# Checkpoint de Crotolamo 1 guardado como referencia de migración (read-only).
+crotolamo1 = "~/Documentos/crotolamo2/reference/c1_checkpoint/chapi_assistant"
 
 [logging]
 # Nivel de log de diagnóstico (DEBUG/INFO/WARNING/ERROR). La env CROTOLAMO_LOG manda.

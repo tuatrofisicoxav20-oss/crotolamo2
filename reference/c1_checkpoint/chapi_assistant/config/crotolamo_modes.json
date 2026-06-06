@@ -1,0 +1,158 @@
+{
+  "active_mode": "crotolamo",
+  "modes": {
+    "crotolamo": {
+      "key": "crotolamo",
+      "title": "Crotolamo",
+      "path": "~/Documentos/chapi_assistant",
+      "description": "Asistente local general: terminal, voz, UI, skills, seguridad y diagnóstico.",
+      "color": "cyan",
+      "keywords": [
+        "crotolamo",
+        "asistente",
+        "runtime",
+        "orbital",
+        "ui"
+      ],
+      "habits": [
+        "Prioriza estabilidad del runtime antes de estética.",
+        "Sugiere comandos seguros primero y pide confirmación si modifican archivos."
+      ],
+      "diagnostic_commands": [
+        "python tools/crotolamo_doctor.py",
+        "python -m py_compile core/crotolamo_runtime.py ui/crotolamo_orbital_ui.py"
+      ]
+    },
+    "huevonitis": {
+      "key": "huevonitis",
+      "title": "Huevonitis",
+      "path": "~/Documentos/huevonitis version 2.1",
+      "description": "Proyecto de escritura/handwriting: extractor, glyph bank, tipografía realista, UI y flujo de revisión.",
+      "color": "magenta",
+      "keywords": [
+        "huevonitis",
+        "extractor",
+        "handwriting",
+        "letra",
+        "glyph",
+        "tipografia",
+        "ocr"
+      ],
+      "habits": [
+        "No tocar todo el extractor a ciegas: aislar traceback, módulo y función.",
+        "Proteger muestras/glyph bank antes de limpiar archivos.",
+        "Preferir mejoras medibles: detección, calidad de glifos, fallback y revisión humana."
+      ],
+      "diagnostic_commands": [
+        "pwd",
+        "find . -maxdepth 2 -type f | sort | sed -n '1,120p'",
+        "python -m py_compile main.py"
+      ]
+    },
+    "tletl": {
+      "key": "tletl",
+      "title": "Tletl",
+      "path": "~/Documentos/tletl_control_v4_1_ai_integrado",
+      "description": "Proyecto de gestos/holograma: MediaPipe, OpenCV, entrenamiento, Blender y prototipos de control.",
+      "color": "purple",
+      "keywords": [
+        "tletl",
+        "gestos",
+        "mediapipe",
+        "opencv",
+        "camara",
+        "blender",
+        "holograma",
+        "mano"
+      ],
+      "habits": [
+        "Separar captura, features, entrenamiento y UI para no mezclar mundos.",
+        "Medir cobertura de datasets antes de entrenar como si rezar fuera pipeline.",
+        "Cuidar Fedora/Wayland/cámara antes de culpar al modelo."
+      ],
+      "diagnostic_commands": [
+        "pwd",
+        "find . -maxdepth 2 -type f | sort | sed -n '1,120p'",
+        "python -m py_compile main.py train_gesture_lab.py 2>/dev/null || true"
+      ]
+    },
+    "fedora": {
+      "key": "fedora",
+      "title": "Fedora / Sistema",
+      "path": "~",
+      "description": "Diagnóstico y mantenimiento de Fedora, paquetes, audio, drivers, logs y rendimiento.",
+      "color": "blue",
+      "keywords": [
+        "fedora",
+        "linux",
+        "dnf",
+        "systemctl",
+        "journalctl",
+        "audio",
+        "driver",
+        "ram",
+        "bateria"
+      ],
+      "habits": [
+        "Primero diagnosticar, luego modificar. No disparar sudo como confeti.",
+        "Guardar salidas de error completas, no fotos borrosas de un traceback poseído."
+      ],
+      "diagnostic_commands": [
+        "uname -a",
+        "cat /etc/fedora-release",
+        "free -h",
+        "df -h ~",
+        "systemctl --failed --no-pager"
+      ]
+    },
+    "escuela": {
+      "key": "escuela",
+      "title": "Escuela",
+      "path": "~/Documentos",
+      "description": "Tareas, estudio, química, matemáticas, olimpiada, resúmenes y planes realistas.",
+      "color": "green",
+      "keywords": [
+        "escuela",
+        "tarea",
+        "quimica",
+        "mate",
+        "examen",
+        "olimpiada",
+        "estudiar"
+      ],
+      "habits": [
+        "Separar lo urgente de lo importante.",
+        "Usar bloques pequeños y entregables concretos para que sí se termine."
+      ],
+      "diagnostic_commands": [
+        "pwd",
+        "find . -maxdepth 2 -type d | sed -n '1,80p'"
+      ]
+    },
+    "laboratorio": {
+      "key": "laboratorio",
+      "title": "Laboratorio",
+      "path": "~/Documentos",
+      "description": "Electrónica, prototipos, garra robótica, sensores, piezas, pruebas y bitácora de inventos.",
+      "color": "yellow",
+      "keywords": [
+        "laboratorio",
+        "electronica",
+        "robot",
+        "garra",
+        "arduino",
+        "sensor",
+        "prototipo",
+        "hardware"
+      ],
+      "habits": [
+        "Empezar con prototipo mínimo medible antes de comprar medio AliExpress.",
+        "Separar mecánica, electrónica, control y software."
+      ],
+      "diagnostic_commands": [
+        "pwd",
+        "find . -maxdepth 2 -type d | sed -n '1,80p'"
+      ]
+    }
+  }
+}

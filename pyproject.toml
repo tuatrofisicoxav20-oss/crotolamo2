@@ -45,6 +45,8 @@ pythonpath = ["."]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+# reference/ es código viejo de C1 guardado como referencia: no se lintea.
+extend-exclude = ["reference"]
 
 [tool.mypy]
 # Básico y pragmático (L3): no perseguir perfección. Solo chequea lo anotado y

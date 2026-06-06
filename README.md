@@ -53,7 +53,10 @@ por git) con solo las claves que quieras cambiar.
 
 ## Procedencia (qué se migró de Crotolamo 1)
 
-Fuente: `~/Documentos/chapi_assistant` (la versión viva de C1).
+Fuente: `~/Documentos/chapi_assistant` (la versión viva de C1). El checkpoint más
+completo de C1 está guardado como referencia en `reference/c1_checkpoint/` y
+registrado como el proyecto `crotolamo1` (las tools de C2 pueden leerlo). Ver
+`reference/README.md`.
 
 | Pieza de C1 | Destino en C2 | Acción |
 |---|---|---|

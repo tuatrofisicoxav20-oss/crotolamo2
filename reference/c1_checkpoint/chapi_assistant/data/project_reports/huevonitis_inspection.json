@@ -1,0 +1,377 @@
+{
+  "project": "huevonitis",
+  "root": "/home/exitili/Documentos/huevonitis version 2.1",
+  "created_at": "2026-05-08T15:40:15",
+  "total_python_files": 68,
+  "likely_entrypoints": [
+    "main.py",
+    "_legacy_root_20260422_112644/apply_review_queue_phase4_integration.py",
+    "tools/_legacy_auto_20260422_112229/glyph_bank_manager_v2.py",
+    "tools/_legacy_auto_20260422_112229/glyph_bank_manager_v3.py",
+    "tools/_legacy_auto_20260422_112229/glyph_bank_manager_v4.py",
+    "tools/_legacy_auto_20260422_112229/glyph_bank_manager_v5.py",
+    "tools/_legacy_auto_20260422_112229/handwriting_extractor_pro_S3_bridge.py",
+    "tools/_legacy_auto_20260422_112644/glyph_bank_manager_S3.py",
+    "tools/bank_analyzer_v1.py",
+    "tools/glyph_bank_manager.py",
+    "tools/glyph_bank_manager_v6.py",
+    "tools/handwriting_extractor_pro.py",
+    "tools/master_dashboard_v1.py",
+    "tools/review_queue_bridge_v1.py",
+    "tools/style_profiler_v1.py",
+    "_legacy_root_20260422_112644/integrar_s3_main_window.py"
+  ],
+  "important_python_files": [
+    "ui/main_window.py",
+    "ui/main_window_before_indent_fix.py",
+    "_legacy_root_20260422_112644/apply_extractor_s1_patch.py",
+    "_legacy_root_20260422_112644/integrar_s3_main_window.py",
+    "main.py",
+    "tools/_legacy_auto_20260422_112229/handwriting_extractor_pro_S3_bridge.py",
+    "tools/handwriting_extractor_pro.py",
+    "ui/__init__.py",
+    "ui/views/__init__.py",
+    "ui/views/canvas_workspace_view.py",
+    "ui/views/command_center_view.py",
+    "ui/views/command_palette_dialog.py",
+    "ui/views/left_workspace_view.py",
+    "ui/views/pages_panel_view.py",
+    "ui/views/properties_panel_view.py",
+    "ui/views/right_canvas_view.py",
+    "ui/views/statusbar_view.py",
+    "ui/views/text_panel_view.py",
+    "ui/views/topbar_view.py"
+  ],
+  "external_imports": [
+    "PIL",
+    "app_state",
+    "bank_analyzer_v1",
+    "config",
+    "copy",
+    "cv2",
+    "detector_core_v1",
+    "detector_grid_v1",
+    "docx",
+    "glyph_editor_ops_v1",
+    "master_dashboard_v1",
+    "numpy",
+    "pytesseract",
+    "reportlab",
+    "review_queue_bridge",
+    "review_queue_bridge_v1",
+    "style_profiler_v1",
+    "textwrap",
+    "unicodedata",
+    "uuid"
+  ],
+  "todo_hits": [
+    {
+      "file": "tools/handwriting_extractor_pro.py",
+      "line": 644,
+      "text": "debug_dir = output_dir / \"_debug\""
+    },
+    {
+      "file": "tools/handwriting_extractor_pro.py",
+      "line": 646,
+      "text": "debug_dir.mkdir(parents=True, exist_ok=True)"
+    },
+    {
+      "file": "tools/handwriting_extractor_pro.py",
+      "line": 659,
+      "text": "debug_img = cv2.cvtColor(clean, cv2.COLOR_GRAY2BGR)"
+    },
+    {
+      "file": "tools/handwriting_extractor_pro.py",
+      "line": 663,
+      "text": "cv2.rectangle(debug_img, (line_box.x, line_box.y), (line_box.x2, line_box.y2), (255, 140, 0), 1)"
+    },
+    {
+      "file": "tools/handwriting_extractor_pro.py",
+      "line": 760,
+      "text": "cv2.imwrite(str(debug_dir / f\"line_{line_idx:03d}.png\"), line_dbg)"
+    },
+    {
+      "file": "tools/handwriting_extractor_pro.py",
+      "line": 762,
+      "text": "cv2.imwrite(str(debug_dir / \"mask_clean.png\"), clean)"
+    },
+    {
+      "file": "tools/handwriting_extractor_pro.py",
+      "line": 763,
+      "text": "cv2.imwrite(str(debug_dir / \"mask_raw.png\"), raw_mask)"
+    },
+    {
+      "file": "tools/handwriting_extractor_pro.py",
+      "line": 764,
+      "text": "cv2.imwrite(str(debug_dir / \"debug_overview.png\"), debug_img)"
+    },
+    {
+      "file": "tools/handwriting_extractor_pro.py",
+      "line": 817,
+      "text": "debug_dir = output_dir / \"_debug\""
+    },
+    {
+      "file": "tools/handwriting_extractor_pro.py",
+      "line": 819,
+      "text": "debug_dir.mkdir(parents=True, exist_ok=True)"
+    },
+    {
+      "file": "tools/handwriting_extractor_pro.py",
+      "line": 825,
+      "text": "debug_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)"
+    },
+    {
+      "file": "tools/handwriting_extractor_pro.py",
+      "line": 842,
+      "text": "cv2.rectangle(debug_img, (left, top), (right, bottom), (255, 140, 0), 1)"
+    },
+    {
+      "file": "tools/handwriting_extractor_pro.py",
+      "line": 843,
+      "text": "cv2.putText(debug_img, ch, (left + 4, top + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 170, 255), 1)"
+    },
+    {
+      "file": "tools/handwriting_extractor_pro.py",
+      "line": 873,
+      "text": "cv2.imwrite(str(debug_dir / \"grid_debug.png\"), debug_img)"
+    },
+    {
+      "file": "tools/handwriting_extractor_pro.py",
+      "line": 874,
+      "text": "cv2.imwrite(str(debug_dir / \"mask_clean.png\"), clean)"
+    },
+    {
+      "file": "tools/handwriting_extractor_pro.py",
+      "line": 931,
+      "text": "debug_dir = output_dir / \"_debug\""
+    },
+    {
+      "file": "tools/handwriting_extractor_pro.py",
+      "line": 933,
+      "text": "debug_dir.mkdir(parents=True, exist_ok=True)"
+    },
+    {
+      "file": "tools/handwriting_extractor_pro.py",
+      "line": 945,
+      "text": "cv2.imwrite(str(debug_dir / \"grid_debug_v1.png\"), result[\"debug_bgr\"])"
+    },
+    {
+      "file": "tools/handwriting_extractor_pro.py",
+      "line": 946,
+      "text": "result[\"mask_pil\"].save(debug_dir / \"mask_clean_v1.png\")"
+    },
+    {
+      "file": "tools/handwriting_extractor_pro.py",
+      "line": 1711,
+      "text": "lines += [\"\", f\"Total guardado: {grand_total}\", \"\", \"Se generaron _preview_sheet.png, _manifest_batch.json, _debug y _rejected cuando aplica.\"]"
+    },
+    {
+      "file": "tools/glyph_bank_manager_v6.py",
+      "line": 34,
+      "text": "self.status_var = tk.StringVar(value=\"Todos\")"
+    },
+    {
+      "file": "tools/glyph_bank_manager_v6.py",
+      "line": 104,
+      "text": "values=[\"Todos\", \"Saludable\", \"Mejorable\", \"Limpiar duplicados\", \"Inestable\", \"Revisión fuerte\", \"Recapturar urgente\", \"Crítico\"],"
+    },
+    {
+      "file": "tools/glyph_bank_manager_v6.py",
+      "line": 172,
+      "text": "if status and status != \"Todos\" and item.get(\"master_status\") != status:"
+    },
+    {
+      "file": "tools/detector_grid_v1.py",
+      "line": 30,
+      "text": "debug_bgr: np.ndarray"
+    },
+    {
+      "file": "tools/detector_grid_v1.py",
+      "line": 164,
+      "text": "debug = rectified.copy()"
+    },
+    {
+      "file": "tools/detector_grid_v1.py",
+      "line": 166,
+      "text": "cv2.line(debug, (x, 0), (x, h - 1), (40, 140, 255), 1)"
+    },
+    {
+      "file": "tools/detector_grid_v1.py",
+      "line": 168,
+      "text": "cv2.line(debug, (0, y), (w - 1, y), (40, 140, 255), 1)"
+    },
+    {
+      "file": "tools/detector_grid_v1.py",
+      "line": 170,
+      "text": "cv2.rectangle(debug, (cell.left, cell.top), (cell.right, cell.bottom), (0, 200, 0), 1)"
+    },
+    {
+      "file": "tools/detector_grid_v1.py",
+      "line": 172,
+      "text": "return GridDetection(mode=mode, columns=columns, rows=rows, cells=cells, mask=mask, debug_bgr=debug, rectified_bgr=rectified, vertical_positions=xs, horizontal_positions=ys)"
+    },
+    {
+      "file": "tools/detector_grid_v1.py",
+      "line": 223,
+      "text": "\"debug_bgr\": detection.debug_bgr,"
+    },
+    {
+      "file": "tools/_legacy_auto_20260422_112229/glyph_bank_manager_v2.py",
+      "line": 96,
+      "text": "tk.Label(top, text=\"Revisa pendientes, acepta/rechaza, reetiqueta y manda a cuarentena con contexto.\","
+    },
+    {
+      "file": "tools/_legacy_auto_20260422_112229/glyph_bank_manager_v2.py",
+      "line": 120,
+      "text": "tk.Checkbutton(row2, text=\"Solo pendientes\", variable=self.review_only_var, bg=\"#ffffff\").pack(side=\"left\", padx=8)"
+    },
+    {
+      "file": "tools/_legacy_auto_20260422_112229/glyph_bank_manager_v2.py",
+      "line": 234,
+      "text": "f\"Pendientes: {summary.get('pending', 0)}\","
+    },
+    {
+      "file": "tools/_legacy_auto_20260422_112229/glyph_bank_manager_v3.py",
+      "line": 234,
+      "text": "self.queue_count_label = tk.Label(sec1, text=\"Pendientes: 0\", bg=\"#ffffff\", fg=\"#111827\", font=(\"Segoe UI\", 9, \"bold\"))"
+    },
+    {
+      "file": "tools/_legacy_auto_20260422_112229/glyph_bank_manager_v3.py",
+      "line": 311,
+      "text": "self.queue_count_label.config(text=f\"Pendientes: {count_pending} | visibles: {len(self.filtered_ids)}\")"
+    },
+    {
+      "file": "tools/_legacy_auto_20260422_112229/handwriting_extractor_pro_S3_bridge.py",
+      "line": 160,
+      "text": "f\"Pendientes: {stats['pending']}\\n\""
+    },
+    {
+      "file": "tools/_legacy_auto_20260422_112644/glyph_bank_manager_S3.py",
+      "line": 241,
+      "text": "sec2 = self._section(parent, \"2. Review queue\", \"Pendientes, relabel, cuarentena y acciones rápidas.\")"
+    },
+    {
+      "file": "tools/_legacy_auto_20260422_112644/glyph_bank_manager_S3.py",
+      "line": 244,
+      "text": "self.review_stats_label = tk.Label(stats_row, text=\"Pendientes: 0\", bg=\"#fff7ed\", fg=\"#9a3412\", font=(\"Segoe UI\", 9, \"bold\"))"
+    },
+    {
+      "file": "tools/_legacy_auto_20260422_112644/glyph_bank_manager_S3.py",
+      "line": 350,
+      "text": "self.review_stats_label.config(text=f\"Pendientes: {stats['pending']} | Total: {stats['total']}\")"
+    },
+    {
+      "file": "tools/_legacy_auto_20260422_112644/glyph_bank_manager_S3.py",
+      "line": 367,
+      "text": "self.detail_box.insert(\"1.0\", \"No hay pendientes.\")"
+    },
+    {
+      "file": "ui/main_window_before_indent_fix.py",
+      "line": 488,
+      "text": "text=\"Todo lo importante en pestañas. Menos ruido, más puntería.\","
+    },
+    {
+      "file": "ui/main_window_before_indent_fix.py",
+      "line": 2273,
+      "text": "texto.append(\"Todos los caracteres tienen al menos 2 variantes.\")"
+    },
+    {
+      "file": "ui/main_window_before_indent_fix.py",
+      "line": 2373,
+      "text": "+ \"\\n\\n¿Quieres continuar de todos modos?\","
+    },
+    {
+      "file": "ui/main_window_before_indent_fix.py",
+      "line": 2750,
+      "text": "format_delivery_checklist(checklist) + \"\\n\\nLa entrega no está completamente lista. ¿Quieres empaquetarla de todos modos?\","
+    },
+    {
+      "file": "_legacy_root_20260422_112644/integrar_s3_main_window.py",
+      "line": 10,
+      "text": "raise SystemExit(f\"No pude reemplazar el método {name}\")"
+    },
+    {
+      "file": "_legacy_root_20260422_112644/apply_extractor_s1_patch.py",
+      "line": 491,
+      "text": "debug_dir = output_dir / \"_debug\""
+    },
+    {
+      "file": "_legacy_root_20260422_112644/apply_extractor_s1_patch.py",
+      "line": 494,
+      "text": "debug_dir.mkdir(parents=True, exist_ok=True)"
+    },
+    {
+      "file": "_legacy_root_20260422_112644/apply_extractor_s1_patch.py",
+      "line": 514,
+      "text": "debug_img = cv2.cvtColor(clean, cv2.COLOR_GRAY2BGR)"
+    },
+    {
+      "file": "_legacy_root_20260422_112644/apply_extractor_s1_patch.py",
+      "line": 526,
+      "text": "cv2.rectangle(debug_img, (line_box.x, line_box.y), (line_box.x2, line_box.y2), (255, 140, 0), 1)"
+    },
+    {
+      "file": "_legacy_root_20260422_112644/apply_extractor_s1_patch.py",
+      "line": 582,
+      "text": "cv2.imwrite(str(debug_dir / f\"line_{line_idx:03d}.png\"), line_dbg)"
+    }
+  ],
+  "large_files": [],
+  "top_dirs": [
+    {
+      "dir": "tipografia",
+      "files": 261
+    },
+    {
+      "dir": "tools",
+      "files": 26
+    },
+    {
+      "dir": "data",
+      "files": 18
+    },
+    {
+      "dir": "controllers",
+      "files": 15
+    },
+    {
+      "dir": "ui",
+      "files": 14
+    },
+    {
+      "dir": ".",
+      "files": 8
+    },
+    {
+      "dir": "core",
+      "files": 6
+    },
+    {
+      "dir": "services",
+      "files": 6
+    },
+    {
+      "dir": "_legacy_root_20260422_112644",
+      "files": 3
+    },
+    {
+      "dir": "editor",
+      "files": 3
+    },
+    {
+      "dir": "RUTA_DEL_BANCO",
+      "files": 1
+    },
+    {
+      "dir": "assets",
+      "files": 1
+    }
+  ],
+  "warnings": [],
+  "recommendations": [
+    "Entrypoint más probable: `main.py`. Úsalo como punto de prueba principal.",
+    "Genera o actualiza `requirements.txt` con las dependencias externas detectadas.",
+    "Hay TODO/FIXME/HACK pendientes. No todos son urgentes, pero conviene revisar los primeros antes de seguir metiendo features.",
+    "Siguiente paso sensato: correr inspección, elegir entrypoint principal y luego compilar solo archivos críticos."
+  ]
+}

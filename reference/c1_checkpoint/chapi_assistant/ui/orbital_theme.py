@@ -1,0 +1,16 @@
+THEME = {
+    "BG": "#040711",
+    "PANEL": "#081020",
+    "PANEL_2": "#0b1428",
+    "BORDER": "#1c3f67",
+    "CYAN": "#00ddff",
+    "BLUE": "#3b7cff",
+    "PURPLE": "#b23cff",
+    "MAGENTA": "#ff35d0",
+    "GREEN": "#00ff91",
+    "RED": "#ff405c",
+    "YELLOW": "#ffd166",
+    "TEXT": "#d9efff",
+    "MUTED": "#7e99b6",
+    "CARD": "#07101f",
+}
