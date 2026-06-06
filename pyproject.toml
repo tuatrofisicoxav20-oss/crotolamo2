@@ -23,6 +23,7 @@ voice = [
     "numpy",
     "scipy",
     "piper-tts",
+    "openwakeword",  # wake word ligero dedicado (M1)
 ]
 dev = [
     "pytest",

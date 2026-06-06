@@ -15,6 +15,7 @@ from crotolamo.settings import get_settings
 from crotolamo.voice import wake
 from crotolamo.voice.stt import STT, VoiceUnavailable
 from crotolamo.voice.tts import TTS
+from crotolamo.voice.wakeword import WakeWordDetector
 
 from interfaces.shell import build_agent
 
@@ -31,6 +32,10 @@ def run_listen(argv: list[str] | None = None) -> int:
     threshold = settings.wake.get("threshold", 0.67)
     variants = settings.wake.get("variants")
     silence_ms = settings.voice.get("vad_silence_ms", 800)
+
+    # M1: wake word dedicado con openWakeWord; si no está, fallback al difuso (Whisper).
+    wake_detector = WakeWordDetector.from_settings(settings)
+    use_oww = wake_detector.available()
 
     def say(text: str) -> None:
         print(text, flush=True)
@@ -55,27 +60,30 @@ def run_listen(argv: list[str] | None = None) -> int:
         print(f"No pude armar el agente, patrón: {error}")
         return 1
 
-    say("Crotolamo escuchando, patrón.")
+    modo = "openWakeWord" if use_oww else "wake difuso (Whisper)"
+    say(f"Crotolamo escuchando, patrón. (wake: {modo})")
 
     while True:
         try:
             print("\nEsperando palabra de activación...", flush=True)
             try:
-                heard = wake_stt.listen_once(silence_ms=silence_ms, max_seconds=5, start_timeout_s=6)
+                if use_oww:
+                    # Detector dedicado: bloquea hasta la activación; no transcribe,
+                    # así que el comando se graba SIEMPRE después.
+                    if not wake_detector.listen_for_wake(timeout_s=None):
+                        continue
+                else:
+                    # Fallback difuso: Whisper 'tiny' sobre el ambiente.
+                    heard = wake_stt.listen_once(silence_ms=silence_ms, max_seconds=5,
+                                                 start_timeout_s=6)
+                    if not heard or not wake.is_wake_word(heard, threshold, variants):
+                        continue
             except VoiceUnavailable as error:
                 print(str(error))
                 return 1
 
-            if not heard or not wake.is_wake_word(heard, threshold, variants):
-                continue
-
-            inline = wake.strip_wake_word(heard, variants)
             say("Te escucho, patrón.")
-
-            if inline and not wake.is_wake_word(inline, threshold, variants):
-                command = inline
-            else:
-                command = stt.listen_once(silence_ms=silence_ms)
+            command = stt.listen_once(silence_ms=silence_ms)
 
             if not command.strip():
                 say("No te escuché claro, patrón.")

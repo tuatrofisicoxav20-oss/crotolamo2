@@ -71,6 +71,10 @@ vad_silence_ms = 800
 [wake]
 target    = "crotolamo"
 threshold = 0.67
+# M1: wake word dedicado con openWakeWord. 'crotolamo' no tiene modelo pre-entrenado,
+# así que se usa un modelo PUENTE soportado hasta entrenar uno propio.
+oww_model     = "hey_jarvis"
+oww_threshold = 0.5
 variants  = [
     "crotolamo", "coto y amo", "coto lamo", "coto amo", "croto lamo",
     "croto el amo", "corto lamo", "corto la mano", "crotolo amo",
