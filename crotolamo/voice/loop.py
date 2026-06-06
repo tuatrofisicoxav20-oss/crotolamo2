@@ -20,13 +20,16 @@ import threading
 from queue import Empty, Queue
 
 from crotolamo.logging_setup import get_logger
+from crotolamo.voice.interfaces import SpeechToText, TextToSpeech
 from crotolamo.voice.tts import split_sentences
 
 log = get_logger("voice.loop")
 
 
 class VoiceLoop:
-    def __init__(self, agent, stt, tts, wake_detector, *, silence_ms: int = 640) -> None:
+    # L4: depende de las interfaces SpeechToText/TextToSpeech, no de STT/TTS concretos.
+    def __init__(self, agent, stt: SpeechToText, tts: TextToSpeech, wake_detector,
+                 *, silence_ms: int = 640) -> None:
         self.agent = agent
         self.stt = stt
         self.tts = tts

@@ -36,6 +36,16 @@ def test_tts_speak_without_voice_is_graceful(tmp_path, capsys):
     assert "voz desactivada" in capsys.readouterr().out
 
 
+def test_stt_tts_satisfy_protocols(tmp_path):
+    # L4: las clases concretas cumplen las interfaces (costura para Wyoming futuro).
+    from crotolamo.voice.interfaces import SpeechToText, TextToSpeech
+    from crotolamo.voice.stt import STT
+    from crotolamo.voice.tts import TTS
+
+    assert isinstance(STT(), SpeechToText)
+    assert isinstance(TTS(tmp_path / "v.onnx"), TextToSpeech)
+
+
 def test_stt_requires_deps_raises_clear_error():
     from crotolamo.voice import stt as stt_mod
 
