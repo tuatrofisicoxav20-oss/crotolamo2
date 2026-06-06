@@ -1,53 +1,28 @@
-"""Tests del loop concurrente con fakes (sin micrófono ni audio real)."""
+"""Tests del loop concurrente con fakes (sin micrófono ni audio real).
 
+Todos los tests de threads usan fakes y terminan con shutdown.set() + join(timeout).
+Ningún test toca audio real ni debe colgar.
+"""
+
+import queue
+import threading
 import time
-import types
 
-from crotolamo.voice.loop import VoiceLoop
+from crotolamo.voice.loop import END, MouthThread, Utterance
+from crotolamo.voice.state import Mode, SharedState
 
 
-class FakeTTS:
+# --- fakes compartidos ---
+class FakeTts:
     def __init__(self):
-        self.stopped = 0
         self.spoken = []
+        self.stopped = 0
 
-    def speak(self, sentence):
-        self.spoken.append(sentence)
+    def speak(self, text):
+        self.spoken.append(text)
 
     def stop(self):
         self.stopped += 1
-
-
-class FakeAgent:
-    def __init__(self, reply):
-        self.reply = reply
-        self.conversation = types.SimpleNamespace(add_user=lambda _t: None)
-
-    def handle_turn(self, command):
-        return self.reply
-
-
-class FakeWake:
-    def __init__(self, wake=False):
-        self._wake = wake
-
-    def available(self):
-        return True
-
-    def listen_for_wake(self, timeout_s=None):
-        time.sleep(0.05)  # evita busy-spin del thread de escucha en el test
-        return self._wake
-
-
-class FakeSTT:
-    def listen_once(self, **kwargs):
-        return ""
-
-
-def _make(reply="Hola, patrón. ¿Qué tal?"):
-    tts = FakeTTS()
-    loop = VoiceLoop(FakeAgent(reply), FakeSTT(), tts, FakeWake())
-    return loop, tts
 
 
 def _wait(cond, timeout=2.0):
@@ -55,53 +30,43 @@ def _wait(cond, timeout=2.0):
     while time.time() < end:
         if cond():
             return True
-        time.sleep(0.02)
+        time.sleep(0.01)
     return cond()
 
 
-# --- barge-in (M3.2) ---
-def test_barge_in_stops_tts_and_clears_queue():
-    loop, tts = _make()
-    loop.tts_queue.put("frase 1")
-    loop.tts_queue.put("frase 2")
-    loop.speaking.set()  # simula reproducción en curso
-
-    assert loop.barge_in() is True
-    assert tts.stopped == 1
-    assert loop.tts_queue.empty()
-
-
-def test_barge_in_noop_when_idle():
-    loop, tts = _make()
-    assert loop.barge_in() is False
-    assert tts.stopped == 0
-
-
-def test_barge_in_marks_interruption_in_history():
-    marks = []
-    loop, _ = _make()
-    loop.agent.conversation = types.SimpleNamespace(add_user=marks.append)
-    loop.tts_queue.put("algo")
-    loop.speaking.set()
-    loop.barge_in()
-    assert marks and "interrump" in marks[0].lower()
-
-
-# --- pipeline proceso -> habla (M3.1) ---
-def test_command_flows_to_speech():
-    loop, tts = _make(reply="Hola, patrón. Todo bien.")
-    loop.start()
+# --- M3.3: MouthThread ---
+def test_mouth_discards_old_turn():
+    tts = FakeTts()
+    state = SharedState()
+    q: queue.Queue = queue.Queue()
+    shutdown = threading.Event()
+    mouth = MouthThread(tts, q, state, shutdown)
+    mouth.start()
     try:
-        loop.command_queue.put("saluda")
-        # El thread de proceso parte la respuesta en frases y el de habla las dice.
-        assert _wait(lambda: len(tts.spoken) >= 2)
-        assert "Hola, patrón." in tts.spoken
+        # Avanzamos a turno 2 ANTES de encolar, para que el test sea determinista.
+        state.new_turn()
+        state.new_turn()  # turno actual = 2
+        q.put(Utterance("vieja", 1))   # de un turno abortado -> debe descartarse
+        q.put(Utterance("nueva", 2))   # vigente -> debe hablarse
+        assert _wait(lambda: tts.spoken == ["nueva"] and q.empty())
     finally:
-        loop.stop()
+        shutdown.set()
+        mouth.join(timeout=2.0)
+    assert not mouth.is_alive()
+    assert tts.spoken == ["nueva"]
 
 
-def test_stop_terminates_threads():
-    loop, _ = _make()
-    loop.start()
-    loop.stop()
-    assert all(not t.is_alive() for t in loop._threads)
+def test_mouth_end_sentinel_returns_to_idle():
+    tts = FakeTts()
+    state = SharedState()
+    state.set_mode(Mode.SPEAKING)
+    q: queue.Queue = queue.Queue()
+    shutdown = threading.Event()
+    mouth = MouthThread(tts, q, state, shutdown)
+    mouth.start()
+    try:
+        q.put(END)
+        assert _wait(lambda: state.get_mode() is Mode.IDLE)
+    finally:
+        shutdown.set()
+        mouth.join(timeout=2.0)
