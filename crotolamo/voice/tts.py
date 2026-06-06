@@ -99,3 +99,12 @@ class TTS:
         """Habla el texto frase por frase. Ya NO recarga el modelo: _get_voice() lo cachea."""
         for sentence in split_sentences(text):
             self.speak(sentence)
+
+    def stop(self) -> None:
+        """Corta la reproducción en curso (barge-in, M3). No-op si no hay audio."""
+        try:
+            import sounddevice as sd
+
+            sd.stop()
+        except Exception:  # noqa: BLE001 - sin sounddevice/dispositivo, nada que cortar
+            pass
