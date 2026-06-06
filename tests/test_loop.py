@@ -8,7 +8,7 @@ import queue
 import threading
 import time
 
-from crotolamo.voice.loop import END, MouthThread, Utterance
+from crotolamo.voice.loop import END, BrainThread, MouthThread, Utterance
 from crotolamo.voice.state import Mode, SharedState
 
 
@@ -70,3 +70,66 @@ def test_mouth_end_sentinel_returns_to_idle():
     finally:
         shutdown.set()
         mouth.join(timeout=2.0)
+
+
+# --- M3.4: BrainThread ---
+class FakeAgent:
+    def __init__(self, reply):
+        self.reply = reply
+
+    def handle_turn(self, command):
+        return self.reply
+
+
+class GatedAgent:
+    """Agente que se bloquea hasta que el test lo libera (para forzar el race)."""
+
+    def __init__(self, reply):
+        self.reply = reply
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def handle_turn(self, command):
+        self.started.set()
+        self.release.wait(timeout=2.0)
+        return self.reply
+
+
+def test_brain_enqueues_sentences_when_turn_unchanged():
+    state = SharedState()
+    state.new_turn()  # actual = 1
+    cmd_q: queue.Queue = queue.Queue()
+    tts_q: queue.Queue = queue.Queue()
+    shutdown = threading.Event()
+    brain = BrainThread(FakeAgent("Hola. Mundo."), cmd_q, tts_q, state, shutdown)
+    brain.start()
+    try:
+        cmd_q.put(("saluda", 1))
+        assert _wait(lambda: tts_q.qsize() >= 3)
+        got = [tts_q.get() for _ in range(3)]
+        assert [u.text for u in got[:2]] == ["Hola.", "Mundo."]
+        assert got[-1] is END
+    finally:
+        shutdown.set()
+        brain.join(timeout=2.0)
+
+
+def test_brain_drops_reply_if_turn_changed():
+    state = SharedState()
+    state.new_turn()  # actual = 1
+    agent = GatedAgent("Hola. Mundo.")
+    cmd_q: queue.Queue = queue.Queue()
+    tts_q: queue.Queue = queue.Queue()
+    shutdown = threading.Event()
+    brain = BrainThread(agent, cmd_q, tts_q, state, shutdown)
+    brain.start()
+    try:
+        cmd_q.put(("saluda", 1))
+        assert agent.started.wait(timeout=2.0)  # el brain ya está "pensando"
+        state.new_turn()                         # barge-in: actual = 2, invalida turno 1
+        agent.release.set()                      # dejamos terminar la inferencia vieja
+        time.sleep(0.1)
+        assert tts_q.empty()                     # su respuesta NO se encoló
+    finally:
+        shutdown.set()
+        brain.join(timeout=2.0)

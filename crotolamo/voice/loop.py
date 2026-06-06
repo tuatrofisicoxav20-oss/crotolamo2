@@ -17,6 +17,7 @@ from dataclasses import dataclass
 
 from crotolamo.logging_setup import get_logger
 from crotolamo.voice.state import Mode, SharedState
+from crotolamo.voice.tts import split_sentences
 
 log = get_logger("voice.loop")
 
@@ -57,3 +58,45 @@ class MouthThread(threading.Thread):
                 continue
             self.state.set_mode(Mode.SPEAKING)
             self.tts.speak(item.text)  # interrumpible (M3.1)
+
+
+class BrainThread(threading.Thread):
+    """Saca comandos, llama al agente y encola las frases con su turn_id (M3.4).
+
+    Nota honesta: agent.handle_turn llama al LLM por HTTP de forma BLOQUEANTE; no se
+    puede cancelar a media inferencia. Si hay barge-in mientras el LLM piensa, la
+    inferencia vieja termina en background pero su salida se DESCARTA por el check de
+    is_current(turn); el audio para al instante. Cancelar el LLM en vuelo es mejora
+    futura (streaming con check de turno).
+    """
+
+    def __init__(self, agent, command_queue: queue.Queue, tts_queue: queue.Queue,
+                 state: SharedState, shutdown: threading.Event) -> None:
+        super().__init__(name="Brain", daemon=True)
+        self.agent = agent
+        self.cmd_q = command_queue
+        self.tts_q = tts_queue
+        self.state = state
+        self.shutdown = shutdown
+
+    def run(self) -> None:
+        while not self.shutdown.is_set():
+            try:
+                command, turn = self.cmd_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            # El turno ya cambió (barge-in mientras esperaba en cola): ignora.
+            if not self.state.is_current(turn):
+                continue
+            self.state.set_mode(Mode.THINKING)
+            try:
+                reply = self.agent.handle_turn(command)
+            except Exception as error:  # noqa: BLE001 - un turno roto no mata el loop
+                log.warning("brain: %s", error)
+                continue
+            # Si interrumpieron mientras pensaba, NO encolar la respuesta vieja.
+            if not self.state.is_current(turn):
+                continue
+            for sentence in split_sentences(reply):
+                self.tts_q.put(Utterance(sentence, turn))
+            self.tts_q.put(END)
