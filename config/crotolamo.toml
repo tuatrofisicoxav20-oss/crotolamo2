@@ -43,6 +43,9 @@ max_iterations = 6
 [memory]
 # Ventana deslizante del historial conversacional (nº de turnos user+assistant).
 max_turns = 20
+# M5: al exceder max_turns, resumir los turnos viejos en vez de descartarlos.
+# Cuesta una llamada corta al LLM por compactación; default false para no gastar.
+compaction = false
 
 # Apps que el patrón puede abrir por nombre (open_app). Edítalas para tu entorno
 # (Hyprland): clave = lista de argumentos del comando. El 'terminal' se AUTODETECTA

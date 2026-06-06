@@ -23,12 +23,27 @@ def build_agent(confirm_fn=None) -> tuple[Agent, Conversation]:
     pide confirmación para tools inseguras (texto o voz).
     """
     settings = get_settings()
+    llm = LLMClient.from_settings(settings)
+
+    # M5: compaction por resumen (opcional, [memory].compaction). El summarizer es una
+    # llamada corta al LLM que condensa los turnos viejos en vez de tirarlos.
+    compaction = settings.memory.get("compaction", False)
+
+    def _summarize(text: str) -> str:
+        resp = llm.chat([
+            {"role": "system", "content": "Resume en español, muy breve, los hechos y "
+             "decisiones clave de esta conversación para conservar contexto. Sin relleno."},
+            {"role": "user", "content": text},
+        ])
+        return resp.content
+
     # M4.2: los hechos ya NO se inyectan en el system prompt aquí, sino vía pre-hook.
     conversation = Conversation(
         system_prompt(),
         max_turns=settings.memory.get("max_turns", 20),
+        compaction=compaction,
+        summarizer=_summarize if compaction else None,
     )
-    llm = LLMClient.from_settings(settings)
 
     # La Fase 2 cablea el registry de tools; si está disponible, lo usamos.
     try:

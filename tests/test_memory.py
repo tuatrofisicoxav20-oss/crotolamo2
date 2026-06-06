@@ -50,3 +50,43 @@ def test_reset_clears_history_but_keeps_system():
     conv.add_user("algo")
     conv.reset()
     assert conv.to_messages() == [{"role": "system", "content": "SYS"}]
+
+
+def test_compaction_summarizes_instead_of_dropping():
+    calls = {"n": 0}
+
+    def fake_summarizer(text):
+        calls["n"] += 1
+        return "RESUMEN"
+
+    conv = Conversation("SYS", max_turns=2, compaction=True, summarizer=fake_summarizer)
+    for i in range(6):
+        conv.add_user(f"u{i}")
+        conv.add_assistant(f"a{i}")
+
+    msgs = conv.to_messages()
+    assert msgs[0]["content"] == "SYS"
+    # Hay un mensaje de resumen anclado (no se perdió el contexto viejo en seco).
+    assert any("resumen" in m["content"].lower() for m in msgs)
+    assert calls["n"] >= 1  # se llamó al summarizer
+    # El historial sigue acotado (no crece sin límite).
+    users = [m for m in msgs if m["role"] == "user"]
+    assert len(users) <= 2
+
+
+def test_compaction_keeps_single_growing_summary():
+    conv = Conversation("SYS", max_turns=1, compaction=True, summarizer=lambda t: "S")
+    for i in range(5):
+        conv.add_user(f"u{i}")
+        conv.add_assistant(f"a{i}")
+    # Solo UN mensaje de resumen, por mucho que se compacte.
+    summaries = [m for m in conv.to_messages() if "resumen" in m["content"].lower()]
+    assert len(summaries) == 1
+
+
+def test_no_compaction_drops_as_before():
+    conv = Conversation("SYS", max_turns=2, compaction=False)
+    for i in range(5):
+        conv.add_user(f"u{i}")
+        conv.add_assistant(f"a{i}")
+    assert not any("resumen" in m["content"].lower() for m in conv.to_messages())
