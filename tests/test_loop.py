@@ -216,7 +216,9 @@ class FakeMic:
 
 
 def _ear(mic, state, *, allow_barge_in=False, silence_ms=64, tts=None,
-         wake_label="wake", voice_label="voice"):
+         wake_label="wake", voice_label="voice",
+         grace_ms=0, margin=0.0, min_chunks=1):
+    # Por defecto, gracia=0/min=1: barge-in de un solo chunk (conducta base M3.6).
     stt_q: queue.Queue = queue.Queue()
     tts_q: queue.Queue = queue.Queue()
     shutdown = threading.Event()
@@ -228,6 +230,8 @@ def _ear(mic, state, *, allow_barge_in=False, silence_ms=64, tts=None,
         tts=tts or FakeTts(),
         stt_queue=stt_q, tts_queue=tts_q, state=state, shutdown=shutdown,
         silence_ms=silence_ms, allow_barge_in=allow_barge_in,
+        barge_in_grace_ms=grace_ms, barge_in_threshold_margin=margin,
+        barge_in_min_chunks=min_chunks,
     )
     return ear, stt_q, tts_q, shutdown
 
@@ -310,3 +314,50 @@ def test_loop_starts_and_stops():
     vl.stop()
     # Si algún thread no respeta shutdown, esto los caza (deadlock de apagado).
     assert all(not t.is_alive() for t in vl.threads)
+
+
+# --- M3.8: mitigación de eco (gracia + persistencia) ---
+def _speaking_state():
+    s = SharedState()
+    s.new_turn()
+    s.set_mode(Mode.SPEAKING)
+    return s
+
+
+def test_barge_in_persistence_requires_multiple_chunks():
+    # Un pico suelto NO dispara (min_chunks=3); una racha sostenida SÍ.
+    s1 = _speaking_state()
+    ear1, _q, _t, sd1 = _ear(FakeMic(["voice"]), s1, allow_barge_in=True,
+                             grace_ms=0, min_chunks=3)
+    ear1.start()
+    try:
+        time.sleep(0.15)
+        assert s1.get_mode() is Mode.SPEAKING  # un pico no interrumpe
+    finally:
+        sd1.set()
+        ear1.join(timeout=2.0)
+
+    s2 = _speaking_state()
+    ear2, _q2, _t2, sd2 = _ear(FakeMic(["voice", "voice", "voice"]), s2,
+                               allow_barge_in=True, grace_ms=0, min_chunks=3)
+    ear2.start()
+    try:
+        assert _wait(lambda: s2.get_mode() is Mode.LISTENING)  # racha sí interrumpe
+        assert s2.turn_id == 2
+    finally:
+        sd2.set()
+        ear2.join(timeout=2.0)
+
+
+def test_barge_in_grace_ignores_early_voice():
+    # Con gracia amplia, la voz temprana (eco del arranque) se ignora.
+    state = _speaking_state()
+    ear, _q, _t, shutdown = _ear(FakeMic(["voice"] * 6), state, allow_barge_in=True,
+                                 grace_ms=5000, min_chunks=1)
+    ear.start()
+    try:
+        time.sleep(0.2)
+        assert state.get_mode() is Mode.SPEAKING  # gracia bloquea el barge-in
+    finally:
+        shutdown.set()
+        ear.join(timeout=2.0)

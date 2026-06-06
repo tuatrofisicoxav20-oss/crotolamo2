@@ -80,6 +80,11 @@ vad_threshold        = 0.8
 vad_preactivation_ms = 800
 # Silencio sostenido que cierra la grabación.
 vad_silence_ms       = 640
+# M3.8: mitigación de eco del barge-in (con altavoces y sin AEC). Con auriculares
+# es confiable; si con altavoces se auto-dispara, usa --no-barge-in.
+barge_in_grace_ms         = 400   # ignora barge-in los primeros ms tras empezar a hablar
+barge_in_threshold_margin = 0.1   # umbral VAD más alto mientras suena el TTS
+barge_in_min_chunks       = 5     # racha de chunks de voz para disparar (no un pico)
 
 [wake]
 target    = "crotolamo"

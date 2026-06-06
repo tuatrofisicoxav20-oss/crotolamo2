@@ -161,7 +161,9 @@ class EarThread(threading.Thread):
                  state: SharedState, shutdown: threading.Event, *,
                  vad_threshold: float = 0.8, silence_ms: int = 640,
                  max_command_s: float = 12.0, allow_barge_in: bool = False,
-                 chunk_ms: float = 32.0) -> None:
+                 chunk_ms: float = 32.0, barge_in_grace_ms: float = 400,
+                 barge_in_threshold_margin: float = 0.1,
+                 barge_in_min_chunks: int = 5) -> None:
         super().__init__(name="Ear", daemon=True)
         self.mic = mic
         self.wake_fn = wake_fn
@@ -174,12 +176,20 @@ class EarThread(threading.Thread):
         self.shutdown = shutdown
         self.vad_threshold = vad_threshold
         self.allow_barge_in = allow_barge_in
+        self._chunk_ms = chunk_ms
         self._silence_chunks = max(1, int(silence_ms / chunk_ms))
         self._max_chunks = int(max_command_s * 1000 / chunk_ms)
+        # M3.8: mitigación de eco (gracia + margen de umbral + persistencia).
+        self._grace_s = barge_in_grace_ms / 1000.0
+        self._margin = barge_in_threshold_margin
+        self._min_chunks = max(1, barge_in_min_chunks)
         self._turn = 0
         self._cmd_frames: list = []
         self._silent_run = 0
         self._cmd_count = 0
+        self._prev_mode = Mode.IDLE
+        self._speaking_since = 0.0
+        self._barge_run = 0
 
     def _start_command(self, preroll: list | None = None) -> None:
         # M2: arrancar con el buffer de pre-activación para no perder el inicio.
@@ -188,8 +198,25 @@ class EarThread(threading.Thread):
         self._cmd_count = 0
 
     def _is_patron_voice(self, chunk, mode) -> bool:
-        # M3.6: versión simple; M3.8 la endurece contra el eco.
-        return self.vad_fn(chunk) >= self.vad_threshold
+        """Detecta voz del patrón con mitigación de eco (M3.8), 3 capas:
+        1) ventana de gracia tras empezar a hablar, 2) umbral elevado en SPEAKING,
+        3) persistencia (N chunks consecutivos), no un pico suelto.
+        """
+        # Capa 2: umbral más alto mientras suena el TTS (el eco infla el VAD).
+        thr = self.vad_threshold + (self._margin if mode is Mode.SPEAKING else 0.0)
+        is_voice = self.vad_fn(chunk) >= thr
+        # Capa 1: gracia tras arrancar el habla (el eco del arranque es el peor).
+        in_grace = (mode is Mode.SPEAKING
+                    and (time.monotonic() - self._speaking_since) < self._grace_s)
+        if is_voice and not in_grace:
+            self._barge_run += 1
+        else:
+            self._barge_run = 0
+        # Capa 3: exige racha sostenida.
+        if self._barge_run >= self._min_chunks:
+            self._barge_run = 0
+            return True
+        return False
 
     def _finish_command(self) -> None:
         wav = self.to_wav(self._cmd_frames)
@@ -203,6 +230,11 @@ class EarThread(threading.Thread):
                 time.sleep(0.005)  # sin audio ahora mismo: no hacer busy-spin
                 continue
             mode = self.state.get_mode()
+            # M3.8: marca el inicio del habla para la ventana de gracia.
+            if mode is Mode.SPEAKING and self._prev_mode is not Mode.SPEAKING:
+                self._speaking_since = time.monotonic()
+                self._barge_run = 0
+            self._prev_mode = mode
 
             if mode is Mode.IDLE:
                 if self.wake_fn(chunk):
@@ -290,6 +322,13 @@ class VoiceLoop:
         self.cmd_q: queue.Queue = queue.Queue()
         self.tts_q: queue.Queue = queue.Queue()
         self.tts = tts
+        # M3.8: parámetros de mitigación de eco desde la config (config-first).
+        try:
+            from crotolamo.settings import get_settings
+
+            vcfg = get_settings().voice
+        except Exception:
+            vcfg = {}
         # Adapters reales por defecto; los tests inyectan fakes (no abre audio).
         self._mic = mic or _RealMic()
         ear = EarThread(
@@ -299,6 +338,9 @@ class VoiceLoop:
             to_wav or stt._frames_to_wav,
             tts, self.stt_q, self.tts_q, self.state, self.shutdown,
             allow_barge_in=allow_barge_in, silence_ms=silence_ms,
+            barge_in_grace_ms=vcfg.get("barge_in_grace_ms", 400),
+            barge_in_threshold_margin=vcfg.get("barge_in_threshold_margin", 0.1),
+            barge_in_min_chunks=vcfg.get("barge_in_min_chunks", 5),
         )
         self.threads = [
             ear,
