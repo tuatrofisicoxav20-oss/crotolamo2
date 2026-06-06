@@ -39,6 +39,16 @@ def _require(module: str):
         ) from error
 
 
+def _voice_cfg() -> dict:
+    """Sección [voice] de la config (o {} si no se puede cargar)."""
+    try:
+        from crotolamo.settings import get_settings
+
+        return get_settings().voice
+    except Exception:
+        return {}
+
+
 class STT:
     def __init__(self, model_size: str = "small", sample_rate: int = 16000,
                  language: str = "es") -> None:
@@ -73,15 +83,41 @@ class STT:
             wav.setframerate(self.sample_rate)
             wav.writeframes(data.tobytes())
 
-    def record_until_silence(self, silence_ms: int = 800, max_seconds: float = 12.0,
+    def record_until_silence(self, silence_ms: int | None = None, max_seconds: float = 12.0,
                              start_timeout_s: float = 4.0) -> Path:
-        """Graba hasta detectar `silence_ms` de silencio tras haber hablado (VAD por energía).
-
-        Args:
-            silence_ms: silencio sostenido que cierra la grabación.
-            max_seconds: tope duro de duración.
-            start_timeout_s: si no se detecta voz en este tiempo, corta.
+        """Graba hasta el silencio. Backend según [voice].vad_backend: 'silero' (M2)
+        o 'energy' (fallback). Silero suma un buffer de pre-activación para no
+        perder las primeras sílabas.
         """
+        voice = _voice_cfg()
+        if silence_ms is None:
+            silence_ms = voice.get("vad_silence_ms", 640)
+        backend = voice.get("vad_backend", "energy")
+
+        if backend == "silero":
+            try:
+                return self._record_silero(silence_ms, max_seconds, start_timeout_s, voice)
+            except VoiceUnavailable:
+                raise
+            except Exception as error:  # noqa: BLE001 - si silero falla, caemos a energía
+                print(f"[VAD silero falló ({error}); uso energía]")
+        return self._record_energy(silence_ms, max_seconds, start_timeout_s)
+
+    def _frames_to_wav(self, frames: list) -> Path:
+        """Normaliza los frames y los escribe a un WAV temporal."""
+        np = _require("numpy")
+        audio = np.concatenate(frames) if frames else np.zeros(1, dtype="float32")
+        peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+        if peak > 0:
+            audio = audio / peak * 0.9
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            path = Path(tmp.name)
+        self._write_wav(path, np.int16(audio * 32767))
+        return path
+
+    def _record_energy(self, silence_ms: int, max_seconds: float,
+                       start_timeout_s: float) -> Path:
+        """VAD por energía RMS. Calibra el piso de ruido con ~10 chunks (M1 audit)."""
         np = _require("numpy")
         sd = _require("sounddevice")
 
@@ -90,13 +126,12 @@ class STT:
         silence_chunks = max(1, int(silence_ms / chunk_ms))
         max_chunks = int(max_seconds * 1000 / chunk_ms)
         start_chunks = int(start_timeout_s * 1000 / chunk_ms)
-        # M1: calibrar el piso de ruido con ~10 chunks (≈300 ms), no con uno solo.
         calib_chunks = 10
 
         frames: list = []
         speaking = False
         silent_run = 0
-        threshold = None  # se fija tras la calibración
+        threshold = None
         calib_rms: list[float] = []
 
         with sd.InputStream(samplerate=self.sample_rate, channels=1, dtype="float32") as stream:
@@ -106,13 +141,11 @@ class STT:
                 frames.append(block)
                 rms = float(np.sqrt(np.mean(block ** 2)) + 1e-9)
 
-                # Fase de calibración: promediamos el ruido de ambiente.
                 if i < calib_chunks:
                     calib_rms.append(rms)
                     continue
                 if threshold is None:
                     noise_floor = float(np.mean(calib_rms)) if calib_rms else 0.0
-                    # Umbral de voz = 3x el piso de ruido medido, con mínimo de seguridad.
                     threshold = max(noise_floor * 3.0, 0.01)
 
                 if rms >= threshold:
@@ -126,15 +159,61 @@ class STT:
                 if not speaking and i >= start_chunks:
                     break
 
-        audio = np.concatenate(frames) if frames else np.zeros(1, dtype="float32")
-        peak = float(np.max(np.abs(audio))) if audio.size else 0.0
-        if peak > 0:
-            audio = audio / peak * 0.9
+        return self._frames_to_wav(frames)
 
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            path = Path(tmp.name)
-        self._write_wav(path, np.int16(audio * 32767))
-        return path
+    def _record_silero(self, silence_ms: int, max_seconds: float,
+                       start_timeout_s: float, voice: dict) -> Path:
+        """VAD neuronal Silero (de GLaDOS, M2). Probabilidad de voz por chunk de
+        32 ms + buffer circular de pre-activación para no perder el inicio.
+        """
+        np = _require("numpy")
+        sd = _require("sounddevice")
+        torch = _require("torch")
+        from collections import deque
+
+        from silero_vad import load_silero_vad
+
+        model = load_silero_vad(onnx=True)
+        model.reset_states()
+        threshold = voice.get("vad_threshold", 0.8)
+        pre_ms = voice.get("vad_preactivation_ms", 800)
+
+        chunk = 512  # Silero exige 512 muestras a 16 kHz (32 ms).
+        chunk_ms = chunk * 1000 / self.sample_rate
+        silence_chunks = max(1, int(silence_ms / chunk_ms))
+        max_chunks = int(max_seconds * 1000 / chunk_ms)
+        start_chunks = int(start_timeout_s * 1000 / chunk_ms)
+        pre_chunks = max(1, int(pre_ms / chunk_ms))
+
+        pre_buffer: deque = deque(maxlen=pre_chunks)
+        frames: list = []
+        speaking = False
+        silent_run = 0
+
+        with sd.InputStream(samplerate=self.sample_rate, channels=1, dtype="float32") as stream:
+            for i in range(max_chunks):
+                block, _ = stream.read(chunk)
+                block = np.squeeze(np.asarray(block, dtype=np.float32))
+                prob = float(model(torch.from_numpy(block.copy()), self.sample_rate))
+
+                if not speaking:
+                    pre_buffer.append(block)
+                    if prob >= threshold:
+                        speaking = True
+                        frames.extend(pre_buffer)  # M2.2: anteponer la pre-activación
+                        silent_run = 0
+                    elif i >= start_chunks:
+                        break
+                else:
+                    frames.append(block)
+                    if prob >= threshold:
+                        silent_run = 0
+                    else:
+                        silent_run += 1
+                        if silent_run >= silence_chunks:
+                            break
+
+        return self._frames_to_wav(frames)
 
     # --- transcripción ---
     def transcribe(self, path: Path) -> str:

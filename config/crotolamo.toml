@@ -65,8 +65,14 @@ whisper_model      = "base"
 wake_whisper_model = "tiny"
 piper_voice        = "es_MX-ald-medium.onnx"
 sample_rate        = 16000
-# VAD (Fase 5): cortar al silencio.
-vad_silence_ms = 800
+# VAD (M2, de GLaDOS): 'silero' (neuronal) o 'energy' (fallback sin modelo).
+vad_backend          = "silero"
+vad_threshold        = 0.8
+# Buffer de pre-activación: ms de audio previos que se anteponen para no perder
+# las primeras sílabas.
+vad_preactivation_ms = 800
+# Silencio sostenido que cierra la grabación.
+vad_silence_ms       = 640
 
 [wake]
 target    = "crotolamo"

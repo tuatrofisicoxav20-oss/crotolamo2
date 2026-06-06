@@ -24,6 +24,7 @@ voice = [
     "scipy",
     "piper-tts",
     "openwakeword",  # wake word ligero dedicado (M1)
+    "silero-vad",    # VAD neuronal + buffer de pre-activación (M2)
 ]
 dev = [
     "pytest",
