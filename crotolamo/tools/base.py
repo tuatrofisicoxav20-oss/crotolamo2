@@ -115,6 +115,12 @@ class Registry:
     def names(self) -> list[str]:
         return list(self._tools)
 
+    def copy(self) -> "Registry":
+        """Registry NUEVO con las mismas tools (m4: aislar del GLOBAL mutable)."""
+        new = Registry()
+        new._tools = dict(self._tools)
+        return new
+
     def schemas(self) -> list[dict[str, Any]]:
         return [t.schema() for t in self._tools.values()]
 

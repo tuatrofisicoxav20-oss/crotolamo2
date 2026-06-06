@@ -85,7 +85,7 @@ def add_fact(texto: str, categoria: str = "general", db_path: Path | None = None
         cur = conn.execute(
             "INSERT INTO facts (texto, categoria) VALUES (?, ?)", (texto, categoria)
         )
-        return int(cur.lastrowid)
+        return int(cur.lastrowid or 0)
 
 
 def get_facts(categoria: str | None = None, db_path: Path | None = None) -> list[dict]:

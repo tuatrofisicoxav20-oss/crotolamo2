@@ -29,6 +29,7 @@ voice = [
 dev = [
     "pytest",
     "ruff",
+    "mypy",
 ]
 
 [project.scripts]
@@ -44,3 +45,12 @@ pythonpath = ["."]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+
+[tool.mypy]
+# Básico y pragmático (L3): no perseguir perfección. Solo chequea lo anotado y
+# tolera las libs de voz sin stubs.
+python_version = "3.11"
+ignore_missing_imports = true
+check_untyped_defs = false
+warn_unused_ignores = false
+disable_error_code = ["var-annotated"]

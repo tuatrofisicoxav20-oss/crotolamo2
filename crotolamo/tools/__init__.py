@@ -21,4 +21,13 @@ def default_registry() -> Registry:
     return GLOBAL_REGISTRY
 
 
-__all__ = ["GLOBAL_REGISTRY", "Registry", "Tool", "tool", "default_registry"]
+def build_registry() -> Registry:
+    """Registry NUEVO y aislado con todas las tools (m4). Mutarlo no afecta al GLOBAL;
+    útil para tests o usos aislados.
+    """
+    return default_registry().copy()
+
+
+__all__ = [
+    "GLOBAL_REGISTRY", "Registry", "Tool", "tool", "default_registry", "build_registry",
+]

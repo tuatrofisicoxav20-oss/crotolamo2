@@ -64,3 +64,14 @@ def test_registry_run_dispatches():
 def test_registry_run_unknown_tool():
     reg = default_registry()
     assert "No tengo una tool" in reg.run("inexistente", {})
+
+
+def test_build_registry_is_isolated():
+    # m4: build_registry() da una copia; mutarla no afecta al GLOBAL_REGISTRY.
+    from crotolamo.tools import GLOBAL_REGISTRY, build_registry
+
+    reg = build_registry()
+    assert set(reg.names()) == set(GLOBAL_REGISTRY.names())
+    before = len(GLOBAL_REGISTRY.names())
+    reg._tools.clear()
+    assert len(GLOBAL_REGISTRY.names()) == before

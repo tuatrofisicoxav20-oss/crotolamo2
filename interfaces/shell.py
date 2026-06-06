@@ -127,7 +127,7 @@ def run_shell(argv: list[str] | None = None) -> int:
             print(f"\nCrotolamo > Anotado, patrón. Lo recordaré: «{fact}».\n")
             continue
 
-        if can_stream:
+        if can_stream and isinstance(agent, ToolAgent):
             print("\nCrotolamo > ", end="", flush=True)
             agent.handle_turn(user, on_token=lambda t: print(t, end="", flush=True))
             print("\n")
