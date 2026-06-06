@@ -13,10 +13,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from crotolamo.safety.paths import path_inside_allowed_roots
 from crotolamo.tools.base import Tool
 
 # Nombres de argumentos que típicamente contienen rutas de archivo (Fase 3).
 _PATH_ARG_NAMES = {"path", "ruta", "file", "archivo", "dest", "destino", "src", "origen", "dir"}
+
+# Prefijos que delatan una ruta del sistema de archivos (señal aparte del nombre).
+_PATH_PREFIXES = ("/", "~/", "./", "../")
+
+
+def _looks_like_path(value: str) -> bool:
+    return value.startswith(_PATH_PREFIXES)
 
 
 @dataclass
@@ -47,28 +55,21 @@ class Guard:
         return cls(settings.allowed_roots)
 
     def _path_inside_allowed(self, candidate: Path) -> bool:
-        try:
-            resolved = candidate.expanduser().resolve()
-        except (OSError, RuntimeError):
-            return False
-        for root in self.allowed_roots:
-            try:
-                resolved.relative_to(root)
-                return True
-            except ValueError:
-                continue
-        return False
+        return path_inside_allowed_roots(candidate, self.allowed_roots)
 
     def check(self, tool: Tool, arguments: dict) -> Decision:
         """Decide si una llamada a tool puede correr."""
-        # 1) Validar cualquier argumento que parezca una ruta contra el allowlist.
+        # 1) Validar contra el allowlist cualquier argumento que sea una ruta:
+        #    por nombre conocido (señal fuerte) O porque el valor parece un path.
         for arg_name, value in arguments.items():
-            if arg_name.lower() in _PATH_ARG_NAMES and isinstance(value, str) and value:
-                if not self._path_inside_allowed(Path(value)):
-                    return Decision.block(
-                        f"La ruta '{value}' está fuera de las zonas permitidas, patrón. "
-                        "No salgo del corral."
-                    )
+            if not isinstance(value, str) or not value:
+                continue
+            is_path_arg = arg_name.lower() in _PATH_ARG_NAMES or _looks_like_path(value)
+            if is_path_arg and not self._path_inside_allowed(Path(value)):
+                return Decision.block(
+                    f"La ruta '{value}' está fuera de las zonas permitidas, patrón. "
+                    "No salgo del corral."
+                )
 
         # 2) Tools marcadas como no-safe piden confirmación explícita.
         if not tool.safe:

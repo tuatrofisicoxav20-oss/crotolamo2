@@ -1,4 +1,17 @@
+import pytest
+
+from crotolamo import settings as settings_mod
 from crotolamo.tools import files
+
+
+@pytest.fixture(autouse=True)
+def allow_tmp(tmp_path, monkeypatch):
+    """Permite operar dentro de tmp_path: las tools de archivo revalidan la
+    allowlist (M2), así que sin esto rechazarían /tmp por estar fuera del corral.
+    """
+    real = settings_mod.get_settings()
+    monkeypatch.setattr(real, "allowed_roots", [tmp_path])
+    monkeypatch.setattr(settings_mod, "_SETTINGS", real)
 
 
 def test_write_then_read(tmp_path):
@@ -45,3 +58,21 @@ def test_destructive_tools_marked_unsafe():
     assert files.delete_file._crotolamo_tool.safe is False
     assert files.move_file._crotolamo_tool.safe is False
     assert files.write_file._crotolamo_tool.safe is True
+
+
+# --- defensa en profundidad (M2): la tool rechaza por sí sola, sin guard ---
+def test_write_outside_corral_rejected_directly():
+    # allow_tmp limita la allowlist a tmp_path; /etc queda fuera del corral.
+    out = files.write_file("/etc/se_cuela.txt", "x")
+    assert "corral" in out.lower() or "permitidas" in out.lower()
+    assert not __import__("pathlib").Path("/etc/se_cuela.txt").exists()
+
+
+def test_read_outside_corral_rejected_directly():
+    out = files.read_file("/etc/passwd")
+    assert "corral" in out.lower() or "permitidas" in out.lower()
+
+
+def test_delete_outside_corral_rejected_directly():
+    out = files.delete_file("/etc/hosts")
+    assert "corral" in out.lower() or "permitidas" in out.lower()

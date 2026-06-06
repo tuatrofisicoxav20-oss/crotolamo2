@@ -1,16 +1,16 @@
 """Operaciones de archivo SEGURAS. Reemplazan el bash crudo de C1.
 
-Cada tool que recibe una ruta usa un nombre de argumento que el guard reconoce
-(`path`, `src`, `dest`...) y valida contra la allowlist de [paths].allowed_roots.
-Las destructivas (delete/move) van marcadas safe=False -> el guard pide confirmación.
-Aquí NO se revalida la allowlist: esa es responsabilidad del guard en el agente;
-las funciones son usables directamente (p.ej. en tests) sin corral.
+Defensa en profundidad (M2): además del guard del agente, CADA tool de archivo
+revalida ella misma la ruta contra la allowlist de [paths].allowed_roots. Dos
+cerrojos: aunque el guard no intercepte (p.ej. llamada directa), la tool rechaza
+rutas fuera del corral. Las destructivas (delete/move) van marcadas safe=False.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
+from crotolamo.safety.paths import path_inside_allowed_roots
 from crotolamo.settings import get_settings
 from crotolamo.tools.base import tool
 
@@ -22,6 +22,14 @@ def _resolve(path: str) -> Path:
     return Path(path).expanduser()
 
 
+def _outside_corral(p: Path) -> str | None:
+    """Devuelve un mensaje de bloqueo si `p` está fuera de la allowlist; si no, None."""
+    if not path_inside_allowed_roots(p, get_settings().allowed_roots):
+        return (f"La ruta '{p}' está fuera de las zonas permitidas, patrón. "
+                "No salgo del corral.")
+    return None
+
+
 @tool
 def read_file(path: str) -> str:
     """Lee un archivo de texto y devuelve su contenido (recortado si es enorme).
@@ -30,6 +38,8 @@ def read_file(path: str) -> str:
         path: ruta del archivo a leer.
     """
     p = _resolve(path)
+    if (blocked := _outside_corral(p)):
+        return blocked
     if not p.exists():
         return f"No existe el archivo, patrón: {p}"
     if p.is_dir():
@@ -52,6 +62,8 @@ def write_file(path: str, content: str) -> str:
         content: contenido a guardar.
     """
     p = _resolve(path)
+    if (blocked := _outside_corral(p)):
+        return blocked
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
@@ -68,6 +80,8 @@ def list_dir(path: str) -> str:
         path: ruta de la carpeta.
     """
     p = _resolve(path)
+    if (blocked := _outside_corral(p)):
+        return blocked
     if not p.exists():
         return f"No existe la carpeta, patrón: {p}"
     if not p.is_dir():
@@ -88,6 +102,8 @@ def make_dir(path: str) -> str:
         path: ruta de la carpeta a crear.
     """
     p = _resolve(path)
+    if (blocked := _outside_corral(p)):
+        return blocked
     try:
         p.mkdir(parents=True, exist_ok=True)
     except OSError as error:
@@ -105,6 +121,8 @@ def move_file(src: str, dest: str) -> str:
     """
     source = _resolve(src)
     target = _resolve(dest)
+    if (blocked := _outside_corral(source) or _outside_corral(target)):
+        return blocked
     if not source.exists():
         return f"No existe el origen, patrón: {source}"
     try:
@@ -123,6 +141,8 @@ def delete_file(path: str) -> str:
         path: ruta del archivo a borrar.
     """
     p = _resolve(path)
+    if (blocked := _outside_corral(p)):
+        return blocked
     if not p.exists():
         return f"No existe, patrón, así que nada que borrar: {p}"
     if p.is_dir():
