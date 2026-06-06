@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -46,10 +47,11 @@ class TTS:
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             audio_path = Path(tmp.name)
         try:
+            # piper >=1.4 lee el texto por stdin (ya no acepta '-- texto').
             subprocess.run(
-                ["python", "-m", "piper", "-m", str(self.voice_model),
-                 "-f", str(audio_path), "--", text],
-                check=True, text=True, capture_output=True,
+                [sys.executable, "-m", "piper", "-m", str(self.voice_model),
+                 "-f", str(audio_path)],
+                input=text, check=True, text=True, capture_output=True,
             )
             if shutil.which("ffplay"):
                 subprocess.run(

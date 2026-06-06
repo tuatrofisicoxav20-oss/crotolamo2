@@ -133,7 +133,7 @@ def collect_checks() -> list[Check]:
 
     # Deps de voz (opcional, extra [voice]).
     missing_voice = []
-    for mod in ("faster_whisper", "sounddevice", "numpy"):
+    for mod in ("faster_whisper", "sounddevice", "numpy", "piper"):
         try:
             __import__(mod)
         except ImportError:
