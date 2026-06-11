@@ -1,0 +1,24 @@
+[Unit]
+Description=Crotolamo 2 — escucha de voz (wake-word)
+Documentation=file:%h/Documentos/crotolamo2/README.md
+# La voz necesita el servidor de sonido del usuario (PipeWire) ya levantado.
+After=default.target pipewire.service wireplumber.service
+Wants=pipewire.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Documentos/crotolamo2
+# El modo de escucha (half-duplex / barge-in / simple) lo escribe la ventana de
+# control en este archivo como CROTOLAMO_LISTEN_ARGS. El guion inicial lo hace
+# opcional: si no existe, arranca en el modo por defecto del código.
+EnvironmentFile=-%h/.config/crotolamo/listener.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/Documentos/crotolamo2/.venv/bin/python -m crotolamo listen $CROTOLAMO_LISTEN_ARGS
+# El listener captura SIGTERM (el stop por defecto de systemd) y sale al instante
+# con os._exit(0): apagado limpio, sin volcado de memoria de onnxruntime/portaudio.
+TimeoutStopSec=10
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

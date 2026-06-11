@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Crotolamo
+GenericName=Asistente de voz
+Comment=Encender, apagar y ver el estado de Crotolamo
+Exec=/usr/bin/python3 @PANEL@
+Icon=crotolamo
+Terminal=false
+Categories=Utility;GTK;
+StartupNotify=true
+StartupWMClass=org.crotolamo.Panel
+Keywords=crotolamo;voz;asistente;voice;
