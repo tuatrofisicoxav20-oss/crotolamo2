@@ -9,6 +9,8 @@ mensaje claro en personaje en vez de reventar.
 
 from __future__ import annotations
 
+import os
+import signal
 import time
 
 from crotolamo.logging_setup import get_logger
@@ -23,7 +25,33 @@ from interfaces.shell import build_agent
 log = get_logger("listener")
 
 
+def _graceful_exit(signum, _frame) -> None:
+    """Apagado a prueba de core-dumps cuando corre como servicio (systemd).
+
+    Con los modelos de voz cargados (onnxruntime/torch) y el micrófono abierto por
+    PortAudio, el cierre "limpio" del intérprete de Python puede segfaultear (el hilo
+    del oído está dentro de una lectura nativa bloqueante). Dejamos que el sistema
+    operativo libere mic y audio, y salimos con os._exit(0): salida instantánea,
+    código 0 y sin volcado de memoria. Es lo correcto para un Ctrl-C o un stop.
+    """
+    try:
+        print("Crotolamo apagado, patrón.", flush=True)
+    except Exception:  # noqa: BLE001
+        pass
+    os._exit(0)
+
+
+def _install_signal_handlers() -> None:
+    """SIGINT (Ctrl-C) y SIGTERM (systemd stop) -> apagado limpio e inmediato."""
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _graceful_exit)
+        except (ValueError, OSError):
+            pass  # p.ej. si no estamos en el hilo principal
+
+
 def run_listen(argv: list[str] | None = None) -> int:
+    _install_signal_handlers()
     settings = get_settings()
     stt = STT.from_settings(settings)  # 'base' para el comando
     # I3: modelo 'tiny' barato solo para escuchar la palabra de activación.

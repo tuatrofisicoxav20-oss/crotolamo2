@@ -23,3 +23,4 @@ config/crotolamo.local.toml
 
 # Basura del SO
 .DS_Store
+wakeword_training/

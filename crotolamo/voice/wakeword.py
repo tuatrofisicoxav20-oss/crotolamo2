@@ -15,6 +15,8 @@ la extra [voice]; solo al escuchar se exige.
 
 from __future__ import annotations
 
+import glob
+import os
 import time
 
 from crotolamo.voice.stt import VoiceUnavailable, _require
@@ -38,6 +40,30 @@ class WakeWordDetector:
             threshold=wake.get("oww_threshold", 0.5),
         )
 
+    def _resolve_model_path(self) -> str:
+        """Resuelve el nombre del modelo (p.ej. 'hey_jarvis') a la ruta de su .onnx.
+
+        Algunas versiones de openWakeWord cargan modelos por NOMBRE y otras solo por
+        RUTA al .onnx. Si model_name ya apunta a un .onnx existente (modelo propio),
+        se usa tal cual; si no, se busca '{model_name}*.onnx' entre los modelos
+        pre-entrenados que openWakeWord trae en resources/models
+        (p.ej. 'hey_jarvis' -> 'hey_jarvis_v0.1.onnx').
+        """
+        if self.model_name.endswith(".onnx") and os.path.isfile(self.model_name):
+            return self.model_name
+        try:
+            import openwakeword
+
+            base = os.path.join(
+                os.path.dirname(openwakeword.__file__), "resources", "models"
+            )
+            matches = sorted(glob.glob(os.path.join(base, f"{self.model_name}*.onnx")))
+            if matches:
+                return matches[0]
+        except Exception:  # noqa: BLE001 - sin resolver, devolvemos el nombre crudo
+            pass
+        return self.model_name
+
     def _get_model(self):
         """Carga el modelo de openWakeWord una sola vez (descarga el puente si falta)."""
         if self._model is not None:
@@ -49,7 +75,7 @@ class WakeWordDetector:
                 "Falta openwakeword, patrón. Instala con: pip install -e '.[voice]'."
             ) from error
 
-        # Descarga perezosa del modelo puente pre-entrenado.
+        # Descarga perezosa del modelo puente pre-entrenado (si falta).
         try:
             from openwakeword.utils import download_models
 
@@ -57,12 +83,29 @@ class WakeWordDetector:
         except Exception:
             pass  # ya descargado, o el nombre es una ruta a un .onnx propio
 
-        # La API varía entre versiones: por nombre (wakeword_models) o por ruta.
-        try:
-            self._model = Model(wakeword_models=[self.model_name], inference_framework="onnx")
-        except TypeError:
-            self._model = Model(wakeword_model_paths=[self.model_name], inference_framework="onnx")
-        return self._model
+        path = self._resolve_model_path()
+
+        # La firma del constructor cambia entre versiones de openWakeWord: unas aceptan
+        # el NOMBRE (wakeword_models) y/o inference_framework; otras solo la RUTA al
+        # .onnx (wakeword_model_paths) y son ONNX puro. Probamos en orden y nos
+        # quedamos con la primera variante que cargue.
+        attempts = (
+            {"wakeword_models": [self.model_name], "inference_framework": "onnx"},
+            {"wakeword_model_paths": [path], "inference_framework": "onnx"},
+            {"wakeword_model_paths": [path]},
+            {"wakeword_models": [path]},
+        )
+        last_error: Exception | None = None
+        for kwargs in attempts:
+            try:
+                self._model = Model(**kwargs)
+                return self._model
+            except Exception as error:  # noqa: BLE001 - TypeError o NoSuchFile, etc.
+                last_error = error
+                continue
+        raise VoiceUnavailable(
+            f"No pude cargar el wake word '{self.model_name}', patrón: {last_error}"
+        )
 
     def available(self) -> bool:
         try:
