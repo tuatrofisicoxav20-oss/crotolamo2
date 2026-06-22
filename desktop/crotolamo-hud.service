@@ -1,0 +1,18 @@
+[Unit]
+Description=Crotolamo HUD — overlay que aparece al convocar por voz
+# Arranca con la sesión gráfica. El HUD necesita WAYLAND_DISPLAY, que systemd
+# --user ya tiene en su entorno (importado por la sesión).
+After=default.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+Environment=PYTHONUNBUFFERED=1
+# python3 del SISTEMA (trae gi/Gtk3), NO el venv del proyecto.
+ExecStart=/usr/bin/python3 %h/Documentos/crotolamo2/desktop/crotolamo_hud.py
+# Si arranca antes de que el compositor esté listo, reintenta.
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

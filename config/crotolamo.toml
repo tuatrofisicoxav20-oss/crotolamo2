@@ -45,11 +45,19 @@ temperature = 0.2
 timeout     = 600
 # Máximo de iteraciones del loop agéntico (anti-loop infinito).
 max_iterations = 6
-# keep_alive: cuánto mantiene Ollama el modelo + su cache de prefijo en RAM tras
-# responder. En CPU el 1er turno paga el prompt-eval de los tool-schemas; mientras
-# el modelo siga caliente, los turnos siguientes reusan el cache y son rápidos (~5s).
-# "15m" = rápido durante la sesión y libera RAM tras 15 min ocioso. Sube a "1h" o
-# "-1" (siempre) si tienes RAM de sobra; baja si la lap va justa de memoria.
+# Tool routing: en vez de mandarle al modelo las ~32 tools en cada turno (lento en
+# CPU: ~130s evaluando el prompt), se le mandan solo las relevantes a la consulta
+# (~2-5s). Medido aquí: 6 tools = 2.4s vs 30 tools = 142s. Déjalo en true salvo
+# que quieras depurar. max_tools = tope de tools por turno.
+tool_routing = true
+max_tools = 8
+# keep_alive: cuánto mantiene Ollama el modelo residente en RAM tras responder.
+# Evita pagar la recarga del modelo (~60s en frío) en cada turno de una sesión.
+# OJO: el cache de prefijo NO amortiza entre turnos (cada turno re-evalúa el prompt);
+# lo que hace usable el rendimiento es el tool_routing de abajo (prompt chico), no
+# este keep_alive. Medido aquí con routing: charla ~5s, acción con tool ~17-22s.
+# "15m" = no recarga durante la sesión y libera RAM tras 15 min ocioso. Sube a "1h"
+# o "-1" (siempre residente) si te sobra RAM; baja si la lap va justa de memoria.
 keep_alive = "15m"
 
 [memory]
@@ -97,13 +105,19 @@ barge_in_min_chunks       = 5     # racha de chunks de voz para disparar (no un 
 
 [wake]
 target    = "crotolamo"
-threshold = 0.67
+# Subido de 0.67 a 0.72: el wake difuso (Whisper) daba falsos positivos ("romano"
+# disparaba). Más estricto = menos fantasmas, a costa de exigir mejor pronunciación.
+threshold = 0.72
 # M1: wake word dedicado con openWakeWord. 'crotolamo' no tiene modelo pre-entrenado,
 # así que se usa un modelo PUENTE soportado hasta entrenar uno propio.
 oww_model     = "hey_jarvis"
 oww_threshold = 0.5
+# Variantes CERCANAS a "crotolamo" (cómo lo transcribe mal Whisper). Se podaron
+# las muy lejanas ("corto la mano", "control amo", "cuatro lamo", "proto/troto
+# lamo") que provocaban falsos positivos. Se añadieron mishears reales del log
+# ("gotolamo", "cottoy amo"). Si ves en el log que tu "crotolamo" se transcribe
+# distinto, añade esa forma aquí.
 variants  = [
-    "crotolamo", "coto y amo", "coto lamo", "coto amo", "croto lamo",
-    "croto el amo", "corto lamo", "corto la mano", "crotolo amo",
-    "control amo", "contro lamo", "cuatro lamo", "proto lamo", "troto lamo",
+    "crotolamo", "croto lamo", "gotolamo", "grotolamo", "crotoamo",
+    "coto lamo", "coto y amo", "cottoy amo", "croto el amo", "crotolo amo",
 ]

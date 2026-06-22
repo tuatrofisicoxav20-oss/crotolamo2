@@ -99,6 +99,7 @@ class BrainThread(threading.Thread):
             # Si interrumpieron mientras pensaba, NO encolar la respuesta vieja.
             if not self.state.is_current(turn):
                 continue
+            self.state.set_text(reply)  # HUD: respuesta que se va a hablar
             for sentence in split_sentences(reply):
                 self.tts_q.put(Utterance(sentence, turn))
             self.tts_q.put(END)
@@ -134,6 +135,7 @@ class SttThread(threading.Thread):
             except OSError:
                 pass
             if text.strip() and self.state.is_current(turn):
+                self.state.set_text(text)  # HUD: frase reconocida del usuario
                 self.out_q.put((text, turn))
 
 
@@ -293,30 +295,81 @@ class _RealMic:
 
 
 class _SileroVad:
-    """Adapter de Silero VAD (M2) como vad_fn(chunk) -> prob."""
+    """Adapter de Silero VAD (M2) como vad_fn(chunk) -> prob.
+
+    Si silero-vad o torch no están instalados, cae a un VAD por energía RMS que
+    devuelve 0.0 o 1.0 (escalado para ser comparable con el umbral 0-1 del loop).
+    El fallback se activa UNA sola vez (no reintenta el import cada chunk) y se
+    reporta en el log UNA vez para no inundar.
+    """
+
+    _ENERGY_FLOOR = 0.01  # RMS mínimo para considerar voz en modo fallback
 
     def __init__(self, sample_rate: int = 16000) -> None:
         self.sample_rate = sample_rate
         self._model: Any = None
+        self._fallback: bool = False  # True = usar energía RMS
 
     def __call__(self, chunk) -> float:
-        import numpy as np
-        import torch
-        from silero_vad import load_silero_vad
+        if self._fallback:
+            return self._energy_vad(chunk)
 
-        if self._model is None:
-            self._model = load_silero_vad(onnx=True)
-        arr = np.asarray(chunk, dtype=np.float32)
-        return float(self._model(torch.from_numpy(arr.copy()), self.sample_rate))
+        try:
+            import numpy as np
+            import torch
+            from silero_vad import load_silero_vad
+
+            if self._model is None:
+                self._model = load_silero_vad(onnx=True)
+            arr = np.asarray(chunk, dtype=np.float32)
+            return float(self._model(torch.from_numpy(arr.copy()), self.sample_rate))
+        except (ImportError, ModuleNotFoundError) as exc:
+            log.warning(
+                "silero-vad no disponible (%s); cayendo a VAD por energía. "
+                "Para mejor VAD: pip install silero-vad torch",
+                exc,
+            )
+            self._fallback = True
+            return self._energy_vad(chunk)
+        except Exception as exc:  # noqa: BLE001 — error de carga o inferencia
+            log.warning(
+                "silero-vad falló (%s); cayendo a VAD por energía permanentemente.",
+                exc,
+            )
+            self._fallback = True
+            self._model = None
+            return self._energy_vad(chunk)
+
+    def _energy_vad(self, chunk) -> float:
+        """VAD de energía RMS como fallback. Devuelve 1.0 si hay voz, 0.0 si no.
+
+        El valor retornado es 0.0 o 1.0 para ser directamente comparable con el
+        umbral vad_threshold (por defecto 0.8) del EarThread.
+        """
+        try:
+            import numpy as np
+
+            arr = np.asarray(chunk, dtype=np.float32)
+            rms = float(np.sqrt(np.mean(arr ** 2)) + 1e-9)
+            return 1.0 if rms >= self._ENERGY_FLOOR else 0.0
+        except Exception:  # noqa: BLE001
+            return 0.0
 
 
 class VoiceLoop:
-    """Orquestador: arma los 4 threads y los apaga limpio (M3.7)."""
+    """Orquestador: arma los 4 threads y los apaga limpio (M3.7).
+
+    Args:
+        hud_publisher: callable(dict) -> None para publicar el estado del HUD en
+                       tiempo real. Si es None (default), no se publica nada.
+                       Usar ``make_file_publisher(path)`` de state.py para escritura
+                       atómica a archivo.
+    """
 
     def __init__(self, agent, stt, tts, wake_detector, *, allow_barge_in: bool = False,
                  silence_ms: int = 640, mic=None, wake_fn=None, vad_fn=None,
-                 to_wav=None) -> None:
-        self.state = SharedState()
+                 to_wav=None, hud_publisher=None) -> None:
+        self.state = SharedState(publisher=hud_publisher)
         self.shutdown = threading.Event()
         self.stt_q: queue.Queue = queue.Queue()
         self.cmd_q: queue.Queue = queue.Queue()

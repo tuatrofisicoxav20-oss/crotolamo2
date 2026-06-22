@@ -108,6 +108,16 @@ class WakeWordDetector:
         )
 
     def available(self) -> bool:
+        """True si openwakeword (y sounddevice) están importables.
+
+        Coherencia con VoiceLoop / listener.py:
+        - openWakeWord es REQUERIDO para el modo concurrente; no tiene fallback
+          en el EarThread (wake_fn=wake_detector.feed).
+        - silero-vad es OPCIONAL: _SileroVad en loop.py cae a energía RMS si falta.
+          Por eso silero NO forma parte de esta comprobación.
+        - Si available() devuelve False, listener.py cae al modo simple (Whisper
+          difuso), que no usa openWakeWord.
+        """
         try:
             import openwakeword  # noqa: F401
             import sounddevice  # noqa: F401
@@ -118,6 +128,17 @@ class WakeWordDetector:
 
     def feed(self, chunk) -> bool:
         """Alimenta un chunk al detector y devuelve True si supera el umbral (M3.6).
+
+        openWakeWord espera frames de 1280 muestras (80 ms a 16 kHz) IDEALMENTE,
+        pero su preprocessor interno mantiene estado entre llamadas y acepta chunks
+        más cortos (verificado en openwakeword/model.py:predict, rama ``else`` en
+        línea 219). Con el frame=512 de _RealMic (32 ms), el preprocessor acumula
+        historia y hace inferencia correctamente; la detección puede ser ligeramente
+        menos reactiva (latencia ~80 ms en vez de ~32 ms) pero es funcional.
+
+        Si el comportamiento fuera problemático, la solución es bufferizar aquí
+        hasta 1280 muestras antes de llamar a model.predict. Por ahora se documenta
+        como tolerable y no se cambia el frame del micrófono (Silero exige 512).
 
         openWakeWord espera int16; convertimos si llega en float.
         """

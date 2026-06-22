@@ -149,6 +149,44 @@ def collect_checks() -> list[Check]:
         )
     )
 
+    # openWakeWord (requerido para el modo concurrente de voz).
+    try:
+        import openwakeword  # noqa: F401
+
+        oww_ok, oww_detail = True, "openwakeword importable (modo concurrente OK)"
+    except ImportError:
+        oww_ok, oww_detail = (
+            False,
+            "falta openwakeword (sin él, solo modo simple/difuso está disponible)",
+        )
+    checks.append(
+        Check(
+            "voz-oww",
+            oww_ok,
+            oww_detail,
+            "pip install openwakeword  (o pip install -e '.[voice]')",
+        )
+    )
+
+    # silero-vad (recomendado para el modo concurrente; hay fallback por energía si falta).
+    try:
+        import silero_vad  # noqa: F401
+
+        svad_ok, svad_detail = True, "silero-vad importable (VAD neuronal activo)"
+    except ImportError:
+        svad_ok, svad_detail = (
+            False,
+            "falta silero-vad (el modo concurrente usará VAD por energía como fallback)",
+        )
+    checks.append(
+        Check(
+            "voz-silero",
+            svad_ok,
+            svad_detail,
+            "pip install silero-vad torch  (opcional, mejora la detección de voz)",
+        )
+    )
+
     # Piper como librería persistente (la API real que usa tts.py).
     try:
         from piper import PiperVoice  # noqa: F401
@@ -215,7 +253,10 @@ def run_doctor() -> int:
     print("Doctor de Crotolamo 2\n" + "=" * 40)
 
     # Distinguimos checks obligatorios de opcionales para el código de salida.
-    optional = {"voz-piper", "voz-deps", "voz-piper-lib", "portaudio", "ydotool"}
+    # voz-oww: requerido para el modo concurrente pero el modo simple funciona sin él.
+    # voz-silero: opcional — hay fallback por energía en _SileroVad (loop.py).
+    optional = {"voz-piper", "voz-deps", "voz-piper-lib", "portaudio", "ydotool",
+                "voz-oww", "voz-silero"}
     hard_fail = False
 
     for c in checks:

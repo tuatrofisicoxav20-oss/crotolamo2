@@ -58,6 +58,11 @@ class Tool:
     parameters: dict[str, Any]  # JSON-schema del objeto de argumentos
     # safe=True: ejecuta directo. safe=False: el guard pedirá confirmación.
     safe: bool = True
+    # direct=True: tool "presentacional" cuyo output YA es una frase lista para el
+    # patrón. El agente puede devolverlo tal cual sin una 2ª llamada al LLM
+    # (short-circuit). Ver ToolAgent.direct_tools. Default False (comportamiento
+    # normal: el modelo redacta la respuesta tras ver el resultado de la tool).
+    direct: bool = False
 
     def schema(self) -> dict[str, Any]:
         """Formato que espera Ollama en el campo `tools`."""
@@ -140,12 +145,20 @@ class Registry:
 GLOBAL_REGISTRY = Registry()
 
 
-def tool(_func: Callable | None = None, *, name: str | None = None, safe: bool = True):
+def tool(
+    _func: Callable | None = None,
+    *,
+    name: str | None = None,
+    safe: bool = True,
+    direct: bool = False,
+):
     """Decorador. Registra la función como tool en el registry global.
 
     Args:
         name: nombre expuesto al LLM (por defecto, el de la función).
         safe: si False, el guard pedirá confirmación antes de ejecutarla.
+        direct: si True, su output es presentacional (frase lista para el patrón)
+            y el agente puede devolverlo sin una 2ª llamada al LLM (short-circuit).
     """
 
     def wrap(func: Callable[..., Any]) -> Callable[..., Any]:
@@ -157,6 +170,7 @@ def tool(_func: Callable | None = None, *, name: str | None = None, safe: bool =
             description=description or func.__name__,
             parameters=parameters,
             safe=safe,
+            direct=direct,
         )
         GLOBAL_REGISTRY.register(t)
         func._crotolamo_tool = t  # type: ignore[attr-defined]

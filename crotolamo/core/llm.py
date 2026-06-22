@@ -7,10 +7,17 @@ para tool-calling nativo de qwen2.5-coder. Los errores se devuelven en personaje
 from __future__ import annotations
 
 import json
+import os
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Any
+
+# Instrumentación opcional: con CROTOLAMO_LLM_PROF=1 imprime tiempo y tokens por
+# llamada a /api/chat (prompt_eval_count, eval_count). Útil para diagnosticar el
+# costo de los tool-schemas en CPU. Cero overhead si la env no está puesta.
+_PROF = os.environ.get("CROTOLAMO_LLM_PROF") == "1"
 
 
 class LLMError(RuntimeError):
@@ -99,6 +106,7 @@ class LLMClient:
             method="POST",
         )
 
+        t0 = time.time() if _PROF else 0.0
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 raw = json.loads(resp.read().decode("utf-8"))
@@ -113,6 +121,15 @@ class LLMClient:
             ) from error
         except json.JSONDecodeError as error:
             raise LLMError("Ollama me devolvió basura no-JSON, patrón.") from error
+
+        if _PROF:
+            n_tools = len(tools) if tools else 0
+            print(
+                f"[LLM-PROF] {time.time() - t0:5.1f}s | "
+                f"prompt_eval={raw.get('prompt_eval_count', '?')} "
+                f"gen={raw.get('eval_count', '?')} | tools_enviadas={n_tools}",
+                flush=True,
+            )
 
         message = raw.get("message", {}) or {}
         return ChatResponse(

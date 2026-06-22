@@ -223,11 +223,28 @@ class STT:
         model = self._get_model()
         # I4: vad_filter=False — ya recortamos por energía en record_until_silence;
         # el doble VAD (energía + el de Whisper) se comía audio.
+        # Anti-alucinación: temperature=0 (determinista, sin "inventar" sobre música
+        # o silencio) en vez del fallback 0..1 por defecto, que es la causa de los
+        # fantasmas tipo "yo te voy a amar" cuando suena Spotify.
         segments, _ = model.transcribe(
             str(path), language=self.language, beam_size=5, vad_filter=False,
             condition_on_previous_text=False, initial_prompt=_INITIAL_PROMPT,
+            temperature=0.0,
         )
-        raw = " ".join(seg.text.strip() for seg in segments).strip()
+        # Descarta segmentos alucinados: Whisper marca cada segmento con la prob de
+        # "no es voz" (no_speech_prob) y su confianza media (avg_logprob). Si el
+        # segmento es muy probablemente NO-voz o de baja confianza, lo tiramos —
+        # eso es lo que transcribe de la música/ruido ambiente.
+        kept: list[str] = []
+        for seg in segments:
+            no_speech = getattr(seg, "no_speech_prob", 0.0) or 0.0
+            avg_logprob = getattr(seg, "avg_logprob", 0.0) or 0.0
+            if no_speech > 0.6 or avg_logprob < -1.2:
+                continue
+            text = seg.text.strip()
+            if text:
+                kept.append(text)
+        raw = " ".join(kept).strip()
         return normalize_text(raw)
 
     def listen_once(self, **vad_kwargs) -> str:

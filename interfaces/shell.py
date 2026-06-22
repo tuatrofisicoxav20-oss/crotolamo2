@@ -49,17 +49,29 @@ def build_agent(confirm_fn=None) -> tuple[Agent, Conversation]:
     try:
         from crotolamo.core.agent import ToolAgent  # type: ignore
         from crotolamo.core.hooks import datetime_prehook, make_facts_prehook
+        from crotolamo.core.router import route_schemas
         from crotolamo.tools import default_registry
         from crotolamo.safety.guard import Guard
+
+        registry = default_registry()
+
+        # Tool routing (rendimiento en CPU): por defecto ON. Manda solo las tools
+        # relevantes a cada consulta para que el turno sea rápido (~2-5s vs ~130s).
+        use_routing = settings.llm.get("tool_routing", True)
+        max_tools = settings.llm.get("max_tools", 8)
+        route_fn = (
+            (lambda t: route_schemas(registry, t, max_tools)) if use_routing else None
+        )
 
         agent: Agent = ToolAgent(
             llm,
             conversation,
-            registry=default_registry(),
+            registry=registry,
             guard=Guard.from_settings(settings),
             max_iterations=settings.llm.get("max_iterations", 6),
             confirm_fn=confirm_fn or _text_confirm,
             pre_hooks=[make_facts_prehook(), datetime_prehook],
+            route_fn=route_fn,
         )
     except Exception:
         agent = Agent(llm, conversation)

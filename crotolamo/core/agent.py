@@ -116,6 +116,38 @@ def _deny(_reason: str) -> bool:
     return False
 
 
+# Tools "de retorno directo" por defecto: su output YA es una frase lista para el
+# patrón (presentacional), así que cuando el modelo pide EXACTAMENTE una de ellas
+# devolvemos su resultado tal cual, sin una 2ª llamada al LLM para que lo redacte.
+# Esto corta ~7-9s por turno en CPU. Inyectable vía ToolAgent(direct_tools=...).
+DEFAULT_DIRECT_TOOLS: frozenset[str] = frozenset({
+    "ram_usage",
+    "system_status",
+    "disk_usage",
+    "music_now",
+    "music_control",
+    "list_processes",
+})
+
+# Prefijos con los que la capa de ejecución (Registry.run) marca un fallo DURO de
+# la tool (excepción no controlada o argumentos inválidos). En esos casos NO se
+# hace short-circuit: dejamos que el modelo reaccione. Los "soft-errors" en
+# personaje de las propias tools ("No pude leer /proc/meminfo, patrón.") SÍ son
+# texto listo para el patrón, así que esos sí se devuelven directos.
+_HARD_ERROR_PREFIXES: tuple[str, ...] = (
+    "La tool '",            # "...reventó, patrón: ..."
+    "Argumentos inválidos para '",
+    "No tengo una tool ",   # nombre desconocido (defensivo; no debería pasar aquí)
+)
+
+
+def _is_hard_error(result: str) -> bool:
+    """True si el resultado de una tool es un fallo duro (no apto para short-circuit)."""
+    if not result or not result.strip():
+        return True
+    return result.lstrip().startswith(_HARD_ERROR_PREFIXES)
+
+
 class ToolAgent(Agent):
     """El loop agéntico: el LLM pide tools, las ejecutamos (bajo guard) y le
     devolvemos el resultado para que decida el siguiente paso.
@@ -131,21 +163,56 @@ class ToolAgent(Agent):
         confirm_fn: ConfirmFn | None = None,
         pre_hooks: list[Callable[[str], str]] | None = None,
         post_hooks: list[Callable[[str], str]] | None = None,
+        route_fn: Callable[[str], list[dict[str, Any]]] | None = None,
+        direct_tools: set[str] | None = None,
     ) -> None:
         super().__init__(llm, conversation)
         self.registry = registry
         self.guard = guard
         self.max_iterations = max_iterations
         self.confirm_fn = confirm_fn or _deny
+        # Short-circuit de retorno directo: nombres de tools "presentacionales"
+        # cuyo output se devuelve tal cual (sin 2ª llamada al LLM). Si es None usa
+        # el default sensato; pasa un set vacío para DESACTIVAR el short-circuit
+        # (comportamiento clásico de 2 llamadas, útil p.ej. para medir/comparar).
+        self.direct_tools: set[str] = (
+            set(DEFAULT_DIRECT_TOOLS) if direct_tools is None else set(direct_tools)
+        )
+        # Tool routing: si está, devuelve solo las tool-schemas relevantes a la
+        # consulta (prompt chico => rápido en CPU). Si es None, se mandan todas.
+        self.route_fn = route_fn
         # M4 (de Open WebUI pipelines): hooks que enriquecen la entrada (pre) y
         # limpian/transforman la respuesta final (post). Se aplican en orden.
         self.pre_hooks = pre_hooks or []
-        self.post_hooks = post_hooks or []
+        # Misión 2: por defecto (post_hooks=None) montamos el limpiador de
+        # preámbulos meta del 3B ("parece que la herramienta no acepta
+        # parámetros...", "te resumo el resultado:"). Es conservador (anclado al
+        # inicio y nunca devuelve vacío). Si el caller pasa post_hooks explícitos,
+        # se respetan tal cual (los tests inyectan los suyos).
+        if post_hooks is None:
+            from crotolamo.core.hooks import (
+                meta_preamble_cleaner,
+                strip_leaked_tool_json,
+            )
+            # Orden: primero limpiar preámbulos meta; luego, si lo que queda es un
+            # tool-call JSON crudo filtrado, sustituirlo por un mensaje en personaje.
+            self.post_hooks = [meta_preamble_cleaner, strip_leaked_tool_json]
+        else:
+            self.post_hooks = post_hooks
 
     def _execute_call(self, name: str, arguments: dict) -> str:
         tool = self.registry.get(name)
         if tool is None:
             return f"No tengo una tool llamada '{name}', patrón."
+
+        # El 3B a veces alucina argumentos que la tool NO declara (p.ej. pide
+        # `ram_usage` con un `limit` que se le "pega" de `list_processes`, vecina
+        # en el routing). Eso haría reventar a func(**args) con un TypeError, lo
+        # que rompería el short-circuit (lo trataría como fallo duro). Filtramos
+        # los kwargs no declarados por ESTA tool antes de ejecutar. No oculta
+        # errores de args REQUERIDOS ausentes: esos siguen reventando como antes.
+        declared = set(tool.parameters.get("properties", {}).keys())
+        arguments = {k: v for k, v in arguments.items() if k in declared}
 
         decision = self.guard.check(tool, arguments)
         if not decision.allowed:
@@ -154,6 +221,15 @@ class ToolAgent(Agent):
             return "Cancelado por el patrón."
 
         return self.registry.run(name, arguments)
+
+    def _is_direct(self, name: str) -> bool:
+        """True si la tool es de retorno directo: o bien está en el set inyectado
+        `direct_tools`, o bien su definición lleva el flag `Tool.direct=True`.
+        """
+        if name in self.direct_tools:
+            return True
+        tool = self.registry.get(name)
+        return bool(tool is not None and getattr(tool, "direct", False))
 
     def _apply(self, hooks, value: str) -> str:
         for hook in hooks:
@@ -164,10 +240,15 @@ class ToolAgent(Agent):
         return value
 
     def handle_turn(self, text: str, on_token=None) -> str:
+        # Enrutamos sobre el texto LIMPIO del patrón (antes de que los pre-hooks le
+        # antepongan fecha/hechos), que es la señal real de intención. El set de
+        # tools se fija UNA vez por turno y se mantiene en todas las iteraciones,
+        # para no romper el cache de prefijo dentro del turno.
+        routing_text = text
         # M4: pre-hooks enriquecen la entrada antes de llegar al LLM.
         text = self._apply(self.pre_hooks, text)
         self.conversation.add_user(text)
-        schemas = self.registry.schemas()
+        schemas = self.route_fn(routing_text) if self.route_fn is not None else self.registry.schemas()
         known = set(self.registry.names())
 
         for _ in range(self.max_iterations):
@@ -207,9 +288,30 @@ class ToolAgent(Agent):
                 tool_calls=tool_calls_payload,
             )
 
+            results: list[tuple[str, str]] = []
             for call in calls:
                 result = self._execute_call(call["name"], call.get("arguments", {}))
                 self.conversation.add_tool_result(call["name"], result)
-            # Volvemos a pedirle al LLM que decida con los resultados a la vista.
+                results.append((call["name"], result))
+
+            # Short-circuit (Misión 1): si el modelo pidió EXACTAMENTE una tool,
+            # esa tool es de retorno directo y NO falló duro, devolvemos su output
+            # tal cual como respuesta final, ahorrándonos la 2ª llamada al LLM
+            # (~7-9s en CPU). Casos con 2+ tools, tool no-directa o fallo duro
+            # caen al comportamiento normal (otra iteración => 2ª llamada).
+            if len(results) == 1:
+                name, result = results[0]
+                if self._is_direct(name) and not _is_hard_error(result):
+                    # Mismos post-hooks y misma actualización de memoria que el
+                    # camino final normal (líneas del bloque `if not calls`).
+                    reply = self._apply(self.post_hooks, result)
+                    if streamer is not None:
+                        # En modo voz/streaming el caller solo lee on_token; hay
+                        # que emitir el texto o el patrón se queda en silencio.
+                        streamer.flush_if_held(reply)
+                    self.conversation.add_assistant(reply)
+                    return reply
+            # Si no hubo short-circuit, volvemos a pedirle al LLM que decida con
+            # los resultados a la vista.
 
         return "Me enredé en demasiados pasos, patrón. Mejor dímelo más simple."

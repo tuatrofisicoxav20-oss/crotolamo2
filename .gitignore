@@ -24,3 +24,6 @@ config/crotolamo.local.toml
 # Basura del SO
 .DS_Store
 wakeword_training/
+
+# Ajustes locales de Claude Code (no versionar)
+.claude/
