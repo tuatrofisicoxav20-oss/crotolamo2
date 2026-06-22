@@ -19,10 +19,11 @@ from crotolamo.voice.normalize import normalize_text
 
 log = get_logger("voice.stt")
 
-_INITIAL_PROMPT = (
-    "Comandos de voz en español mexicano para un asistente llamado Crotolamo. "
-    "Frases comunes: crea una carpeta, abre archivos, mi escritorio, patrón."
-)
+# Pista de transcripción SOLO para comandos. OJO: Whisper REGURGITA este texto
+# literal cuando oye silencio/ruido; por eso NO debe contener "crotolamo" (haría
+# que el detector de wake se autodisparara) ni ejemplos de comandos (los inventaría
+# como órdenes fantasma). El detector de wake usa initial_prompt=None (sin pista).
+_INITIAL_PROMPT = "Transcripción de habla en español de México."
 
 # Caché de modelos Whisper POR tamaño: así 'base' (comando) y 'tiny' (wake) pueden
 # coexistir sin pisarse el uno al otro.
@@ -54,10 +55,13 @@ def _voice_cfg() -> dict:
 
 class STT:
     def __init__(self, model_size: str = "small", sample_rate: int = 16000,
-                 language: str = "es") -> None:
+                 language: str = "es", initial_prompt: str | None = _INITIAL_PROMPT) -> None:
         self.model_size = model_size
         self.sample_rate = sample_rate
         self.language = language
+        # El detector de wake debe pasar initial_prompt=None: si no, Whisper
+        # regurgita la pista (con "crotolamo") sobre silencio y dispara solo.
+        self.initial_prompt = initial_prompt
 
     @classmethod
     def from_settings(cls, settings) -> "STT":
@@ -228,7 +232,7 @@ class STT:
         # fantasmas tipo "yo te voy a amar" cuando suena Spotify.
         segments, _ = model.transcribe(
             str(path), language=self.language, beam_size=5, vad_filter=False,
-            condition_on_previous_text=False, initial_prompt=_INITIAL_PROMPT,
+            condition_on_previous_text=False, initial_prompt=self.initial_prompt,
             temperature=0.0,
         )
         # Descarta segmentos alucinados: Whisper marca cada segmento con la prob de

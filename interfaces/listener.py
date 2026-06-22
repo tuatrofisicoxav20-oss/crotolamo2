@@ -95,10 +95,13 @@ def run_listen(argv: list[str] | None = None) -> int:
     _install_signal_handlers()
     settings = get_settings()
     stt = STT.from_settings(settings)  # 'base' para el comando
-    # I3: modelo 'tiny' barato solo para escuchar la palabra de activación.
+    # I3: modelo barato solo para escuchar la palabra de activación.
+    # initial_prompt=None es CLAVE: con pista, Whisper la regurgita sobre el
+    # silencio (incluye "crotolamo") y dispara falsos wakes.
     wake_stt = STT(
         model_size=settings.voice.get("wake_whisper_model", "tiny"),
         sample_rate=settings.voice.get("sample_rate", 16000),
+        initial_prompt=None,
     )
     tts = TTS.from_settings(settings)
     threshold = settings.wake.get("threshold", 0.67)
