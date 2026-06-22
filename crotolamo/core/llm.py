@@ -53,11 +53,18 @@ class LLMClient:
         model: str = "qwen2.5-coder:7b",
         temperature: float = 0.2,
         timeout: float = 120,
+        keep_alive: str = "15m",
     ) -> None:
         self.host = host.rstrip("/")
         self.model = model
         self.temperature = temperature
         self.timeout = timeout
+        # keep_alive: cuánto mantiene Ollama el modelo (y su cache de prefijo KV)
+        # residente tras una respuesta. En CPU es CLAVE: el primer turno paga el
+        # prompt-eval completo de los tool-schemas (~lento), pero si el modelo
+        # sigue caliente los turnos siguientes reusan el cache y son baratos.
+        # "15m" balancea rapidez en sesión vs. liberar RAM cuando no se usa.
+        self.keep_alive = keep_alive
 
     @classmethod
     def from_settings(cls, settings) -> "LLMClient":
@@ -67,6 +74,7 @@ class LLMClient:
             model=llm.get("model", "qwen2.5-coder:7b"),
             temperature=llm.get("temperature", 0.2),
             timeout=llm.get("timeout", 120),
+            keep_alive=llm.get("keep_alive", "15m"),
         )
 
     def chat(
@@ -78,6 +86,7 @@ class LLMClient:
             "model": self.model,
             "stream": False,
             "messages": messages,
+            "keep_alive": self.keep_alive,
             "options": {"temperature": self.temperature},
         }
         if tools:
@@ -128,6 +137,7 @@ class LLMClient:
             "model": self.model,
             "stream": True,
             "messages": messages,
+            "keep_alive": self.keep_alive,
             "options": {"temperature": self.temperature},
         }
         if tools:

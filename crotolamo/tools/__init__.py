@@ -12,6 +12,7 @@ def default_registry() -> Registry:
         desktop,
         facts,
         files,
+        media,
         projects,
         search,
         shortcuts,

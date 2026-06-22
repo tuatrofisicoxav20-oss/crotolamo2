@@ -45,6 +45,12 @@ temperature = 0.2
 timeout     = 600
 # Máximo de iteraciones del loop agéntico (anti-loop infinito).
 max_iterations = 6
+# keep_alive: cuánto mantiene Ollama el modelo + su cache de prefijo en RAM tras
+# responder. En CPU el 1er turno paga el prompt-eval de los tool-schemas; mientras
+# el modelo siga caliente, los turnos siguientes reusan el cache y son rápidos (~5s).
+# "15m" = rápido durante la sesión y libera RAM tras 15 min ocioso. Sube a "1h" o
+# "-1" (siempre) si tienes RAM de sobra; baja si la lap va justa de memoria.
+keep_alive = "15m"
 
 [memory]
 # Ventana deslizante del historial conversacional (nº de turnos user+assistant).
@@ -60,6 +66,7 @@ compaction = false
 [apps]
 opera         = ["flatpak", "run", "com.opera.opera-gx"]
 "opera gx"    = ["flatpak", "run", "com.opera.opera-gx"]
+spotify       = ["flatpak", "run", "com.spotify.Client"]
 blender       = ["blender"]
 vscode        = ["code"]
 geany         = ["geany"]
