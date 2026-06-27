@@ -19,7 +19,10 @@ import glob
 import os
 import time
 
+from crotolamo.logging_setup import get_logger
 from crotolamo.voice.stt import VoiceUnavailable, _require
+
+log = get_logger("voice.wakeword")
 
 # openWakeWord espera frames de 1280 muestras (80 ms a 16 kHz).
 _FRAME = 1280
@@ -148,7 +151,13 @@ class WakeWordDetector:
         if arr.dtype != np.int16:
             arr = (arr * 32767).astype(np.int16)
         scores = model.predict(arr)
-        return bool(scores and max(scores.values()) >= self.threshold)
+        mx = max(scores.values()) if scores else 0.0
+        # Log de diagnóstico: solo cuando hay señal (>0.05), para ver qué score da
+        # la voz REAL del patrón y afinar el umbral sin inundar el log con silencio.
+        if mx > 0.05:
+            log.info("wake score=%.3f (umbral=%.2f) -> %s",
+                     mx, self.threshold, "DISPARA" if mx >= self.threshold else "no")
+        return bool(mx >= self.threshold)
 
     def listen_for_wake(self, timeout_s: float | None = None) -> bool:
         """Escucha el micrófono y devuelve True al detectar la palabra de activación.
