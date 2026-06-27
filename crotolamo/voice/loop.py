@@ -205,6 +205,13 @@ class EarThread(threading.Thread):
         self._prev_mode = Mode.IDLE
         self._speaking_since = 0.0
         self._barge_run = 0
+        # Cooldown anti-eco tras un turno: el modelo de wake se entrenó con voz
+        # Piper sintética y el TTS de Crotolamo TAMBIÉN es Piper, así que al hablar
+        # su respuesta el micro la capta y dispara FALSOS wakes -> bucle infinito
+        # (habla -> wake -> comando vacío -> "Lo siento" -> habla...). Al volver a
+        # IDLE ignoramos el wake un momento para que el eco del TTS no lo dispare.
+        self._idle_grace_until = 0.0
+        self._post_speak_grace_s = 1.5
 
     def _start_command(self, preroll: list | None = None) -> None:
         # M2: arrancar con el buffer de pre-activación para no perder el inicio.
@@ -249,9 +256,18 @@ class EarThread(threading.Thread):
             if mode is Mode.SPEAKING and self._prev_mode is not Mode.SPEAKING:
                 self._speaking_since = time.monotonic()
                 self._barge_run = 0
+            # Al ENTRAR a IDLE desde un turno (habló/pensó/escuchó), arranca el
+            # cooldown anti-eco para que el TTS y su eco no disparen un falso wake.
+            if mode is Mode.IDLE and self._prev_mode in (
+                Mode.SPEAKING, Mode.THINKING, Mode.LISTENING
+            ):
+                self._idle_grace_until = time.monotonic() + self._post_speak_grace_s
             self._prev_mode = mode
 
             if mode is Mode.IDLE:
+                # Cooldown anti-eco: tras un turno, no escuches el wake un momento.
+                if time.monotonic() < self._idle_grace_until:
+                    continue
                 if self.wake_fn(chunk):
                     self._turn = self.state.new_turn()
                     self.state.set_mode(Mode.LISTENING)
