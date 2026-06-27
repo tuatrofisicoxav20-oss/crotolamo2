@@ -144,6 +144,12 @@ class SttThread(threading.Thread):
             if text.strip() and self.state.is_current(turn):
                 self.state.set_text(text)  # HUD: frase reconocida del usuario
                 self.out_q.put((text, turn))
+            elif self.state.is_current(turn):
+                # Transcripción VACÍA (comando corto/silencio: el VAD cortó pronto o
+                # el patrón solo dijo "crotolamo" sin orden). No hay nada que pensar:
+                # volver a reposo. Antes se quedaba PEGADO en "pensando" para siempre
+                # porque el EarThread ya había puesto el modo en THINKING.
+                self.state.set_mode(Mode.IDLE)
 
 
 def _drain_queue(q: queue.Queue) -> None:

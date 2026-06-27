@@ -97,8 +97,10 @@ vad_threshold        = 0.8
 # Buffer de pre-activación: ms de audio previos que se anteponen para no perder
 # las primeras sílabas.
 vad_preactivation_ms = 800
-# Silencio sostenido que cierra la grabación.
-vad_silence_ms       = 640
+# Silencio sostenido que cierra la grabación del comando. Subido de 640 a 900ms
+# para tolerar una pausa breve tras decir "crotolamo" antes de la orden (si no, el
+# comando salía vacío). Aun así, conviene decir "crotolamo" + la orden seguido.
+vad_silence_ms       = 900
 # M3.8: mitigación de eco del barge-in (con altavoces y sin AEC). Con auriculares
 # es confiable; si con altavoces se auto-dispara, usa --no-barge-in.
 barge_in_grace_ms         = 400   # ignora barge-in los primeros ms tras empezar a hablar
