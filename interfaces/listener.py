@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import threading
 import time
 from pathlib import Path
 
@@ -138,6 +139,19 @@ def run_listen(argv: list[str] | None = None) -> int:
     except Exception as error:  # noqa: BLE001
         print(f"No pude armar el agente, patrón: {error}")
         return 1
+
+    # Calentar el LLM en segundo plano: el PRIMER comando arranca llama en frío
+    # (~60-120s en CPU), lo que deja la voz "pensando" un buen rato. Una llamada
+    # dummy al arrancar lo deja residente (keep_alive lo mantiene) para que la
+    # primera orden responda rápido. No bloquea el arranque.
+    def _warm_llm() -> None:
+        try:
+            agent.llm.chat([{"role": "user", "content": "di solo: ok"}])
+            log.info("LLM caliente, patrón.")
+        except Exception as error:  # noqa: BLE001
+            log.warning("no pude calentar el LLM: %s", error)
+
+    threading.Thread(target=_warm_llm, name="WarmLLM", daemon=True).start()
 
     # M3: por defecto, loop concurrente. --simple = modo secuencial viejo (fallback).
     # Barge-in conservador: half-duplex por defecto; --barge-in lo activa (auriculares).

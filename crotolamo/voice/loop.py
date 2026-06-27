@@ -95,9 +95,16 @@ class BrainThread(threading.Thread):
                 reply = self.agent.handle_turn(command)
             except Exception as error:  # noqa: BLE001 - un turno roto no mata el loop
                 log.warning("brain: %s", error)
-                continue
-            # Si interrumpieron mientras pensaba, NO encolar la respuesta vieja.
+                # CLAVE: si el LLM falla, hablamos un error y volvemos a reposo.
+                # Antes hacía `continue` sin tocar el modo -> el HUD se quedaba
+                # PEGADO en "pensando" para siempre.
+                reply = "Se me trabaron los cables, patrón. Vuelve a intentarlo."
+            # Si interrumpieron mientras pensaba, el turno nuevo ya maneja el estado.
             if not self.state.is_current(turn):
+                continue
+            # Respuesta vacía: volver a reposo en vez de dejar el HUD en "pensando".
+            if not (reply and reply.strip()):
+                self.state.set_mode(Mode.IDLE)
                 continue
             self.state.set_text(reply)  # HUD: respuesta que se va a hablar
             for sentence in split_sentences(reply):

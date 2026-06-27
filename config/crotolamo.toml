@@ -40,9 +40,11 @@ level = "INFO"
 host        = "http://localhost:11434"
 model       = "qwen2.5-coder:7b"
 temperature = 0.2
-# En CPU (sin GPU) la inferencia con muchos tool-schemas es lenta: timeout MUY holgado
-# para que un turno conversacional alcance a responder. Con GPU se puede bajar a 60-90.
-timeout     = 600
+# Timeout de una llamada al LLM. Bajado de 600 a 180: con tool routing los turnos
+# son cortos, y 600s significaba que un Ollama colgado dejaba la voz "pensando"
+# hasta 10 min. 180s cubre un arranque en frío (~60-120s) + la respuesta; si se
+# excede, devuelve error en personaje y la voz vuelve a reposo (no se queda pegada).
+timeout     = 180
 # Máximo de iteraciones del loop agéntico (anti-loop infinito).
 max_iterations = 6
 # Tool routing: en vez de mandarle al modelo las ~32 tools en cada turno (lento en
