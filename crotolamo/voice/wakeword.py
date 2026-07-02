@@ -30,9 +30,13 @@ _SAMPLE_RATE = 16000
 
 
 class WakeWordDetector:
-    def __init__(self, model_name: str = "hey_jarvis", threshold: float = 0.5) -> None:
+    def __init__(self, model_name: str = "hey_jarvis", threshold: float = 0.5,
+                 debug: bool = False) -> None:
         self.model_name = model_name
         self.threshold = threshold
+        # Modo debug (validación de mic): imprime CADA score en tiempo real por
+        # stdout para calibrar el umbral viendo qué da la voz real vs el ruido.
+        self.debug = debug
         self._model = None  # se carga una sola vez
 
     @classmethod
@@ -41,6 +45,7 @@ class WakeWordDetector:
         return cls(
             model_name=wake.get("oww_model", "hey_jarvis"),
             threshold=wake.get("oww_threshold", 0.5),
+            debug=os.environ.get("CROTOLAMO_WAKE_DEBUG", "") not in ("", "0"),
         )
 
     def _resolve_model_path(self) -> str:
@@ -145,19 +150,32 @@ class WakeWordDetector:
 
         openWakeWord espera int16; convertimos si llega en float.
         """
+        mx = self.score(chunk)
+        fired = mx >= self.threshold
+        if self.debug:
+            print(f"[wake] score={mx:.3f} umbral={self.threshold:.2f}"
+                  f"{'  <<< DISPARA' if fired else ''}", flush=True)
+        # Log de diagnóstico: solo cuando hay señal (>0.05), para ver qué score da
+        # la voz REAL del patrón y afinar el umbral sin inundar el log con silencio.
+        if mx > 0.05:
+            log.info("wake score=%.3f (umbral=%.2f) -> %s",
+                     mx, self.threshold, "DISPARA" if fired else "no")
+        return fired
+
+    def score(self, chunk) -> float:
+        """Score crudo de openWakeWord para un chunk (máximo entre los modelos).
+
+        Separado de feed() para que las herramientas de calibración
+        (scripts/wake_debug.py) puedan medir sin duplicar la conversión ni el
+        estado del preprocessor.
+        """
         np = _require("numpy")
         model = self._get_model()
         arr = np.asarray(chunk)
         if arr.dtype != np.int16:
             arr = (arr * 32767).astype(np.int16)
         scores = model.predict(arr)
-        mx = max(scores.values()) if scores else 0.0
-        # Log de diagnóstico: solo cuando hay señal (>0.05), para ver qué score da
-        # la voz REAL del patrón y afinar el umbral sin inundar el log con silencio.
-        if mx > 0.05:
-            log.info("wake score=%.3f (umbral=%.2f) -> %s",
-                     mx, self.threshold, "DISPARA" if mx >= self.threshold else "no")
-        return bool(mx >= self.threshold)
+        return float(max(scores.values())) if scores else 0.0
 
     def listen_for_wake(self, timeout_s: float | None = None) -> bool:
         """Escucha el micrófono y devuelve True al detectar la palabra de activación.
