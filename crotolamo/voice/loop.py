@@ -113,16 +113,23 @@ class BrainThread(threading.Thread):
 
 
 class SttThread(threading.Thread):
-    """Transcribe el audio de comandos, solo si el turno sigue vigente (M3.5)."""
+    """Transcribe el audio de comandos, solo si el turno sigue vigente (M3.5).
+
+    hotwords: sesgo del decoder Whisper hacia nombres propios, SOLO para
+    comandos (esta ruta corre siempre POST-wake). La detección de wake no pasa
+    por aquí y queda sin sesgo, para no inflar falsos despertares.
+    """
 
     def __init__(self, stt, stt_queue: queue.Queue, command_queue: queue.Queue,
-                 state: SharedState, shutdown: threading.Event) -> None:
+                 state: SharedState, shutdown: threading.Event,
+                 hotwords: str | None = None) -> None:
         super().__init__(name="Stt", daemon=True)
         self.stt = stt
         self.in_q = stt_queue
         self.out_q = command_queue
         self.state = state
         self.shutdown = shutdown
+        self.hotwords = hotwords
 
     def run(self) -> None:
         while not self.shutdown.is_set():
@@ -133,7 +140,7 @@ class SttThread(threading.Thread):
             if not self.state.is_current(turn):
                 continue  # comando abortado antes de transcribir
             try:
-                text = self.stt.transcribe(audio_path)
+                text = self.stt.transcribe(audio_path, hotwords=self.hotwords)
             except Exception as error:  # noqa: BLE001
                 log.warning("stt: %s", error)
                 text = ""
@@ -426,7 +433,9 @@ class VoiceLoop:
         )
         self.threads = [
             ear,
-            SttThread(stt, self.stt_q, self.cmd_q, self.state, self.shutdown),
+            SttThread(stt, self.stt_q, self.cmd_q, self.state, self.shutdown,
+                      hotwords=vcfg.get("hotwords",
+                                        "Crotolamo, Tletl, Huevonitis")),
             BrainThread(agent, self.cmd_q, self.tts_q, self.state, self.shutdown),
             MouthThread(tts, self.tts_q, self.state, self.shutdown),
         ]

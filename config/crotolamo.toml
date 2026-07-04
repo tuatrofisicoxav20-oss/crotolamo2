@@ -106,6 +106,11 @@ vad_silence_ms       = 900
 barge_in_grace_ms         = 400   # ignora barge-in los primeros ms tras empezar a hablar
 barge_in_threshold_margin = 0.1   # umbral VAD más alto mientras suena el TTS
 barge_in_min_chunks       = 5     # racha de chunks de voz para disparar (no un pico)
+# Hotwords (faster-whisper >= 1.0.2): sesgo del decoder hacia nombres propios,
+# SOLO en la transcripción de comandos (post-wake). La detección de wake NO lo
+# usa: un sesgo con "crotolamo" sobre silencio aumentaría falsos despertares.
+# Overridable desde crotolamo.local.toml como el resto de la config.
+hotwords = "Crotolamo, Tletl, Huevonitis"
 
 [wake]
 target    = "crotolamo"

@@ -55,3 +55,43 @@ def test_stt_requires_deps_raises_clear_error():
     except stt_mod.VoiceUnavailable:
         raised = True
     assert raised
+
+
+class _FakeWhisperModel:
+    """Modelo falso: registra los kwargs que recibe model.transcribe()."""
+
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    def transcribe(self, path, **kwargs):
+        self.calls.append(kwargs)
+        return iter(()), None  # (segments, info)
+
+
+def test_transcribe_propaga_hotwords_al_modelo(tmp_path):
+    """El wrapper STT.transcribe() propaga `hotwords` a model.transcribe()
+    (faster-whisper >= 1.0.2) SIN hardcodearlo: quien no lo pasa — la ruta de
+    WAKE difuso llama transcribe(path) a secas — manda hotwords=None (sin
+    sesgo, para no inflar falsos despertares)."""
+    from crotolamo.voice import stt as stt_mod
+
+    fake = _FakeWhisperModel()
+    stt_mod._models["_fake_hotwords_"] = fake
+    try:
+        stt = stt_mod.STT(model_size="_fake_hotwords_")
+        wav = tmp_path / "x.wav"
+        wav.touch()
+
+        # Ruta de COMANDOS: el caller pasa las hotwords y llegan al modelo.
+        stt.transcribe(wav, hotwords="Crotolamo, Tletl, Huevonitis")
+        assert fake.calls[-1]["hotwords"] == "Crotolamo, Tletl, Huevonitis"
+
+        # Ruta de WAKE: transcribe(path) sin argumento -> el modelo recibe
+        # hotwords=None (exactamente el comportamiento previo, sin sesgo).
+        stt.transcribe(wav)
+        assert fake.calls[-1]["hotwords"] is None
+        # El resto de la llamada no cambió (anti-alucinación intacta).
+        assert fake.calls[-1]["temperature"] == 0.0
+        assert fake.calls[-1]["condition_on_previous_text"] is False
+    finally:
+        stt_mod._models.pop("_fake_hotwords_", None)

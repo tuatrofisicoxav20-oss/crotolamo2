@@ -223,7 +223,13 @@ class STT:
         return self._frames_to_wav(frames)
 
     # --- transcripción ---
-    def transcribe(self, path: Path) -> str:
+    def transcribe(self, path: Path, hotwords: str | None = None) -> str:
+        """Transcribe el WAV. `hotwords` (faster-whisper >= 1.0.2) sesga el
+        decoder hacia nombres propios ("Crotolamo", "Tletl"...) SOLO en la
+        llamada que lo pida — el caller decide; aquí no se hardcodea nada.
+        La ruta de wake NO debe pasarlo: igual que initial_prompt, un sesgo
+        con "crotolamo" sobre silencio/ruido aumentaría falsos despertares.
+        """
         model = self._get_model()
         # I4: vad_filter=False — ya recortamos por energía en record_until_silence;
         # el doble VAD (energía + el de Whisper) se comía audio.
@@ -233,7 +239,7 @@ class STT:
         segments, _ = model.transcribe(
             str(path), language=self.language, beam_size=5, vad_filter=False,
             condition_on_previous_text=False, initial_prompt=self.initial_prompt,
-            temperature=0.0,
+            temperature=0.0, hotwords=hotwords,
         )
         # Descarta segmentos alucinados: Whisper marca cada segmento con la prob de
         # "no es voz" (no_speech_prob) y su confianza media (avg_logprob). Si el

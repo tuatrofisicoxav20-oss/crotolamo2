@@ -150,9 +150,11 @@ class FakeStt:
     def __init__(self, text="abre youtube"):
         self.text = text
         self.transcribed = 0
+        self.hotwords_seen: list = []  # hotwords recibidos por llamada
 
-    def transcribe(self, path):
+    def transcribe(self, path, hotwords=None):
         self.transcribed += 1
+        self.hotwords_seen.append(hotwords)
         return self.text
 
     def listen_once(self, **kwargs):
@@ -176,6 +178,27 @@ def test_stt_passes_text_for_current_turn():
         assert _wait(lambda: not out_q.empty())
         text, turn = out_q.get()
         assert text == "abre youtube" and turn == 1
+    finally:
+        shutdown.set()
+        th.join(timeout=2.0)
+
+
+def test_stt_thread_propaga_hotwords_de_comandos():
+    """La ruta de COMANDOS (SttThread, siempre post-wake) transcribe con las
+    hotwords configuradas; sin configurar, transcribe con None (sin sesgo)."""
+    state = SharedState()
+    state.new_turn()
+    stt = FakeStt("abre tletl")
+    in_q: queue.Queue = queue.Queue()
+    out_q: queue.Queue = queue.Queue()
+    shutdown = threading.Event()
+    th = SttThread(stt, in_q, out_q, state, shutdown,
+                   hotwords="Crotolamo, Tletl, Huevonitis")
+    th.start()
+    try:
+        in_q.put((_NO_WAV, 1))
+        assert _wait(lambda: not out_q.empty())
+        assert stt.hotwords_seen == ["Crotolamo, Tletl, Huevonitis"]
     finally:
         shutdown.set()
         th.join(timeout=2.0)
