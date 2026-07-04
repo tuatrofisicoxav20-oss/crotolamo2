@@ -25,6 +25,20 @@ allowed_roots = [
     "~/.crotolamo",
 ]
 
+# Zona de CONFIRMACIÓN: rutas fuera de allowed_roots pero dentro de estas
+# raíces se permiten PIDIENDO PERMISO por voz ("¿lo hago, patrón?"). Fuera de
+# ambas zonas sigue bloqueado. Así Crotolamo puede usar toda la lap sin hacer
+# nada delicado a la mala.
+confirm_roots = ["~"]
+
+# Personalidad del asistente: "desmadrosa" (buen pedo, echador de relajo,
+# expresiones mexicanas; el desmadre nunca estorba la tarea) o "clasica"
+# (directo y sarcástico, el tono original). extra = texto libre opcional que
+# se anexa al prompt del estilo elegido.
+[persona]
+style = "desmadrosa"
+extra = ""
+
 # Proyectos del patrón sobre los que Crotolamo puede razonar (Fase 3).
 [projects]
 crotolamo  = "~/Documentos/crotolamo2"
@@ -111,6 +125,18 @@ barge_in_min_chunks       = 5     # racha de chunks de voz para disparar (no un 
 # usa: un sesgo con "crotolamo" sobre silencio aumentaría falsos despertares.
 # Overridable desde crotolamo.local.toml como el resto de la config.
 hotwords = "Crotolamo, Tletl, Huevonitis"
+# Endpointing inteligente: si la transcripción parece una oración A MEDIAS
+# (termina en "de", "para", "y", coma, o es un verbo colgado como "abre"),
+# se reabre la escucha endpoint_continue_s segundos y se concatena la
+# continuación, hasta endpoint_max_rounds veces. Así una pausa de PENSAR no
+# corta el comando. false = comportamiento clásico (corte por silencio fijo).
+smart_endpoint      = true
+endpoint_max_rounds = 2
+endpoint_continue_s = 2.5
+# Conversación continua: tras responder, Crotolamo sigue escuchando esta
+# ventana (segundos) SIN exigir "crotolamo" otra vez. Si no dices nada, la
+# ventana expira y vuelve a esperar la palabra de activación. 0 = apagado.
+followup_s = 6.0
 
 [wake]
 target    = "crotolamo"

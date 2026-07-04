@@ -56,6 +56,18 @@ GROUPS: dict[str, dict[str, Any]] = {
             "pon", "ponme", "pausa", "pausala", "play", "dale play", "siguiente",
             "anterior", "suena", "sonando", "tema", "escuchar", "rola", "salta",
             "siguiente cancion", "para la musica", "quita la musica", "toca",
+            # frases naturales de voz que no disparaban (gap de validación):
+            "quita la cancion", "quitala", "parale", "cortale",
+        ],
+    },
+    "windows": {
+        "tools": ["list_windows", "app_status", "focus_window", "close_window"],
+        "keywords": [
+            "ventana", "ventanas", "que apps", "tengo abiert", "abiertas",
+            "abiertos", "esta abierto", "esta abierta", "sigue abierto",
+            "sigue abierta", "cierra", "cierrame", "enfoca", "enfocame",
+            "cambiate a", "cambia a", "trae al frente", "pon enfrente",
+            "workspace", "esta corriendo",
         ],
     },
     "files": {
@@ -68,6 +80,8 @@ GROUPS: dict[str, dict[str, Any]] = {
             "lee", "leer", "escribe", "escribir", "guarda en", "crea un",
             "crea una", "borra", "elimina", "mueve", "renombra", "lista",
             "directorio", "txt", "markdown", "md", "documento",
+            # imperativos naturales de voz (gap de validación):
+            "mueveme", "muevelo", "pasame", "pasalo", "manda", "mandame",
             # frases comunes para "ver qué hay" en una carpeta (gap del routing):
             "carpeta", "que hay en", "que tengo en", "muestra", "muestrame",
             "contenido de", "ensename los", "ver los archivos",
@@ -102,10 +116,15 @@ GROUPS: dict[str, dict[str, Any]] = {
         ],
     },
     "search": {
-        "tools": ["search_web"],
+        # search_web abre pestaña; fetch_web_results/read_page LEEN el contenido
+        # para poder respondérselo al patrón por voz.
+        "tools": ["search_web", "fetch_web_results", "read_page"],
         "keywords": [
             "busca en", "buscar en", "google", "internet", "en la web",
             "investiga", "buscame", "busca informacion",
+            "que dice internet", "informacion sobre", "informacion de",
+            "leeme la pagina", "lee la pagina", "leeme el articulo",
+            "averigua", "consulta en internet", "quien es", "que es ",
         ],
     },
 }
@@ -128,12 +147,24 @@ def select_tool_names(text: str, max_tools: int = MAX_TOOLS_DEFAULT) -> list[str
     selected: list[str] = []
     seen: set[str] = set()
 
-    for group in GROUPS.values():
-        if any(kw in norm for kw in group["keywords"]):
-            for name in group["tools"]:
-                if name not in seen:
-                    seen.add(name)
-                    selected.append(name)
+    # Especificidad primero: el grupo con MÁS y MÁS LARGOS keywords matcheados
+    # va antes en la unión. Con el tope de max_tools, esto evita que un grupo
+    # genérico ("pagina" -> desktop, "lee" -> files) desplace al grupo que
+    # matcheó la frase completa ("leeme la pagina" -> search). Score = suma de
+    # longitudes de los matches (evidencia total), desempate por número de
+    # matches y luego por orden de declaración, como antes.
+    scored: list[tuple[int, int, int, dict[str, Any]]] = []
+    for idx, group in enumerate(GROUPS.values()):
+        matched = [kw for kw in group["keywords"] if kw in norm]
+        if matched:
+            score = sum(len(kw) for kw in matched)
+            scored.append((score, len(matched), idx, group))
+
+    for _, _, _, group in sorted(scored, key=lambda t: (-t[0], -t[1], t[2])):
+        for name in group["tools"]:
+            if name not in seen:
+                seen.add(name)
+                selected.append(name)
 
     return selected[:max_tools]
 

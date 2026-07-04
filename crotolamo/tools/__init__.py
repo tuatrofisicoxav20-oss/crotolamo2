@@ -17,6 +17,7 @@ def default_registry() -> Registry:
         search,
         shortcuts,
         system,
+        windows,
     )
 
     return GLOBAL_REGISTRY

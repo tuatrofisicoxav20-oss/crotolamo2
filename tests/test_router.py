@@ -63,3 +63,42 @@ def test_route_schemas_only_includes_existing_tools():
     schemas = route_schemas(reg, "pon musica y abre spotify")
     for s in schemas:
         assert s["function"]["name"] in available
+
+
+# --- frases naturales de voz (validación de mic / expansión de tools) ---
+
+def test_ventanas_abiertas_enruta_a_windows():
+    names = select_tool_names("qué apps tengo abiertas?")
+    assert "list_windows" in names
+    assert "app_status" in names
+
+
+def test_cerrar_app_enruta_a_windows():
+    names = select_tool_names("ciérrame la ventana de opera")
+    assert "close_window" in names
+
+
+def test_esta_abierto_enruta_a_windows():
+    names = select_tool_names("está abierto blender?")
+    assert "app_status" in names
+
+
+def test_mueveme_y_pasame_enrutan_a_files():
+    assert "move_file" in select_tool_names("muéveme el reporte a descargas")
+    assert "move_file" in select_tool_names("pásame la nota al escritorio")
+
+
+def test_quita_la_cancion_enruta_a_media():
+    names = select_tool_names("quítala, no me gusta esa canción")
+    assert "music_control" in names
+
+
+def test_que_dice_internet_enruta_a_web_con_lectura():
+    names = select_tool_names("qué dice internet de la nueva versión de blender")
+    assert "fetch_web_results" in names
+    assert "read_page" in names
+
+
+def test_leeme_la_pagina_enruta_a_read_page():
+    names = select_tool_names("léeme la página de fedora magazine")
+    assert "read_page" in names

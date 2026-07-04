@@ -57,7 +57,8 @@ def test_destructive_tools_marked_unsafe():
     # El guard se apoya en este flag para pedir confirmación.
     assert files.delete_file._crotolamo_tool.safe is False
     assert files.move_file._crotolamo_tool.safe is False
-    assert files.write_file._crotolamo_tool.safe is True
+    # M6: sobrescribir archivos también es destructivo -> confirma siempre.
+    assert files.write_file._crotolamo_tool.safe is False
 
 
 # --- defensa en profundidad (M2): la tool rechaza por sí sola, sin guard ---
@@ -75,4 +76,23 @@ def test_read_outside_corral_rejected_directly():
 
 def test_delete_outside_corral_rejected_directly():
     out = files.delete_file("/etc/hosts")
+    assert "corral" in out.lower() or "permitidas" in out.lower()
+
+
+# --- corral ampliado (M6): la tool acepta también la zona de confirmación ---
+def test_write_inside_confirm_roots_accepted(tmp_path, monkeypatch):
+    # allowed = libre/, confirm = confirmable/. La confirmación ya ocurrió en el
+    # guard: la tool no debe re-bloquear una ruta de la zona de confirmación.
+    real = settings_mod.get_settings()
+    monkeypatch.setattr(real, "allowed_roots", [tmp_path / "libre"])
+    monkeypatch.setattr(real, "confirm_roots", [tmp_path / "confirmable"])
+    out = files.write_file(str(tmp_path / "confirmable" / "x.txt"), "hola")
+    assert "Escribí" in out
+
+
+def test_outside_both_zones_still_rejected(tmp_path, monkeypatch):
+    real = settings_mod.get_settings()
+    monkeypatch.setattr(real, "allowed_roots", [tmp_path / "libre"])
+    monkeypatch.setattr(real, "confirm_roots", [tmp_path / "confirmable"])
+    out = files.write_file(str(tmp_path / "otra" / "x.txt"), "hola")
     assert "corral" in out.lower() or "permitidas" in out.lower()

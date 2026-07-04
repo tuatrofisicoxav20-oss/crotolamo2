@@ -6,6 +6,11 @@ guard decide, por tool y por argumentos, si la acción:
   - corre directo (safe),
   - necesita confirmación del patrón,
   - o se bloquea (p.ej. una ruta fuera de las raíces permitidas).
+
+Tres zonas por ruta (M6):
+  - dentro de allowed_roots  -> libre (corre directo si la tool es safe),
+  - dentro de confirm_roots  -> pide confirmación al patrón,
+  - fuera de ambas           -> bloqueada.
 """
 
 from __future__ import annotations
@@ -13,7 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from crotolamo.safety.paths import path_inside_allowed_roots
+from crotolamo.safety.paths import path_inside_roots
 from crotolamo.tools.base import Tool
 
 # Nombres de argumentos que típicamente contienen rutas de archivo (Fase 3).
@@ -47,34 +52,60 @@ class Decision:
 
 
 class Guard:
-    def __init__(self, allowed_roots: list[Path]) -> None:
+    def __init__(
+        self,
+        allowed_roots: list[Path],
+        confirm_roots: list[Path] | None = None,
+    ) -> None:
         self.allowed_roots = [p.expanduser().resolve() for p in allowed_roots]
+        # Zona de confirmación (M6). Default: el home del patrón — Crotolamo puede
+        # usar toda la lap, pero fuera de la zona libre pide permiso primero.
+        if confirm_roots is None:
+            confirm_roots = [Path("~")]
+        self.confirm_roots = [p.expanduser().resolve() for p in confirm_roots]
 
     @classmethod
     def from_settings(cls, settings) -> "Guard":
-        return cls(settings.allowed_roots)
+        return cls(settings.allowed_roots, getattr(settings, "confirm_roots", None))
 
     def _path_inside_allowed(self, candidate: Path) -> bool:
-        return path_inside_allowed_roots(candidate, self.allowed_roots)
+        return path_inside_roots(candidate, self.allowed_roots)
+
+    def _path_inside_confirm(self, candidate: Path) -> bool:
+        return path_inside_roots(candidate, self.confirm_roots)
 
     def check(self, tool: Tool, arguments: dict) -> Decision:
         """Decide si una llamada a tool puede correr."""
-        # 1) Validar contra el allowlist cualquier argumento que sea una ruta:
+        # 1) Clasificar en zonas cualquier argumento que sea una ruta:
         #    por nombre conocido (señal fuerte) O porque el valor parece un path.
+        confirm_reason = ""
         for arg_name, value in arguments.items():
             if not isinstance(value, str) or not value:
                 continue
             is_path_arg = arg_name.lower() in _PATH_ARG_NAMES or _looks_like_path(value)
-            if is_path_arg and not self._path_inside_allowed(Path(value)):
-                return Decision.block(
-                    f"La ruta '{value}' está fuera de las zonas permitidas, patrón. "
-                    "No salgo del corral."
-                )
+            if not is_path_arg:
+                continue
+            candidate = Path(value)
+            if self._path_inside_allowed(candidate):
+                continue
+            if self._path_inside_confirm(candidate):
+                if not confirm_reason:
+                    confirm_reason = f"fuera de la zona libre: {value}. ¿Lo hago?"
+                continue
+            return Decision.block(
+                f"La ruta '{value}' está fuera de las zonas permitidas, patrón. "
+                "No salgo del corral."
+            )
 
-        # 2) Tools marcadas como no-safe piden confirmación explícita.
+        # 2) Tools marcadas como no-safe piden confirmación explícita SIEMPRE,
+        #    sin importar en qué zona caigan sus rutas.
         if not tool.safe:
             return Decision.confirm(
                 f"La acción '{tool.name}' puede ser destructiva, patrón. ¿La confirmo?"
             )
+
+        # 3) Rutas en la zona de confirmación: se puede, pero preguntando.
+        if confirm_reason:
+            return Decision.confirm(confirm_reason)
 
         return Decision.ok()

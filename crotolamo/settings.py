@@ -43,6 +43,9 @@ class Settings:
     home: Path
     paths: dict[str, Path] = field(default_factory=dict)
     allowed_roots: list[Path] = field(default_factory=list)
+    # Zona de confirmación (M6): fuera de allowed_roots pero dentro de estas
+    # raíces, las tools corren PREVIA confirmación del patrón. Default: su home.
+    confirm_roots: list[Path] = field(default_factory=list)
     projects: dict[str, Path] = field(default_factory=dict)
 
     # --- accesos cómodos a secciones ---
@@ -61,6 +64,10 @@ class Settings:
     @property
     def wake(self) -> dict[str, Any]:
         return self.raw.get("wake", {})
+
+    @property
+    def persona(self) -> dict[str, Any]:
+        return self.raw.get("persona", {})
 
     def validate_critical(self) -> list[str]:
         """Devuelve lista de problemas con rutas críticas (no lanza)."""
@@ -92,6 +99,8 @@ def load_settings(config_path: Path | None = None) -> Settings:
     }
 
     allowed_roots = [_expand(p) for p in paths_raw.get("allowed_roots", [])]
+    # [paths].confirm_roots puede no existir aún en el toml: default ["~"].
+    confirm_roots = [_expand(p) for p in paths_raw.get("confirm_roots", ["~"])]
     projects = {name: _expand(p) for name, p in data.get("projects", {}).items()}
 
     return Settings(
@@ -100,6 +109,7 @@ def load_settings(config_path: Path | None = None) -> Settings:
         home=Path.home(),
         paths=paths,
         allowed_roots=allowed_roots,
+        confirm_roots=confirm_roots,
         projects=projects,
     )
 

@@ -1,16 +1,20 @@
 """Operaciones de archivo SEGURAS. Reemplazan el bash crudo de C1.
 
 Defensa en profundidad (M2): además del guard del agente, CADA tool de archivo
-revalida ella misma la ruta contra la allowlist de [paths].allowed_roots. Dos
-cerrojos: aunque el guard no intercepte (p.ej. llamada directa), la tool rechaza
-rutas fuera del corral. Las destructivas (delete/move) van marcadas safe=False.
+revalida ella misma la ruta contra el corral. Dos cerrojos: aunque el guard no
+intercepte (p.ej. llamada directa), la tool rechaza rutas fuera del corral.
+Las destructivas (delete/move/write) van marcadas safe=False.
+
+Corral ampliado (M6): el corral de la tool = allowed_roots + confirm_roots. Si
+una ruta cae en confirm_roots, el guard YA pidió confirmación al patrón antes de
+ejecutar la tool; aquí solo se rechaza lo que queda fuera de ambas zonas.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from crotolamo.safety.paths import path_inside_allowed_roots
+from crotolamo.safety.paths import path_inside_roots
 from crotolamo.settings import get_settings
 from crotolamo.tools.base import tool
 
@@ -23,8 +27,14 @@ def _resolve(path: str) -> Path:
 
 
 def _outside_corral(p: Path) -> str | None:
-    """Devuelve un mensaje de bloqueo si `p` está fuera de la allowlist; si no, None."""
-    if not path_inside_allowed_roots(p, get_settings().allowed_roots):
+    """Devuelve un mensaje de bloqueo si `p` está fuera del corral; si no, None.
+
+    El corral acepta allowed_roots (zona libre) Y confirm_roots (zona con
+    confirmación): si la ruta está en la segunda, el guard ya preguntó al patrón.
+    """
+    settings = get_settings()
+    roots = list(settings.allowed_roots) + list(settings.confirm_roots)
+    if not path_inside_roots(p, roots):
         return (f"La ruta '{p}' está fuera de las zonas permitidas, patrón. "
                 "No salgo del corral.")
     return None
@@ -53,9 +63,10 @@ def read_file(path: str) -> str:
     return text
 
 
-@tool
+@tool(safe=False)
 def write_file(path: str, content: str) -> str:
-    """Escribe (crea o sobrescribe) un archivo de texto.
+    """Escribe (crea o sobrescribe) un archivo de texto. Puede pisar contenido
+    existente, así que pide confirmación.
 
     Args:
         path: ruta del archivo a escribir.

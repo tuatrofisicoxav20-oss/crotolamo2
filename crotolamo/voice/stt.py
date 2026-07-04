@@ -258,11 +258,42 @@ class STT:
         return normalize_text(raw)
 
     def listen_once(self, **vad_kwargs) -> str:
+        return self._listen_transcribe(**vad_kwargs)
+
+    def _listen_transcribe(self, hotwords: str | None = None, **vad_kwargs) -> str:
         path = self.record_until_silence(**vad_kwargs)
         try:
-            return self.transcribe(path)
+            return self.transcribe(path, hotwords=hotwords)
         finally:
             try:
                 path.unlink(missing_ok=True)
             except OSError:
                 pass
+
+    def listen_smart(self, silence_ms: int | None = None, max_seconds: float = 12.0,
+                     start_timeout_s: float = 4.0, rounds: int = 2,
+                     continue_timeout_s: float = 2.5,
+                     hotwords: str | None = None) -> str:
+        """Escucha con endpointing inteligente: si la frase parece INCOMPLETA
+        (pausa de pensar: termina en "de", "para", coma...), reabre la escucha
+        `continue_timeout_s` segundos y concatena la continuación, hasta
+        `rounds` veces. Si la continuación sale vacía (de verdad ya terminó),
+        se queda con lo que hay. Con rounds=0 equivale a listen_once.
+        """
+        from crotolamo.voice.endpoint import seems_incomplete
+
+        text = self._listen_transcribe(
+            hotwords=hotwords, silence_ms=silence_ms, max_seconds=max_seconds,
+            start_timeout_s=start_timeout_s,
+        )
+        for _ in range(max(0, rounds)):
+            if not text.strip() or not seems_incomplete(text):
+                break
+            extra = self._listen_transcribe(
+                hotwords=hotwords, silence_ms=silence_ms, max_seconds=max_seconds,
+                start_timeout_s=continue_timeout_s,
+            )
+            if not extra.strip():
+                break
+            text = f"{text.strip()} {extra.strip()}"
+        return text

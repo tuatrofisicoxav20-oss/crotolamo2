@@ -108,6 +108,24 @@ def run_listen(argv: list[str] | None = None) -> int:
     threshold = settings.wake.get("threshold", 0.67)
     variants = settings.wake.get("variants")
     silence_ms = settings.voice.get("vad_silence_ms", 800)
+    # Endpointing inteligente: si la frase parece a medias (pausa de pensar),
+    # reabrir la escucha y concatenar. followup_s > 0 = tras responder, seguir
+    # escuchando esa ventana SIN exigir "crotolamo" de nuevo (conversación).
+    smart_endpoint = settings.voice.get("smart_endpoint", True)
+    endpoint_rounds = settings.voice.get("endpoint_max_rounds", 2)
+    endpoint_continue_s = settings.voice.get("endpoint_continue_s", 2.5)
+    followup_s = settings.voice.get("followup_s", 6.0)
+    # Hotwords solo para COMANDOS (post-wake), igual que el loop concurrente.
+    hotwords = settings.voice.get("hotwords") or None
+
+    def listen_command(start_timeout_s: float = 4.0) -> str:
+        if smart_endpoint:
+            return stt.listen_smart(
+                silence_ms=silence_ms, start_timeout_s=start_timeout_s,
+                rounds=endpoint_rounds, continue_timeout_s=endpoint_continue_s,
+                hotwords=hotwords,
+            )
+        return stt.listen_once(silence_ms=silence_ms, start_timeout_s=start_timeout_s)
 
     # M1: wake word dedicado con openWakeWord; si no está, fallback al difuso (Whisper).
     # [wake].use_oww = false fuerza el wake DIFUSO (Whisper), que sí reconoce
@@ -215,24 +233,37 @@ def run_listen(argv: list[str] | None = None) -> int:
             # Convocado: el HUD debe APARECER (listening).
             hud_state.set_mode(Mode.LISTENING)
             say("Te escucho, patrón.")
-            command = stt.listen_once(silence_ms=silence_ms)
+            command = listen_command()
 
             if not command.strip():
                 say("No te escuché claro, patrón.")
                 continue  # el finally publica idle -> HUD se oculta
 
-            print(f"Orden: {command}", flush=True)
-            hud_state.set_text(command)
-            hud_state.set_mode(Mode.THINKING)
-            reply = agent.handle_turn(command)
-            print(reply, flush=True)
-            hud_state.set_text(reply)
-            hud_state.set_mode(Mode.SPEAKING)
-            try:
-                tts.speak_sentences(reply)  # Fase 6: TTS por frases
-            except Exception as error:  # noqa: BLE001
-                log.warning("voz falló: %s", error)
-            time.sleep(0.5)
+            # Conversación: atender el comando y, si followup_s > 0, seguir
+            # escuchando esa ventana sin exigir el wake word otra vez. La
+            # ventana se cierra sola si el patrón ya no dice nada (la
+            # grabación corta por start_timeout sin voz -> texto vacío).
+            while command.strip():
+                print(f"Orden: {command}", flush=True)
+                hud_state.set_text(command)
+                hud_state.set_mode(Mode.THINKING)
+                reply = agent.handle_turn(command)
+                print(reply, flush=True)
+                hud_state.set_text(reply)
+                hud_state.set_mode(Mode.SPEAKING)
+                try:
+                    tts.speak_sentences(reply)  # Fase 6: TTS por frases
+                except Exception as error:  # noqa: BLE001
+                    log.warning("voz falló: %s", error)
+                time.sleep(0.5)
+
+                if followup_s <= 0:
+                    break
+                hud_state.set_mode(Mode.LISTENING)
+                print("(sigo escuchando...)", flush=True)
+                command = wake.strip_wake_word(
+                    listen_command(start_timeout_s=followup_s)
+                )
 
         except KeyboardInterrupt:
             say("Crotolamo apagado, patrón.")
