@@ -113,3 +113,48 @@ def test_listen_smart_usa_timeout_corto_en_continuacion():
     assert stt.calls[1]["start_timeout_s"] == 2.5
     # hotwords llegan a TODAS las escuchas del comando
     assert all(c["hotwords"] == "Crotolamo" for c in stt.calls)
+
+
+# --- min_audio_s: silencio puro NO se transcribe (mic sordo mínimo) ---
+
+def test_min_audio_salta_whisper_en_silencio(tmp_path, monkeypatch):
+    import wave as wave_mod
+
+    import numpy as np
+
+    stt = stt_mod.STT(model_size="fake")
+
+    def _fake_record(**kwargs):
+        # WAV de 1 muestra: lo que produce _frames_to_wav cuando nadie habló
+        path = tmp_path / "vacio.wav"
+        with wave_mod.open(str(path), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(16000)
+            w.writeframes(np.zeros(1, dtype=np.int16).tobytes())
+        return path
+
+    def _boom(path, hotwords=None):
+        raise AssertionError("no debía transcribir silencio")
+
+    monkeypatch.setattr(stt, "record_until_silence", _fake_record)
+    monkeypatch.setattr(stt, "transcribe", _boom)
+    assert stt.listen_once(min_audio_s=0.3) == ""
+
+
+def test_min_audio_cero_transcribe_como_siempre(tmp_path, monkeypatch):
+    import wave as wave_mod
+
+    import numpy as np
+
+    stt = stt_mod.STT(model_size="fake")
+    path = tmp_path / "voz.wav"
+    with wave_mod.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+        w.writeframes(np.zeros(16000, dtype=np.int16).tobytes())  # 1s de audio
+
+    monkeypatch.setattr(stt, "record_until_silence", lambda **k: path)
+    monkeypatch.setattr(stt, "transcribe", lambda p, hotwords=None: "hola")
+    assert stt.listen_once(min_audio_s=0.3) == "hola"

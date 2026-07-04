@@ -122,3 +122,35 @@ def strip_wake_word(text: str, variants: Iterable[str] | None = None) -> str:
 def contains_any(text: str, variants: Iterable[str]) -> bool:
     lower = normalize_for_wake(text)
     return any(normalize_for_wake(v) in lower for v in variants)
+
+
+def split_wake_command(
+    heard: str,
+    threshold: float = DEFAULT_THRESHOLD,
+    variants: Iterable[str] | None = None,
+) -> tuple[bool, str]:
+    """(¿se activó?, comando pegado) para una frase dicha DE CORRIDO.
+
+    Antes el listener rechazaba de plano cualquier frase de 4+ palabras (guard
+    anti-alucinación), así que "crotolamo ábreme la carpeta" NO activaba. La
+    regla nueva conserva la protección pero bien puesta: el wake word debe
+    venir AL INICIO (en las 3 primeras palabras) — la música/ruido transcrito
+    casi nunca ARRANCA con algo que suene a "crotolamo", pero el patrón sí.
+
+    - "crotolamo"                    -> (True, "")            [pide la orden]
+    - "crotolamo pausa la música"    -> (True, "pausa la música")  [directo]
+    - "abre la carpeta de descargas" -> (False, "")           [no es wake]
+    """
+    heard = (heard or "").strip()
+    if not heard:
+        return False, ""
+    variant_list = list(variants) if variants is not None else _default_variants()
+    head = " ".join(heard.split()[:3])
+    if not is_wake_word(head, threshold, variant_list):
+        return False, ""
+    command = strip_wake_word(heard, variant_list)
+    # strip devuelve el original si no encontró qué quitar (p.ej. el score fue
+    # difuso sobre las 3 palabras juntas): en ese caso no hay orden separable.
+    if normalize_for_wake(command) == normalize_for_wake(heard):
+        return True, ""
+    return True, command.strip()

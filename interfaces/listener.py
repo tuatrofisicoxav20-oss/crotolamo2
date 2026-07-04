@@ -125,7 +125,7 @@ def run_listen(argv: list[str] | None = None) -> int:
     ack = settings.voice.get("ack", "beep")
     stream_speak = settings.voice.get("stream_speak", True)
     wake_silence_ms = settings.voice.get("wake_silence_ms", 400)
-    wake_max_s = settings.voice.get("wake_max_seconds", 3.0)
+    wake_max_s = settings.voice.get("wake_max_seconds", 8.0)
 
     def listen_command(start_timeout_s: float = 4.0) -> str:
         if smart_endpoint:
@@ -221,38 +221,50 @@ def run_listen(argv: list[str] | None = None) -> int:
                     if not wake_detector.listen_for_wake(timeout_s=None):
                         continue
                 else:
-                    # Fallback difuso: Whisper sobre el ambiente. Ventana de
-                    # silencio corta y tope chico: "crotolamo" es una palabra,
-                    # y cuanto menos audio, más rápida la transcripción.
+                    # Fallback difuso: Whisper sobre el ambiente. Silencio corto
+                    # (una palabra no necesita 600ms) pero tope amplio: así
+                    # "crotolamo pausa la música" DE CORRIDO cabe completo.
+                    # min_audio_s: si nadie habló, NO se transcribe el silencio
+                    # (eso costaba ~1s de mic sordo por ciclo vacío).
                     heard = wake_stt.listen_once(silence_ms=wake_silence_ms,
                                                  max_seconds=wake_max_s,
-                                                 start_timeout_s=6)
+                                                 start_timeout_s=6,
+                                                 min_audio_s=0.3)
                     # Log de lo que oyó el wake difuso: sirve para AFINAR la lista
                     # de variantes de "crotolamo" según cómo lo transcribe Whisper.
                     if heard:
                         log.info("wake difuso oyó: %r", heard)
-                    # Guard anti-alucinación: "crotolamo" es UNA palabra; una frase
-                    # larga (4+ palabras) es casi siempre música/ruido transcrito,
-                    # no la palabra de activación. La rechazamos de plano.
-                    if heard and len(heard.split()) > 3:
-                        continue
-                    if not heard or not wake.is_wake_word(heard, threshold, variants):
+                    # Activación: el wake debe venir AL INICIO de la frase (3
+                    # primeras palabras) — protege de música/ruido igual que el
+                    # viejo guard de "máximo 3 palabras", pero SIN rechazar
+                    # "crotolamo <orden>" dicho de corrido: esa orden pegada se
+                    # atiende directo, sin segundo turno de escucha.
+                    activated, inline_cmd = wake.split_wake_command(
+                        heard, threshold, variants
+                    )
+                    if not activated:
                         continue
             except VoiceUnavailable as error:
                 print(str(error))
                 return 1
 
-            # Convocado: el HUD debe APARECER (listening). Acuse según config:
-            # "beep" suena SIN bloquear (la grabación abre de inmediato y el
-            # patrón puede hablar ya); "voz" es el clásico "Te escucho" (~1s
-            # de espera); "off" nada — solo el HUD.
+            # Convocado: el HUD debe APARECER (listening). Si la orden venía
+            # pegada al wake, se atiende de inmediato (ni bip hace falta). Si
+            # no, acuse según config: "beep" suena SIN bloquear (la grabación
+            # abre de inmediato y el patrón puede hablar ya); "voz" es el
+            # clásico "Te escucho" (~1s de espera); "off" nada — solo el HUD.
             hud_state.set_mode(Mode.LISTENING)
-            if ack == "voz":
-                say("Te escucho, patrón.")
-            elif ack != "off":
-                tts.beep()
-                print("Te escucho, patrón.", flush=True)
-            command = listen_command()
+            if use_oww:
+                inline_cmd = ""  # openWakeWord no transcribe: no hay orden pegada
+            if inline_cmd:
+                command = inline_cmd
+            else:
+                if ack == "voz":
+                    say("Te escucho, patrón.")
+                elif ack != "off":
+                    tts.beep()
+                    print("Te escucho, patrón.", flush=True)
+                command = listen_command()
 
             if not command.strip():
                 say("No te escuché claro, patrón.")

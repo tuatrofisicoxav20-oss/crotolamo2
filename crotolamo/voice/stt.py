@@ -34,6 +34,16 @@ class VoiceUnavailable(RuntimeError):
     """Faltan las dependencias de voz. Instala con: pip install -e '.[voice]'."""
 
 
+def _wav_seconds(path: Path) -> float:
+    """Duración del WAV en segundos (0.0 si no se puede leer)."""
+    try:
+        with wave.open(str(path), "rb") as wav:
+            rate = wav.getframerate()
+            return wav.getnframes() / rate if rate else 0.0
+    except (OSError, wave.Error):
+        return 0.0
+
+
 def _require(module: str):
     try:
         return __import__(module)
@@ -266,9 +276,18 @@ class STT:
     def listen_once(self, **vad_kwargs) -> str:
         return self._listen_transcribe(**vad_kwargs)
 
-    def _listen_transcribe(self, hotwords: str | None = None, **vad_kwargs) -> str:
+    def _listen_transcribe(self, hotwords: str | None = None,
+                           min_audio_s: float = 0.0, **vad_kwargs) -> str:
+        """Graba y transcribe. min_audio_s: si el WAV quedó más corto (el VAD
+        nunca detectó voz: grabación vacía), devuelve "" SIN pasar por Whisper
+        — el modelo paddea a ventanas de 30s, así que transcribir silencio
+        cuesta ~1s con el micrófono cerrado. En el bucle del wake eso era una
+        ventana SORDA cada ciclo silencioso; ahora el mic reabre de inmediato.
+        """
         path = self.record_until_silence(**vad_kwargs)
         try:
+            if min_audio_s > 0 and _wav_seconds(path) < min_audio_s:
+                return ""
             return self.transcribe(path, hotwords=hotwords)
         finally:
             try:

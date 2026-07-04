@@ -160,10 +160,12 @@ ack = "beep"
 # Hablar cada frase EN CUANTO el LLM la genera (streaming), en vez de esperar
 # la respuesta completa: la primera palabra suena varios segundos antes.
 stream_speak = true
-# Ventanas del WAKE (una palabra corta): silencio de corte y tope de grabación
-# chicos = detección y transcripción mucho más rápidas que las del comando.
+# Ventanas del WAKE: silencio de corte chico (400ms detecta "crotolamo" solo
+# casi al instante), pero tope AMPLIO para que "crotolamo pausa la música"
+# dicho DE CORRIDO quepa completo y se atienda directo (sin segundo turno de
+# escucha). El tope no estorba al caso corto: el silencio corta antes.
 wake_silence_ms  = 400
-wake_max_seconds = 3.0
+wake_max_seconds = 8.0
 
 [wake]
 target    = "crotolamo"
