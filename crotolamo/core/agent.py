@@ -60,8 +60,12 @@ class Agent:
         self.llm = llm
         self.conversation = conversation
 
-    def handle_turn(self, text: str) -> str:
-        """Un turno conversacional con memoria. Sin tools todavía (Fase 1)."""
+    def handle_turn(self, text: str, on_token=None) -> str:
+        """Un turno conversacional con memoria. Sin tools todavía (Fase 1).
+
+        on_token: misma firma que en ToolAgent (el listener lo usa para hablar
+        en streaming); aquí el fallback emite la respuesta completa de golpe.
+        """
         self.conversation.add_user(text)
 
         try:
@@ -71,6 +75,8 @@ class Agent:
 
         reply = response.content or "Me quedé en blanco, patrón. Repíteme eso."
         self.conversation.add_assistant(reply)
+        if on_token is not None:
+            on_token(reply)
         return reply
 
 
@@ -165,12 +171,17 @@ class ToolAgent(Agent):
         post_hooks: list[Callable[[str], str]] | None = None,
         route_fn: Callable[[str], list[dict[str, Any]]] | None = None,
         direct_tools: set[str] | None = None,
+        fastpath: bool = True,
     ) -> None:
         super().__init__(llm, conversation)
         self.registry = registry
         self.guard = guard
         self.max_iterations = max_iterations
         self.confirm_fn = confirm_fn or _deny
+        # Misión velocidad: atajos regex SIN LLM para comandos inequívocos
+        # ("pausa la música" -> music_control). El comando pasa igual por el
+        # guard y el registry; solo se salta las ~17-22s del LLM en CPU.
+        self.fastpath = fastpath
         # Short-circuit de retorno directo: nombres de tools "presentacionales"
         # cuyo output se devuelve tal cual (sin 2ª llamada al LLM). Si es None usa
         # el default sensato; pasa un set vacío para DESACTIVAR el short-circuit
@@ -247,6 +258,28 @@ class ToolAgent(Agent):
         routing_text = text
         # M4: pre-hooks enriquecen la entrada antes de llegar al LLM.
         text = self._apply(self.pre_hooks, text)
+
+        # Fast-path (misión velocidad): comando inequívoco -> tool directa sin
+        # LLM (~0.1s en vez de ~17-22s). Solo si la regla cubre el comando
+        # COMPLETO; cualquier matiz cae al loop normal de abajo. El historial
+        # se alimenta igual para que la conversación no pierda el turno.
+        if self.fastpath:
+            from crotolamo.core import fastpath as fastpath_mod
+
+            hit = fastpath_mod.match(routing_text)
+            if hit is not None:
+                fast_name, fast_args = hit
+                result = self._execute_call(fast_name, fast_args)
+                if not _is_hard_error(result):
+                    reply = self._apply(self.post_hooks, result)
+                    self.conversation.add_user(text)
+                    self.conversation.add_assistant(reply)
+                    if on_token is not None:
+                        on_token(reply)
+                    return reply
+                # Fallo duro del atajo (p.ej. hyprctl ausente): que lo razone
+                # el LLM como siempre, sin ensuciar el historial.
+
         self.conversation.add_user(text)
         schemas = self.route_fn(routing_text) if self.route_fn is not None else self.registry.schemas()
         known = set(self.registry.names())

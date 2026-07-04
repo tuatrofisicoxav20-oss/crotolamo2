@@ -61,11 +61,16 @@ class LLMClient:
         temperature: float = 0.2,
         timeout: float = 120,
         keep_alive: str = "15m",
+        num_ctx: int | None = None,
     ) -> None:
         self.host = host.rstrip("/")
         self.model = model
         self.temperature = temperature
         self.timeout = timeout
+        # num_ctx: ventana de contexto que Ollama reserva. En CPU, una ventana
+        # más chica reduce memoria y trabajo del KV-cache; con el routing de
+        # tools (prompts cortos) 2048 sobra. None = default del modelo.
+        self.num_ctx = num_ctx
         # keep_alive: cuánto mantiene Ollama el modelo (y su cache de prefijo KV)
         # residente tras una respuesta. En CPU es CLAVE: el primer turno paga el
         # prompt-eval completo de los tool-schemas (~lento), pero si el modelo
@@ -82,7 +87,14 @@ class LLMClient:
             temperature=llm.get("temperature", 0.2),
             timeout=llm.get("timeout", 120),
             keep_alive=llm.get("keep_alive", "15m"),
+            num_ctx=llm.get("num_ctx"),
         )
+
+    def _options(self) -> dict[str, Any]:
+        options: dict[str, Any] = {"temperature": self.temperature}
+        if self.num_ctx:
+            options["num_ctx"] = self.num_ctx
+        return options
 
     def chat(
         self,
@@ -94,7 +106,7 @@ class LLMClient:
             "stream": False,
             "messages": messages,
             "keep_alive": self.keep_alive,
-            "options": {"temperature": self.temperature},
+            "options": self._options(),
         }
         if tools:
             payload["tools"] = tools
@@ -155,7 +167,7 @@ class LLMClient:
             "stream": True,
             "messages": messages,
             "keep_alive": self.keep_alive,
-            "options": {"temperature": self.temperature},
+            "options": self._options(),
         }
         if tools:
             payload["tools"] = tools

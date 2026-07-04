@@ -55,13 +55,18 @@ def _voice_cfg() -> dict:
 
 class STT:
     def __init__(self, model_size: str = "small", sample_rate: int = 16000,
-                 language: str = "es", initial_prompt: str | None = _INITIAL_PROMPT) -> None:
+                 language: str = "es", initial_prompt: str | None = _INITIAL_PROMPT,
+                 beam_size: int = 5) -> None:
         self.model_size = model_size
         self.sample_rate = sample_rate
         self.language = language
         # El detector de wake debe pasar initial_prompt=None: si no, Whisper
         # regurgita la pista (con "crotolamo") sobre silencio y dispara solo.
         self.initial_prompt = initial_prompt
+        # beam_size: haces de búsqueda del decoder. 5 = más preciso; 1-2 = mucho
+        # más rápido en CPU con pérdida mínima en comandos cortos. El wake puede
+        # ir en 1 (solo busca UNA palabra); comandos, según [voice].beam_size.
+        self.beam_size = beam_size
 
     @classmethod
     def from_settings(cls, settings) -> "STT":
@@ -69,6 +74,7 @@ class STT:
         return cls(
             model_size=voice.get("whisper_model", "small"),
             sample_rate=voice.get("sample_rate", 16000),
+            beam_size=voice.get("beam_size", 5),
         )
 
     def _get_model(self):
@@ -237,7 +243,7 @@ class STT:
         # o silencio) en vez del fallback 0..1 por defecto, que es la causa de los
         # fantasmas tipo "yo te voy a amar" cuando suena Spotify.
         segments, _ = model.transcribe(
-            str(path), language=self.language, beam_size=5, vad_filter=False,
+            str(path), language=self.language, beam_size=self.beam_size, vad_filter=False,
             condition_on_previous_text=False, initial_prompt=self.initial_prompt,
             temperature=0.0, hotwords=hotwords,
         )

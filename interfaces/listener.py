@@ -21,7 +21,7 @@ from crotolamo.settings import get_settings
 from crotolamo.voice import wake
 from crotolamo.voice.state import Mode, SharedState, make_file_publisher
 from crotolamo.voice.stt import STT, VoiceUnavailable
-from crotolamo.voice.tts import TTS
+from crotolamo.voice.tts import TTS, StreamSpeaker
 from crotolamo.voice.wakeword import WakeWordDetector
 
 from interfaces.shell import build_agent
@@ -117,6 +117,15 @@ def run_listen(argv: list[str] | None = None) -> int:
     followup_s = settings.voice.get("followup_s", 6.0)
     # Hotwords solo para COMANDOS (post-wake), igual que el loop concurrente.
     hotwords = settings.voice.get("hotwords") or None
+    # Velocidad percibida: ack = acuse tras el wake ("beep" instantáneo, "voz"
+    # habla "Te escucho" ~1s, "off" nada). stream_speak habla cada frase
+    # conforme el LLM la genera, en vez de esperar la respuesta completa. El
+    # wake usa su propia ventana de silencio (una palabra corta no necesita
+    # los ~600ms de los comandos) y un tope de grabación chico.
+    ack = settings.voice.get("ack", "beep")
+    stream_speak = settings.voice.get("stream_speak", True)
+    wake_silence_ms = settings.voice.get("wake_silence_ms", 400)
+    wake_max_s = settings.voice.get("wake_max_seconds", 3.0)
 
     def listen_command(start_timeout_s: float = 4.0) -> str:
         if smart_endpoint:
@@ -145,7 +154,7 @@ def run_listen(argv: list[str] | None = None) -> int:
     def voice_confirm(reason: str) -> bool:
         say(reason + " Di 'confirmo' o 'cancela', patrón.")
         try:
-            answer = wake_stt.listen_once(silence_ms=silence_ms, max_seconds=5)
+            answer = wake_stt.listen_once(silence_ms=wake_silence_ms, max_seconds=5)
         except VoiceUnavailable:
             return False
         if wake.contains_any(answer, wake.CANCEL_VARIANTS):
@@ -212,8 +221,11 @@ def run_listen(argv: list[str] | None = None) -> int:
                     if not wake_detector.listen_for_wake(timeout_s=None):
                         continue
                 else:
-                    # Fallback difuso: Whisper 'tiny' sobre el ambiente.
-                    heard = wake_stt.listen_once(silence_ms=silence_ms, max_seconds=5,
+                    # Fallback difuso: Whisper sobre el ambiente. Ventana de
+                    # silencio corta y tope chico: "crotolamo" es una palabra,
+                    # y cuanto menos audio, más rápida la transcripción.
+                    heard = wake_stt.listen_once(silence_ms=wake_silence_ms,
+                                                 max_seconds=wake_max_s,
                                                  start_timeout_s=6)
                     # Log de lo que oyó el wake difuso: sirve para AFINAR la lista
                     # de variantes de "crotolamo" según cómo lo transcribe Whisper.
@@ -230,9 +242,16 @@ def run_listen(argv: list[str] | None = None) -> int:
                 print(str(error))
                 return 1
 
-            # Convocado: el HUD debe APARECER (listening).
+            # Convocado: el HUD debe APARECER (listening). Acuse según config:
+            # "beep" suena SIN bloquear (la grabación abre de inmediato y el
+            # patrón puede hablar ya); "voz" es el clásico "Te escucho" (~1s
+            # de espera); "off" nada — solo el HUD.
             hud_state.set_mode(Mode.LISTENING)
-            say("Te escucho, patrón.")
+            if ack == "voz":
+                say("Te escucho, patrón.")
+            elif ack != "off":
+                tts.beep()
+                print("Te escucho, patrón.", flush=True)
             command = listen_command()
 
             if not command.strip():
@@ -247,14 +266,36 @@ def run_listen(argv: list[str] | None = None) -> int:
                 print(f"Orden: {command}", flush=True)
                 hud_state.set_text(command)
                 hud_state.set_mode(Mode.THINKING)
-                reply = agent.handle_turn(command)
-                print(reply, flush=True)
-                hud_state.set_text(reply)
-                hud_state.set_mode(Mode.SPEAKING)
-                try:
-                    tts.speak_sentences(reply)  # Fase 6: TTS por frases
-                except Exception as error:  # noqa: BLE001
-                    log.warning("voz falló: %s", error)
+                # stream_speak: habla cada frase EN CUANTO el LLM la cierra,
+                # en vez de esperar la respuesta completa (la primera palabra
+                # suena segundos antes). Fallback al camino clásico si el
+                # streamer no llegó a hablar (p.ej. LLMError devuelto como
+                # texto sin pasar por on_token).
+                if stream_speak:
+                    speaker = StreamSpeaker(
+                        tts, on_first=lambda: hud_state.set_mode(Mode.SPEAKING)
+                    )
+                    try:
+                        reply = agent.handle_turn(command, on_token=speaker.feed)
+                    finally:
+                        spoke = speaker.finish()
+                    print(reply, flush=True)
+                    hud_state.set_text(reply)
+                    if not spoke and reply.strip():
+                        hud_state.set_mode(Mode.SPEAKING)
+                        try:
+                            tts.speak_sentences(reply)
+                        except Exception as error:  # noqa: BLE001
+                            log.warning("voz falló: %s", error)
+                else:
+                    reply = agent.handle_turn(command)
+                    print(reply, flush=True)
+                    hud_state.set_text(reply)
+                    hud_state.set_mode(Mode.SPEAKING)
+                    try:
+                        tts.speak_sentences(reply)  # Fase 6: TTS por frases
+                    except Exception as error:  # noqa: BLE001
+                        log.warning("voz falló: %s", error)
                 time.sleep(0.5)
 
                 if followup_s <= 0:

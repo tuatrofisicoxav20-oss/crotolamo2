@@ -16,6 +16,7 @@ importa sin la extra [voice].
 
 from __future__ import annotations
 
+import queue
 import re
 import threading
 from pathlib import Path
@@ -123,6 +124,25 @@ class TTS:
         for sentence in split_sentences(text):
             self.speak(sentence)
 
+    def beep(self) -> None:
+        """Bip corto NO bloqueante: acuse de "te escucho" instantáneo.
+
+        Sustituye al "Te escucho, patrón" hablado (~1s de síntesis+reproducción
+        bloqueante) cuando [voice].ack = "beep": suena mientras la grabación del
+        comando YA está abierta, así el patrón puede hablar de inmediato. Un
+        tono senoidal no es voz, así que el VAD (Silero) no lo confunde.
+        """
+        try:
+            import numpy as np
+            import sounddevice as sd
+
+            rate = 22050
+            t = np.linspace(0.0, 0.12, int(0.12 * rate), endpoint=False)
+            tone = (0.2 * np.sin(2 * np.pi * 880.0 * t)).astype("float32")
+            sd.play(tone, samplerate=rate)  # sin wait: no bloquea la escucha
+        except Exception as error:  # noqa: BLE001 - sin audio, el bip es opcional
+            log.warning("no pude sonar el bip: %s", error)
+
     def stop(self) -> None:
         """Corta cualquier reproducción en curso (thread-safe, M3.1)."""
         self._stop_flag.set()
@@ -132,3 +152,71 @@ class TTS:
             sd.stop()
         except Exception:  # noqa: BLE001 - sin sounddevice/dispositivo, nada que cortar
             pass
+
+
+class StreamSpeaker:
+    """Habla frases COMPLETAS conforme el LLM las va generando (streaming).
+
+    Antes: agent.handle_turn devolvía la respuesta ENTERA y recién ahí se
+    hablaba — con el LLM en CPU, varios segundos de silencio percibido. Ahora:
+    feed() se cablea como on_token del agente; en cuanto se cierra una frase
+    (. ! ? o salto de línea) se encola y un hilo la va hablando MIENTRAS el
+    modelo sigue generando las siguientes. La primera palabra suena en cuanto
+    existe la primera frase, no al final del turno.
+
+    Uso:
+        speaker = StreamSpeaker(tts, on_first=...)
+        reply = agent.handle_turn(cmd, on_token=speaker.feed)
+        spoke = speaker.finish()   # habla la cola restante y espera; True si habló
+        if not spoke: tts.speak_sentences(reply)  # fallback (p.ej. error del LLM)
+    """
+
+    _BOUNDARY = re.compile(r"(?<=[.!?\n])\s+")
+
+    def __init__(self, tts: TTS, on_first=None) -> None:
+        self.tts = tts
+        self._on_first = on_first
+        self._buffer = ""
+        self._spoke = False
+        self._q: queue.Queue[str | None] = queue.Queue()
+        self._thread = threading.Thread(
+            target=self._worker, name="StreamSpeaker", daemon=True
+        )
+        self._thread.start()
+
+    def _worker(self) -> None:
+        while True:
+            sentence = self._q.get()
+            if sentence is None:
+                return
+            if not self._spoke:
+                self._spoke = True
+                if self._on_first is not None:
+                    try:
+                        self._on_first()
+                    except Exception as error:  # noqa: BLE001
+                        log.warning("on_first falló: %s", error)
+            try:
+                self.tts.speak(sentence)
+            except Exception as error:  # noqa: BLE001 - una frase rota no mata la cola
+                log.warning("StreamSpeaker: %s", error)
+
+    def feed(self, token: str) -> None:
+        """on_token del agente: acumula y encola las frases ya cerradas."""
+        self._buffer += token
+        parts = self._BOUNDARY.split(self._buffer)
+        if len(parts) > 1:
+            for part in parts[:-1]:
+                if part.strip():
+                    self._q.put(part.strip())
+            self._buffer = parts[-1]
+
+    def finish(self, timeout_s: float = 120.0) -> bool:
+        """Habla lo que quede en el buffer, espera la cola y devuelve si habló."""
+        tail = self._buffer.strip()
+        self._buffer = ""
+        if tail:
+            self._q.put(tail)
+        self._q.put(None)
+        self._thread.join(timeout=timeout_s)
+        return self._spoke

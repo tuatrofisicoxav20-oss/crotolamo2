@@ -75,6 +75,15 @@ max_tools = 8
 # "15m" = no recarga durante la sesión y libera RAM tras 15 min ocioso. Sube a "1h"
 # o "-1" (siempre residente) si te sobra RAM; baja si la lap va justa de memoria.
 keep_alive = "15m"
+# Ventana de contexto que Ollama reserva. Con el tool routing los prompts son
+# cortos; 2048 sobra y en CPU reduce memoria/trabajo del KV-cache. Súbelo si
+# activas [memory].compaction con historiales largos.
+num_ctx = 2048
+# Fast-path SIN LLM (misión velocidad): comandos inequívocos ("pausa la
+# música", "qué apps tengo abiertas", "abre opera") ejecutan la tool directo
+# (~0.1s en vez de ~17-22s de LLM). Solo tools seguras; cualquier frase con
+# matices cae al agente normal. false = todo pasa por el LLM.
+fastpath = true
 
 [memory]
 # Ventana deslizante del historial conversacional (nº de turnos user+assistant).
@@ -111,10 +120,12 @@ vad_threshold        = 0.8
 # Buffer de pre-activación: ms de audio previos que se anteponen para no perder
 # las primeras sílabas.
 vad_preactivation_ms = 800
-# Silencio sostenido que cierra la grabación del comando. Subido de 640 a 900ms
-# para tolerar una pausa breve tras decir "crotolamo" antes de la orden (si no, el
-# comando salía vacío). Aun así, conviene decir "crotolamo" + la orden seguido.
-vad_silence_ms       = 900
+# Silencio sostenido que cierra la grabación del comando. Historia: 640 -> 900
+# (toleraba la pausa tras "crotolamo") -> 600 (misión velocidad): ahora el
+# endpointing inteligente (smart_endpoint) REABRE la escucha si la frase quedó
+# a medias, así que el corte puede ser agresivo sin perder oraciones. Menos
+# silencio = Crotolamo reacciona ~300ms antes en CADA comando.
+vad_silence_ms       = 600
 # M3.8: mitigación de eco del barge-in (con altavoces y sin AEC). Con auriculares
 # es confiable; si con altavoces se auto-dispara, usa --no-barge-in.
 barge_in_grace_ms         = 400   # ignora barge-in los primeros ms tras empezar a hablar
@@ -137,6 +148,22 @@ endpoint_continue_s = 2.5
 # ventana (segundos) SIN exigir "crotolamo" otra vez. Si no dices nada, la
 # ventana expira y vuelve a esperar la palabra de activación. 0 = apagado.
 followup_s = 6.0
+# --- Misión velocidad (que actúe EN CUANTO terminas de hablar) ---
+# beam_size del decoder Whisper. MEDIDO en esta lap (CTranslate2 int8): bajar
+# el beam NO acelera — beam5 1.73s < beam2 2.04s < beam1 2.52s (el beam search
+# de ct2 está mejor optimizado que el greedy). Se queda en 5: máxima precisión
+# gratis. El knob existe por si otra build/equipo se comporta distinto.
+beam_size = 5
+# Acuse tras el wake: "beep" = bip instantáneo NO bloqueante (puedes hablar ya),
+# "voz" = "Te escucho, patrón" hablado (~1s de espera), "off" = solo el HUD.
+ack = "beep"
+# Hablar cada frase EN CUANTO el LLM la genera (streaming), en vez de esperar
+# la respuesta completa: la primera palabra suena varios segundos antes.
+stream_speak = true
+# Ventanas del WAKE (una palabra corta): silencio de corte y tope de grabación
+# chicos = detección y transcripción mucho más rápidas que las del comando.
+wake_silence_ms  = 400
+wake_max_seconds = 3.0
 
 [wake]
 target    = "crotolamo"

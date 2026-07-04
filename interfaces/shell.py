@@ -72,6 +72,7 @@ def build_agent(confirm_fn=None) -> tuple[Agent, Conversation]:
             confirm_fn=confirm_fn or _text_confirm,
             pre_hooks=[make_facts_prehook(), datetime_prehook],
             route_fn=route_fn,
+            fastpath=settings.llm.get("fastpath", True),
         )
     except Exception:
         agent = Agent(llm, conversation)
