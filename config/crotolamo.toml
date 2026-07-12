@@ -51,6 +51,22 @@ crotolamo1 = "~/Documentos/crotolamo2/reference/c1_checkpoint/chapi_assistant"
 level = "INFO"
 
 [llm]
+# Motor de inferencia: "ollama" (local, CPU) o "glm" (nube, Z.ai).
+#
+# POR QUÉ "glm": esta lap no tiene GPU dedicada. Inferir qwen-7b en CPU cuesta
+# ~17-22s por turno con tool y deja la RAM en swap. GLM-4.7-Flash es GRATIS y
+# responde en ~1-2s, sacando la inferencia de la máquina. Con backend="glm" los
+# ~5 GB del modelo local dejan de residir en RAM.
+#
+# Requiere una API key (gratuita en https://z.ai). NO se guarda aquí (este
+# archivo va a git): exportala en tu shell.
+#     export CROTOLAMO_GLM_API_KEY="tu-key"
+#
+# Si pones "glm" y no hay key, Crotolamo avisa y cae solo a Ollama.
+# La env CROTOLAMO_LLM_BACKEND pisa esta clave (para probar sin editar nada).
+backend     = "glm"
+
+# --- Motor local (backend = "ollama") ---
 host        = "http://localhost:11434"
 model       = "qwen2.5-coder:7b"
 temperature = 0.2
@@ -85,6 +101,29 @@ num_ctx = 2048
 # matices cae al agente normal. false = todo pasa por el LLM.
 fastpath = true
 
+# --- Motor en la nube (backend = "glm") ---
+# Solo se lee si backend = "glm". La API key va en la env, nunca aquí.
+[llm.glm]
+base_url = "https://api.z.ai/api/paas/v4"
+# glm-4.7-flash: gratuito para usuarios registrados y con tool-calling nativo.
+# Si algún día quieres más músculo y no te importa pagar: "glm-4.7" o "glm-5.2".
+model    = "glm-4.7-flash"
+# 60s sobra: la nube responde en ~1-2s. El timeout de 180s de Ollama existía por
+# el arranque en frío del modelo local, que aquí no aplica.
+timeout  = 60
+# Razonamiento interno del modelo ANTES de responder. GLM-4.7 lo trae ENCENDIDO por
+# defecto; aquí se apaga. MEDIDO contra la API real (2026-07-09):
+#     charla:  thinking=on 6.87s  |  thinking=off 1.23s   (5.6x)
+#     acción:  thinking=on 1.57s  |  thinking=off 1.23s   (tool-calls 3/3 en ambos)
+# Un "hola" con thinking gasta ~460 tokens de reasoning para nada. En voz, esos 5s
+# de más se sienten. Ponlo en true si prefieres que razone preguntas difíciles.
+thinking = false
+# Respaldo local: si GLM falla en caliente (se cayó el wifi, la key caducó, un 429),
+# Crotolamo usa el modelo de Ollama de arriba durante estos segundos antes de volver
+# a intentar la nube. Sin esto, cada frase esperaría el timeout para nada. Es lo que
+# permite seguir usando el asistente SIN INTERNET, aunque más lento.
+fallback_cooldown_s = 60
+
 [memory]
 # Ventana deslizante del historial conversacional (nº de turnos user+assistant).
 max_turns = 20
@@ -114,9 +153,22 @@ whisper_model      = "base"
 wake_whisper_model = "tiny"
 piper_voice        = "es_MX-ald-medium.onnx"
 sample_rate        = 16000
+# Micrófono que abre Crotolamo. Comentado = el default del sistema (comportamiento
+# histórico). Tras activar la cancelación de eco (`desktop/aec.sh on`), apúntalo al
+# source limpio: así SOLO Crotolamo usa el AEC y no cambias el default global (que
+# afectaría a Discord, el navegador, etc.). El AEC es lo que permite, más adelante,
+# volver a `use_oww = true` sin que el asistente se autodispare con su propia voz.
+# input_device = "crotolamo_aec_source"
 # VAD (M2, de GLaDOS): 'silero' (neuronal) o 'energy' (fallback sin modelo).
 vad_backend          = "silero"
 vad_threshold        = 0.8
+# Histéresis del VAD (contra "se corta a media frase"). vad_threshold es el umbral
+# para ENTRAR en voz; vad_neg_threshold es el umbral (más bajo) para MANTENERSE en
+# ella. Sin histéresis, una micro-pausa de respirar/pensar cae bajo 0.8 y empieza a
+# contar silencio -> trunca el comando. Con 0.35, sigues "en voz" durante la pausa.
+# COMENTADO = sin histéresis (comportamiento histórico). Descoméntalo y mide:
+#   .venv/bin/python scripts/stt_harness.py record --n 10 --dir stt_bench
+# vad_neg_threshold  = 0.35
 # Buffer de pre-activación: ms de audio previos que se anteponen para no perder
 # las primeras sílabas.
 vad_preactivation_ms = 800

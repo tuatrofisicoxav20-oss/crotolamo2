@@ -14,6 +14,8 @@ tóxicos (la única blocklist que sobrevive: contenido, no comandos).
 
 from __future__ import annotations
 
+import ipaddress
+import socket
 import urllib.error
 import urllib.request
 from html.parser import HTMLParser
@@ -257,6 +259,36 @@ def fetch_web_results(query: str) -> str:
     return "\n".join(lines)
 
 
+def is_public_url(url: str) -> bool:
+    """False si la URL apunta a la red interna (loopback, LAN, link-local...).
+
+    El LLM elige a qué URL llamar, y a veces la elige a partir de texto que vio en
+    otra página. Sin este filtro podría pedir `http://localhost:11434` (el propio
+    Ollama) o `http://169.254.169.254` (metadatos de nube): eso es SSRF.
+
+    Resolvemos el hostname porque un dominio público puede apuntar a 127.0.0.1.
+    Ante la duda (DNS que no resuelve), devolvemos False: negar es lo seguro.
+    """
+    host = urlparse(url).hostname
+    if not host:
+        return False
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (socket.gaierror, UnicodeError, ValueError):
+        return False
+    if not infos:
+        return False
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return False
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            return False
+    return True
+
+
 @tool
 def read_page(url: str) -> str:
     """Descarga una página web y devuelve su contenido como texto plano,
@@ -274,6 +306,10 @@ def read_page(url: str) -> str:
     scheme = urlparse(url).scheme.lower()
     if scheme not in ("http", "https"):
         return f"Solo puedo leer páginas http o https, patrón, no '{scheme}://'."
+
+    if not is_public_url(url):
+        return ("Esa dirección es de la red interna, patrón. No leo ahí: "
+                "solo páginas públicas de internet.")
 
     try:
         content_type, body = _http_get(url, timeout=12.0)

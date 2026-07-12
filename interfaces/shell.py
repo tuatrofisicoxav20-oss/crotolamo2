@@ -9,7 +9,7 @@ Comandos del shell:
 from __future__ import annotations
 
 from crotolamo.core.agent import Agent
-from crotolamo.core.llm import LLMClient
+from crotolamo.core.engine import build_llm
 from crotolamo.core.memory import Conversation
 from crotolamo.core.persona import system_prompt
 from crotolamo.persistence import facts
@@ -23,7 +23,8 @@ def build_agent(confirm_fn=None) -> tuple[Agent, Conversation]:
     pide confirmación para tools inseguras (texto o voz).
     """
     settings = get_settings()
-    llm = LLMClient.from_settings(settings)
+    # Ollama (local) o GLM (nube), según [llm].backend. Ver crotolamo/core/engine.py.
+    llm = build_llm(settings)
 
     # M5: compaction por resumen (opcional, [memory].compaction). El summarizer es una
     # llamada corta al LLM que condensa los turnos viejos en vez de tirarlos.

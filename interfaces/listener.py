@@ -19,7 +19,13 @@ from pathlib import Path
 from crotolamo.logging_setup import get_logger
 from crotolamo.settings import get_settings
 from crotolamo.voice import wake
-from crotolamo.voice.state import Mode, SharedState, make_file_publisher
+from crotolamo.voice.state import (
+    CONTROL_PATH,
+    Mode,
+    SharedState,
+    make_file_publisher,
+    read_control_enabled,
+)
 from crotolamo.voice.stt import STT, VoiceUnavailable
 from crotolamo.voice.tts import TTS, StreamSpeaker
 from crotolamo.voice.wakeword import WakeWordDetector
@@ -195,7 +201,7 @@ def run_listen(argv: list[str] | None = None) -> int:
         try:
             VoiceLoop(agent, stt, tts, wake_detector,
                       allow_barge_in=allow_barge_in, silence_ms=silence_ms,
-                      hud_publisher=hud_publisher).run()
+                      hud_publisher=hud_publisher, control_path=CONTROL_PATH).run()
         finally:
             # Escribir idle final al salir del loop (KeyboardInterrupt, stop(), etc.).
             # Si _graceful_exit llegó primero (os._exit), este bloque no ejecuta;
@@ -210,6 +216,8 @@ def run_listen(argv: list[str] | None = None) -> int:
     # concurrente ya lo hacía). Reutilizamos SharedState para garantizar el MISMO
     # esquema JSON que el HUD espera.
     hud_state = SharedState(publisher=make_file_publisher(_HUD_STATE_PATH))
+    # Estado inicial de la escucha desde el canal de control (default: activa).
+    hud_state.set_enabled(read_control_enabled())
 
     while True:
         try:
@@ -247,6 +255,15 @@ def run_listen(argv: list[str] | None = None) -> int:
             except VoiceUnavailable as error:
                 print(str(error))
                 return 1
+
+            # Escucha pausada desde el panel: ignora este wake por completo (mismo
+            # efecto visible que en el loop concurrente: decir "crotolamo" no hace
+            # nada). El poll bloqueante del wake no se puede interrumpir, así que
+            # consultamos el flag AQUÍ, justo tras dispararse.
+            if not read_control_enabled():
+                hud_state.set_enabled(False)
+                continue
+            hud_state.set_enabled(True)
 
             # Convocado: el HUD debe APARECER (listening). Si la orden venía
             # pegada al wake, se atiende de inmediato (ni bip hace falta). Si

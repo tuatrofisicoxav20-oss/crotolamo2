@@ -9,6 +9,7 @@ Los proyectos se leen de [projects] en la config (cero hardcodeo).
 
 from __future__ import annotations
 
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -185,7 +186,10 @@ def launch_project(name: str) -> str:
             launchers.append(path)
 
     if not launchers:
-        argv = terminal_exec(f'cd "{project}"; exec bash')
+        # shlex.quote: `terminal_exec` arma `bash -lc <cadena>`. Sin escapar, un
+        # nombre de ruta con comillas o `$(...)` se ejecutaría como sintaxis de
+        # shell en vez de tratarse como un literal.
+        argv = terminal_exec(f"cd {shlex.quote(str(project))}; exec bash")
         if argv is None:
             return f"No hallé launcher ni terminal para {name}, patrón. Cablea uno en [apps]."
         run_detached(argv)
@@ -195,7 +199,11 @@ def launch_project(name: str) -> str:
     if launcher.suffix == ".desktop":
         run_detached(["gtk-launch", launcher.stem])
         return f"Lancé {name} con {launcher.name}, patrón."
-    argv = terminal_exec(f'cd "{project}" && "{launcher}"; exec bash')
+    # `launcher` sale de un rglob del proyecto: es un nombre de archivo del disco,
+    # no una constante. Un archivo llamado `run";rm -rf ~;".sh` se ejecutaría.
+    argv = terminal_exec(
+        f"cd {shlex.quote(str(project))} && {shlex.quote(str(launcher))}; exec bash"
+    )
     if argv is None:
         return f"No encontré un terminal para lanzar {name}, patrón. Cablea uno en [apps]."
     run_detached(argv)

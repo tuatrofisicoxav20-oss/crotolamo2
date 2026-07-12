@@ -84,12 +84,20 @@ class _LiveStreamer:
     """Streamea tokens al patrón en vivo, salvo que la respuesta empiece como un
     tool-call JSON ('{', '[' o cerca de código) — en ese caso retiene, para no
     filtrar el JSON crudo de los tool-calls que qwen emite en `content`.
+
+    `hold_until_done=True` retiene SIEMPRE. Se usa cuando a esta llamada se le
+    enviaron tools: el modelo puede verbalizar su intención ANTES de pedir la tool
+    ("Voy a pausar la música por ti") y en voz eso se hablaría, seguido del
+    resultado real. Medido contra GLM: en streaming emite ese preámbulo; en
+    no-streaming, `content` viene vacío. Si no se enviaron tools, lo que salga ES
+    la respuesta final y se habla en vivo, que es el objetivo de `stream_speak`.
     """
 
-    def __init__(self, on_token: Callable[[str], None]) -> None:
+    def __init__(self, on_token: Callable[[str], None],
+                 hold_until_done: bool = False) -> None:
         self._on_token = on_token
         self._buf: list[str] = []
-        self._decision: str | None = None  # None | "stream" | "hold"
+        self._decision: str | None = "hold" if hold_until_done else None
 
     def feed(self, chunk: str) -> None:
         self._buf.append(chunk)
@@ -200,6 +208,7 @@ class ToolAgent(Agent):
         # parámetros...", "te resumo el resultado:"). Es conservador (anclado al
         # inicio y nunca devuelve vacío). Si el caller pasa post_hooks explícitos,
         # se respetan tal cual (los tests inyectan los suyos).
+        self.post_hooks: list[Callable[[str], str]]
         if post_hooks is None:
             from crotolamo.core.hooks import (
                 meta_preamble_cleaner,
@@ -285,7 +294,13 @@ class ToolAgent(Agent):
         known = set(self.registry.names())
 
         for _ in range(self.max_iterations):
-            streamer = _LiveStreamer(on_token) if on_token is not None else None
+            # Con tools a la vista, el modelo puede anunciar lo que va a hacer antes
+            # de pedirla; retenemos hasta saber si hubo tool_call. Sin tools (charla),
+            # se habla en vivo.
+            streamer = (
+                _LiveStreamer(on_token, hold_until_done=bool(schemas))
+                if on_token is not None else None
+            )
             try:
                 if streamer is not None:
                     response = self.llm.chat_stream(
@@ -347,4 +362,12 @@ class ToolAgent(Agent):
             # Si no hubo short-circuit, volvemos a pedirle al LLM que decida con
             # los resultados a la vista.
 
-        return "Me enredé en demasiados pasos, patrón. Mejor dímelo más simple."
+        # Agotadas las iteraciones. El historial acaba en un bloque tool sin
+        # respuesta del asistente; si no cerramos con un assistant, el turno
+        # siguiente arranca con una secuencia inconsistente (y algunos motores
+        # rechazan un `tool` sin `assistant` que lo suceda).
+        reply = "Me enredé en demasiados pasos, patrón. Mejor dímelo más simple."
+        self.conversation.add_assistant(reply)
+        if on_token is not None:
+            on_token(reply)
+        return reply

@@ -6,6 +6,8 @@ HTML de mentiras con la estructura real de html.duckduckgo.com.
 
 import urllib.error
 
+import pytest
+
 from crotolamo.tools import default_registry, search
 
 # HTML mínimo con la estructura real de html.duckduckgo.com: links result__a
@@ -56,6 +58,16 @@ PAGE_HTML = """
 """
 
 
+def _fake_dns(monkeypatch, ip="93.184.216.34"):
+    """Neutraliza la resolución DNS que hace el guardia SSRF de read_page.
+
+    Sin esto, cualquier test que llame a read_page haría una consulta DNS real y
+    fallaría sin conexión, rompiendo la promesa de "SIN red" de este archivo.
+    """
+    monkeypatch.setattr(search.socket, "getaddrinfo",
+                        lambda *a, **kw: [(2, 1, 6, "", (ip, 0))])
+
+
 def _patch_get(monkeypatch, content_type, body, capture=None):
     def fake_get(url, timeout=10.0):
         if capture is not None:
@@ -63,6 +75,7 @@ def _patch_get(monkeypatch, content_type, body, capture=None):
         return content_type, body
 
     monkeypatch.setattr(search, "_http_get", fake_get)
+    _fake_dns(monkeypatch)
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +216,7 @@ def test_read_page_http_error(monkeypatch):
         raise urllib.error.HTTPError(url, 404, "Not Found", None, None)
 
     monkeypatch.setattr(search, "_http_get", boom)
+    _fake_dns(monkeypatch)
     out = search.read_page("https://example.com/no-existe")
     assert "404" in out
     assert "patrón" in out
@@ -213,6 +227,7 @@ def test_read_page_network_error(monkeypatch):
         raise urllib.error.URLError("se cayó el wifi")
 
     monkeypatch.setattr(search, "_http_get", boom)
+    _fake_dns(monkeypatch)
     out = search.read_page("https://example.com")
     assert "patrón" in out
     assert "Traceback" not in out
@@ -231,3 +246,52 @@ def test_new_tools_registered():
     for name in ("fetch_web_results", "read_page"):
         assert name in reg.names()
         assert reg.get(name).safe is True
+
+
+# --- Guardia SSRF: read_page no debe alcanzar la red interna ---
+# El LLM elige la URL, a veces a partir de texto de otra página. Sin este filtro
+# podría leer el propio Ollama (localhost:11434) o metadatos de nube.
+
+def _resolver_fijo(ip: str):
+    """Sustituto de socket.getaddrinfo que siempre resuelve a `ip`."""
+    def fake(host, port, *a, **kw):
+        return [(2, 1, 6, "", (ip, 0))]
+    return fake
+
+
+@pytest.mark.parametrize("ip", [
+    "127.0.0.1",        # loopback
+    "10.0.0.5",         # privada
+    "192.168.1.1",      # privada
+    "169.254.169.254",  # link-local: metadatos de nube
+    "0.0.0.0",          # unspecified
+])
+def test_url_interna_se_bloquea(monkeypatch, ip):
+    monkeypatch.setattr(search.socket, "getaddrinfo", _resolver_fijo(ip))
+    assert search.is_public_url("http://loquesea.com/") is False
+
+
+def test_url_publica_se_permite(monkeypatch):
+    monkeypatch.setattr(search.socket, "getaddrinfo", _resolver_fijo("93.184.216.34"))
+    assert search.is_public_url("https://example.com/") is True
+
+
+def test_dns_que_no_resuelve_se_niega(monkeypatch):
+    """Ante la duda, negar."""
+    def boom(*a, **kw):
+        raise search.socket.gaierror("sin DNS")
+
+    monkeypatch.setattr(search.socket, "getaddrinfo", boom)
+    assert search.is_public_url("https://no-existe.invalid/") is False
+
+
+def test_read_page_no_toca_la_red_si_es_interna(monkeypatch):
+    """El bloqueo ocurre ANTES de la petición HTTP."""
+    monkeypatch.setattr(search.socket, "getaddrinfo", _resolver_fijo("127.0.0.1"))
+
+    def no_debe_llamarse(*a, **kw):
+        raise AssertionError("read_page intentó descargar una URL interna")
+
+    monkeypatch.setattr(search, "_http_get", no_debe_llamarse)
+    out = search.read_page(url="http://localhost:11434/api/tags")
+    assert "red interna" in out

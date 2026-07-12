@@ -132,3 +132,37 @@ def test_search_files_empty_query():
     from crotolamo.tools import files
 
     assert "Dame un nombre" in files.search_files("")
+
+
+# --- El preámbulo hablado (GLM verbaliza su intención antes de pedir la tool) ---
+
+def test_streamer_retiene_todo_si_se_enviaron_tools():
+    """En voz, "Voy a pausar la música por ti" no debe sonar antes del resultado."""
+    from crotolamo.core.agent import _LiveStreamer
+
+    dichos = []
+    s = _LiveStreamer(dichos.append, hold_until_done=True)
+    for t in ("¡Claro", " que sí!", " Voy a pausar."):
+        s.feed(t)
+    assert dichos == []  # nada salió por el altavoz
+
+
+def test_streamer_habla_en_vivo_si_no_hay_tools():
+    """Charla pura: lo que sale ES la respuesta, se habla ya (stream_speak)."""
+    from crotolamo.core.agent import _LiveStreamer
+
+    dichos = []
+    s = _LiveStreamer(dichos.append, hold_until_done=False)
+    s.feed("Hola ")
+    s.feed("patrón")
+    assert "".join(dichos) == "Hola patrón"
+
+
+def test_streamer_retenido_suelta_el_texto_final():
+    from crotolamo.core.agent import _LiveStreamer
+
+    dichos = []
+    s = _LiveStreamer(dichos.append, hold_until_done=True)
+    s.feed("preámbulo que no debe sonar")
+    s.flush_if_held("Listo, pausé la música, patrón.")
+    assert dichos == ["Listo, pausé la música, patrón."]
