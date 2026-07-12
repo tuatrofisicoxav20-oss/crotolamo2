@@ -18,6 +18,7 @@ from __future__ import annotations
 import glob
 import os
 import time
+from typing import Any
 
 from crotolamo.logging_setup import get_logger
 from crotolamo.voice.stt import VoiceUnavailable, _require
@@ -38,6 +39,7 @@ class WakeWordDetector:
         # stdout para calibrar el umbral viendo qué da la voz real vs el ruido.
         self.debug = debug
         self._model = None  # se carga una sola vez
+        self._np: Any = None  # numpy cacheado: score() corre en CADA chunk (~31/s)
 
     @classmethod
     def from_settings(cls, settings) -> "WakeWordDetector":
@@ -68,12 +70,20 @@ class WakeWordDetector:
             matches = sorted(glob.glob(os.path.join(base, f"{self.model_name}*.onnx")))
             if matches:
                 return matches[0]
-        except Exception:  # noqa: BLE001 - sin resolver, devolvemos el nombre crudo
-            pass
+        except Exception as error:  # noqa: BLE001 - sin resolver, el nombre crudo
+            log.debug("no pude resolver la ruta del modelo '%s': %s",
+                      self.model_name, error)
         return self.model_name
 
     def _get_model(self):
-        """Carga el modelo de openWakeWord una sola vez (descarga el puente si falta)."""
+        """Carga el modelo de openWakeWord una sola vez (descarga el puente si falta).
+
+        También cachea numpy en self._np: score() corre en cada chunk de audio y
+        resolver el import ahí (aunque esté cacheado en sys.modules) era costo
+        por frame sin motivo.
+        """
+        if self._np is None:
+            self._np = _require("numpy")
         if self._model is not None:
             return self._model
         try:
@@ -88,8 +98,9 @@ class WakeWordDetector:
             from openwakeword.utils import download_models
 
             download_models([self.model_name])
-        except Exception:
-            pass  # ya descargado, o el nombre es una ruta a un .onnx propio
+        except Exception as error:  # noqa: BLE001
+            # Ya descargado, o el nombre es una ruta a un .onnx propio.
+            log.debug("descarga del modelo '%s' omitida: %s", self.model_name, error)
 
         path = self._resolve_model_path()
 
@@ -169,8 +180,8 @@ class WakeWordDetector:
         (scripts/wake_debug.py) puedan medir sin duplicar la conversión ni el
         estado del preprocessor.
         """
-        np = _require("numpy")
         model = self._get_model()
+        np = self._np  # cacheado por _get_model(): no re-resolver en el hot path
         arr = np.asarray(chunk)
         if arr.dtype != np.int16:
             arr = (arr * 32767).astype(np.int16)
@@ -194,7 +205,8 @@ class WakeWordDetector:
             from crotolamo.settings import get_settings
 
             _device = get_settings().voice.get("input_device")
-        except Exception:  # noqa: BLE001 — sin config, el default del sistema
+        except Exception as error:  # noqa: BLE001 — sin config, el default del sistema
+            log.debug("sin config de voz (%s); uso el micrófono default", error)
             _device = None
         with sd.InputStream(samplerate=_SAMPLE_RATE, channels=1, dtype="int16",
                             device=_device) as stream:

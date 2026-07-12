@@ -10,14 +10,14 @@ import time
 
 from pathlib import Path
 
-from crotolamo.voice.loop import (
+from crotolamo.voice.loop import VoiceLoop
+from crotolamo.voice.threads import (
     END,
     BrainThread,
     EarThread,
     MouthThread,
     SttThread,
     Utterance,
-    VoiceLoop,
 )
 from crotolamo.voice.state import Mode, SharedState
 

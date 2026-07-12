@@ -80,7 +80,8 @@ def _voice_cfg() -> dict:
         from crotolamo.settings import get_settings
 
         return get_settings().voice
-    except Exception:
+    except Exception as error:  # noqa: BLE001 — sin config usable, defaults
+        log.debug("no pude cargar la config de voz (%s); uso defaults", error)
         return {}
 
 
@@ -244,7 +245,12 @@ class STT:
             for i in range(max_chunks):
                 block, _ = stream.read(chunk)
                 block = np.squeeze(np.asarray(block, dtype=np.float32))
-                prob = float(model(torch.from_numpy(block.copy()), self.sample_rate))
+                # ascontiguousarray evita la copia extra que hacía .copy(): solo
+                # copia si el bloque no es ya un array float32 contiguo.
+                prob = float(model(
+                    torch.from_numpy(np.ascontiguousarray(block, dtype=np.float32)),
+                    self.sample_rate,
+                ))
 
                 if not speaking:
                     pre_buffer.append(block)
@@ -323,8 +329,8 @@ class STT:
         finally:
             try:
                 path.unlink(missing_ok=True)
-            except OSError:
-                pass
+            except OSError as error:
+                log.debug("no pude borrar el WAV temporal %s: %s", path, error)
 
     def listen_smart(self, silence_ms: int | None = None, max_seconds: float = 12.0,
                      start_timeout_s: float = 4.0, rounds: int = 2,

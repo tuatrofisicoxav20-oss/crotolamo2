@@ -14,7 +14,7 @@ import queue
 import threading
 import time
 
-from crotolamo.voice.loop import EarThread
+from crotolamo.voice.threads import EarThread
 from crotolamo.voice.state import Mode, SharedState
 
 
