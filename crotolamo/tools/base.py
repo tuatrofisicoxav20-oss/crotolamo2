@@ -9,8 +9,50 @@ from __future__ import annotations
 
 import inspect
 import re
+import subprocess
+import unicodedata
 from dataclasses import dataclass
 from typing import Any, Callable, get_type_hints
+
+from crotolamo.logging_setup import get_logger
+
+log = get_logger("tools")
+
+
+# ---------------------------------------------------------------------------
+# Helpers compartidos por las tools (una sola implementación, cero duplicados).
+# OJO: base.py no debe importar de desktop/windows/etc. (evita ciclos).
+# ---------------------------------------------------------------------------
+
+def _strip_accents(text: str) -> str:
+    return "".join(
+        c for c in unicodedata.normalize("NFD", text) if unicodedata.category(c) != "Mn"
+    )
+
+
+def normalize_key(text: str) -> str:
+    """Normaliza una clave (app/carpeta/sitio/ventana) para emparejar robusto:
+    minúsculas, sin acentos y espacios colapsados."""
+    return re.sub(r"\s+", " ", _strip_accents(text.lower())).strip()
+
+
+def run_cmd(args: list[str], timeout: float = 10) -> subprocess.CompletedProcess:
+    """subprocess.run con la configuración estándar de las tools: texto,
+    salida capturada y timeout. Lanza OSError/TimeoutExpired si falla."""
+    return subprocess.run(args, text=True, capture_output=True, timeout=timeout)
+
+
+# Tope de lectura para no inundar el contexto del LLM.
+READ_CAP = 20_000
+
+
+def truncate_for_context(text: str, cap: int = READ_CAP) -> str:
+    """Recorta un texto largo para que quepa en el contexto del LLM,
+    dejando una marca con el tamaño original."""
+    if len(text) <= cap:
+        return text
+    return text[:cap] + f"\n...[recortado, {len(text)} chars en total]"
+
 
 # Mapeo de tipos Python -> tipos JSON-schema.
 _JSON_TYPES: dict[type, str] = {
@@ -84,7 +126,8 @@ def _build_parameters(func: Callable[..., Any], param_docs: dict[str, str]) -> d
     sig = inspect.signature(func)
     try:
         hints = get_type_hints(func)
-    except Exception:
+    except Exception as error:  # noqa: BLE001 — sin hints, degradamos a "string"
+        log.debug("no pude resolver los type hints de %s: %s", func.__name__, error)
         hints = {}
 
     properties: dict[str, Any] = {}

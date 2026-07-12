@@ -16,10 +16,7 @@ from pathlib import Path
 
 from crotolamo.safety.paths import path_inside_roots
 from crotolamo.settings import get_settings
-from crotolamo.tools.base import tool
-
-# Tope de lectura para no inundar el contexto del LLM.
-_READ_CAP = 20_000
+from crotolamo.tools.base import tool, truncate_for_context
 
 
 def _resolve(path: str) -> Path:
@@ -58,9 +55,7 @@ def read_file(path: str) -> str:
         text = p.read_text(encoding="utf-8", errors="replace")
     except OSError as error:
         return f"No pude leer {p}, patrón: {error}"
-    if len(text) > _READ_CAP:
-        text = text[:_READ_CAP] + f"\n...[recortado, {len(text)} chars en total]"
-    return text
+    return truncate_for_context(text)
 
 
 @tool(safe=False)
@@ -204,11 +199,15 @@ def create_note(title: str, content: str = "") -> str:
         content: cuerpo opcional de la nota.
     """
     notas_dir = get_settings().paths.get("notas", Path.home() / "Documentos" / "crotolamo_notas")
-    notas_dir.mkdir(parents=True, exist_ok=True)
 
     clean = "".join(c if c.isalnum() or c in " _-" else "_" for c in title).strip()
     clean = clean.replace(" ", "_") or "nota"
     path = notas_dir / f"{clean}.md"
+    # Mismo cerrojo que las demás tools de escritura: la ruta final debe caer
+    # dentro del corral (aunque salga de la config, no nos fiamos).
+    if (blocked := _outside_corral(path)):
+        return blocked
+    notas_dir.mkdir(parents=True, exist_ok=True)
 
     if not content.strip():
         content = f"# {title}\n\n"

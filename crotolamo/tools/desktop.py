@@ -11,10 +11,12 @@ import random
 import re
 import shutil
 import subprocess
-import unicodedata
 from pathlib import Path
 
-from crotolamo.tools.base import tool
+from crotolamo.logging_setup import get_logger
+from crotolamo.tools.base import normalize_key, tool
+
+log = get_logger("desktop")
 
 HOME = Path.home()
 
@@ -48,7 +50,6 @@ COMMON_SITES: dict[str, str] = {
 APP_COMMANDS: dict[str, list[list[str]]] = {
     "opera": [["flatpak", "run", "com.opera.opera-gx"]],
     "opera gx": [["flatpak", "run", "com.opera.opera-gx"]],
-    "terminal": [["gnome-terminal"]],
     "archivos": [["nautilus"]],
     "nautilus": [["nautilus"]],
     "blender": [["blender"]],
@@ -72,15 +73,25 @@ def funny_line() -> str:
     return random.choice(_FUNNY_OPEN)
 
 
-def _strip_accents(text: str) -> str:
-    return "".join(
-        c for c in unicodedata.normalize("NFD", text) if unicodedata.category(c) != "Mn"
-    )
+def resolve_target(target: str) -> tuple[str, dict]:
+    """Clasifica un destino genérico en (tipo, payload): url/app/folder/search.
 
-
-def normalize_key(text: str) -> str:
-    """Normaliza una clave de app/carpeta/sitio para emparejar (acentos, espacios)."""
-    return re.sub(r"\s+", " ", _strip_accents(text.lower())).strip()
+    Punto único de resolución para los atajos aprendidos (shortcuts.py) y
+    cualquier otro consumidor: aquí viven APP_COMMANDS/COMMON_SITES/FOLDERS,
+    así que la clasificación se decide aquí y no leyendo los dicts desde fuera.
+    """
+    key = normalize_key(target)
+    if key in COMMON_SITES:
+        return "url", {"value": COMMON_SITES[key]}
+    # "terminal" no vive en APP_COMMANDS (lo resuelve _detect_terminal en
+    # open_app), pero sigue siendo una app válida como destino de atajo.
+    if key in APP_COMMANDS or key == "terminal":
+        return "app", {"value": key}
+    if key in FOLDERS:
+        return "folder", {"value": key}
+    if target.startswith(("http://", "https://")):
+        return "url", {"value": target.strip()}
+    return "search", {"engine": "google", "query": target.strip()}
 
 
 def run_detached(args: list[str]) -> None:
@@ -135,7 +146,8 @@ def _config_apps() -> dict[str, list[str]]:
         from crotolamo.settings import get_settings
 
         raw = get_settings().raw.get("apps", {})
-    except Exception:
+    except Exception as error:  # noqa: BLE001 — sin config, valen los defaults
+        log.debug("no pude leer [apps] de la config: %s", error)
         return {}
     apps: dict[str, list[str]] = {}
     for name, cmd in raw.items():
@@ -151,8 +163,8 @@ def _open_local_browser(url: str) -> str:
         try:
             run_detached(["flatpak", "run", "com.opera.opera-gx", url])
             return f"{funny_line()}\nAbrí esta pestaña, patrón: {url}"
-        except Exception:
-            pass
+        except (OSError, subprocess.SubprocessError) as error:
+            log.debug("flatpak/opera falló, caigo a xdg-open: %s", error)
     run_detached(["xdg-open", url])
     return f"{funny_line()}\nAbrí esta URL con el navegador por defecto, patrón: {url}"
 
@@ -207,7 +219,8 @@ def open_app(name: str) -> str:
         try:
             run_detached(args)
             return f"{funny_line()}\nAbrí {name}, patrón."
-        except Exception:
+        except (OSError, subprocess.SubprocessError) as error:
+            log.debug("no pude lanzar %s: %s", args, error)
             continue
     return f"No pude abrir {name}, patrón."
 

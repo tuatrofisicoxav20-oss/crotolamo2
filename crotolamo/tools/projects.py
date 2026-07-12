@@ -9,16 +9,27 @@ Los proyectos se leen de [projects] en la config (cero hardcodeo).
 
 from __future__ import annotations
 
+import fnmatch
+import os
 import shlex
 import subprocess
 from pathlib import Path
 
 from crotolamo.settings import get_settings
-from crotolamo.tools.base import tool
-from crotolamo.tools.desktop import normalize_key, run_detached, terminal_exec
+from crotolamo.tools.base import normalize_key, tool, truncate_for_context
+from crotolamo.tools.desktop import run_detached, terminal_exec
 
 _SKIP_DIRS = {".venv", "venv", "__pycache__", ".git", "node_modules"}
-_READ_CAP = 20_000
+
+
+def _walk_files(root: Path) -> "list[Path]":
+    """Archivos del proyecto, PODANDO los directorios de _SKIP_DIRS antes de
+    descender (un rglob + filtro posterior se traga .venv/node_modules enteros)."""
+    files: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in _SKIP_DIRS)
+        files.extend(Path(dirpath) / f for f in sorted(filenames))
+    return files
 
 
 def _projects() -> dict[str, Path]:
@@ -53,9 +64,7 @@ def analyze_project(name: str) -> str:
         return f"No encontré el proyecto {name}: {project}"
 
     py_files, sh_files = [], []
-    for path in project.rglob("*"):
-        if any(skip in path.parts for skip in _SKIP_DIRS):
-            continue
+    for path in _walk_files(project):
         if path.suffix == ".py":
             py_files.append(path)
         elif path.suffix == ".sh":
@@ -127,9 +136,7 @@ def read_project_file(project: str, relative_path: str) -> str:
         text = target.read_text(encoding="utf-8", errors="replace")
     except OSError as error:
         return f"No pude leer {target}, patrón: {error}"
-    if len(text) > _READ_CAP:
-        text = text[:_READ_CAP] + f"\n...[recortado, {len(text)} chars en total]"
-    return f"Contenido de {project}/{relative_path}:\n{text}"
+    return f"Contenido de {project}/{relative_path}:\n{truncate_for_context(text)}"
 
 
 @tool
@@ -178,12 +185,17 @@ def launch_project(name: str) -> str:
     if not project.exists():
         return f"No encontré el proyecto {name}: {project}"
 
-    launchers: list[Path] = []
-    for pattern in ("launch*.sh", "*launcher*.sh", "run*.sh", "start*.sh", "*.desktop"):
-        for path in project.rglob(pattern):
-            if any(skip in path.parts for skip in _SKIP_DIRS):
-                continue
-            launchers.append(path)
+    # UN solo recorrido (podado) matcheando los 5 patrones; se conserva la
+    # prioridad original: launch*.sh gana a run*.sh, y estos a *.desktop.
+    patterns = ("launch*.sh", "*launcher*.sh", "run*.sh", "start*.sh", "*.desktop")
+    candidates: list[tuple[int, Path]] = []
+    for path in _walk_files(project):
+        for rank, pattern in enumerate(patterns):
+            if fnmatch.fnmatchcase(path.name, pattern):
+                candidates.append((rank, path))
+                break
+    candidates.sort(key=lambda item: item[0])  # sort estable: conserva el orden del walk
+    launchers = [path for _rank, path in candidates]
 
     if not launchers:
         # shlex.quote: `terminal_exec` arma `bash -lc <cadena>`. Sin escapar, un

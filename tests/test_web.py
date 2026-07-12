@@ -1,14 +1,17 @@
-"""Tests de fetch_web_results / read_page SIN red real.
+"""Tests de fetch_web_results / read_page SIN red real (externa).
 
-Se parchea search._http_get (el único punto que toca la red) y se alimenta
-HTML de mentiras con la estructura real de html.duckduckgo.com.
+Se parchea _web._http_get (el único punto que toca la red) y se alimenta
+HTML de mentiras con la estructura real de html.duckduckgo.com. Los tests de
+redirect anti-SSRF levantan un servidor HTTP local efímero (127.0.0.1).
 """
 
+import http.server
+import threading
 import urllib.error
 
 import pytest
 
-from crotolamo.tools import default_registry, search
+from crotolamo.tools import _web, default_registry, search
 
 # HTML mínimo con la estructura real de html.duckduckgo.com: links result__a
 # con uddg encodeado y snippets result__snippet.
@@ -64,7 +67,7 @@ def _fake_dns(monkeypatch, ip="93.184.216.34"):
     Sin esto, cualquier test que llame a read_page haría una consulta DNS real y
     fallaría sin conexión, rompiendo la promesa de "SIN red" de este archivo.
     """
-    monkeypatch.setattr(search.socket, "getaddrinfo",
+    monkeypatch.setattr(_web.socket, "getaddrinfo",
                         lambda *a, **kw: [(2, 1, 6, "", (ip, 0))])
 
 
@@ -74,7 +77,7 @@ def _patch_get(monkeypatch, content_type, body, capture=None):
             capture.append(url)
         return content_type, body
 
-    monkeypatch.setattr(search, "_http_get", fake_get)
+    monkeypatch.setattr(_web, "_http_get", fake_get)
     _fake_dns(monkeypatch)
 
 
@@ -106,10 +109,10 @@ def test_fetch_decodes_uddg_with_query_params(monkeypatch):
 
 def test_decode_ddg_href_directly():
     href = "//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fx&rut=zzz"
-    assert search._decode_ddg_href(href) == "https://example.com/x"
+    assert _web._decode_ddg_href(href) == "https://example.com/x"
     # Sin uddg: se devuelve tal cual (normalizando el //).
-    assert search._decode_ddg_href("//example.com/y") == "https://example.com/y"
-    assert search._decode_ddg_href("https://example.com/z") == "https://example.com/z"
+    assert _web._decode_ddg_href("//example.com/y") == "https://example.com/y"
+    assert _web._decode_ddg_href("https://example.com/z") == "https://example.com/z"
 
 
 def test_fetch_blocked_query(monkeypatch):
@@ -135,7 +138,7 @@ def test_fetch_network_error(monkeypatch):
     def boom(url, timeout=10.0):
         raise urllib.error.URLError("nombre no resuelve")
 
-    monkeypatch.setattr(search, "_http_get", boom)
+    monkeypatch.setattr(_web, "_http_get", boom)
     out = search.fetch_web_results("ajolote")
     assert "patrón" in out
     assert "conexión" in out.lower()
@@ -215,7 +218,7 @@ def test_read_page_http_error(monkeypatch):
     def boom(url, timeout=12.0):
         raise urllib.error.HTTPError(url, 404, "Not Found", None, None)
 
-    monkeypatch.setattr(search, "_http_get", boom)
+    monkeypatch.setattr(_web, "_http_get", boom)
     _fake_dns(monkeypatch)
     out = search.read_page("https://example.com/no-existe")
     assert "404" in out
@@ -226,7 +229,7 @@ def test_read_page_network_error(monkeypatch):
     def boom(url, timeout=12.0):
         raise urllib.error.URLError("se cayó el wifi")
 
-    monkeypatch.setattr(search, "_http_get", boom)
+    monkeypatch.setattr(_web, "_http_get", boom)
     _fake_dns(monkeypatch)
     out = search.read_page("https://example.com")
     assert "patrón" in out
@@ -267,31 +270,112 @@ def _resolver_fijo(ip: str):
     "0.0.0.0",          # unspecified
 ])
 def test_url_interna_se_bloquea(monkeypatch, ip):
-    monkeypatch.setattr(search.socket, "getaddrinfo", _resolver_fijo(ip))
-    assert search.is_public_url("http://loquesea.com/") is False
+    monkeypatch.setattr(_web.socket, "getaddrinfo", _resolver_fijo(ip))
+    assert _web.is_public_url("http://loquesea.com/") is False
 
 
 def test_url_publica_se_permite(monkeypatch):
-    monkeypatch.setattr(search.socket, "getaddrinfo", _resolver_fijo("93.184.216.34"))
-    assert search.is_public_url("https://example.com/") is True
+    monkeypatch.setattr(_web.socket, "getaddrinfo", _resolver_fijo("93.184.216.34"))
+    assert _web.is_public_url("https://example.com/") is True
 
 
 def test_dns_que_no_resuelve_se_niega(monkeypatch):
     """Ante la duda, negar."""
     def boom(*a, **kw):
-        raise search.socket.gaierror("sin DNS")
+        raise _web.socket.gaierror("sin DNS")
 
-    monkeypatch.setattr(search.socket, "getaddrinfo", boom)
-    assert search.is_public_url("https://no-existe.invalid/") is False
+    monkeypatch.setattr(_web.socket, "getaddrinfo", boom)
+    assert _web.is_public_url("https://no-existe.invalid/") is False
 
 
 def test_read_page_no_toca_la_red_si_es_interna(monkeypatch):
     """El bloqueo ocurre ANTES de la petición HTTP."""
-    monkeypatch.setattr(search.socket, "getaddrinfo", _resolver_fijo("127.0.0.1"))
+    monkeypatch.setattr(_web.socket, "getaddrinfo", _resolver_fijo("127.0.0.1"))
 
     def no_debe_llamarse(*a, **kw):
         raise AssertionError("read_page intentó descargar una URL interna")
 
-    monkeypatch.setattr(search, "_http_get", no_debe_llamarse)
+    monkeypatch.setattr(_web, "_http_get", no_debe_llamarse)
     out = search.read_page(url="http://localhost:11434/api/tags")
+    assert "red interna" in out
+
+
+def test_search_reexporta_por_compat():
+    """search.py re-exporta la fontanería de _web (compat con código viejo)."""
+    assert search.is_public_url is _web.is_public_url
+    assert search._http_get is _web._http_get
+    assert search._decode_ddg_href is _web._decode_ddg_href
+    assert search._DDGResultsParser is _web._DDGResultsParser
+    assert search._PageTextExtractor is _web._PageTextExtractor
+    assert search.BlockedRedirectError is _web.BlockedRedirectError
+
+
+# --- Guardia SSRF en redirects: urlopen sigue los 3xx solo; sin revalidar, un
+# 302 hacia http://169.254.169.254/ o localhost se salta el filtro de la URL
+# original. Servidor local efímero: sin red externa.
+
+class _RedirectHandler(http.server.BaseHTTPRequestHandler):
+    """Servidor de mentiras: /a redirige (302), /b responde contenido."""
+
+    redirect_to = ""  # lo fija cada test
+
+    def do_GET(self):  # noqa: N802 — nombre que exige BaseHTTPRequestHandler
+        if self.path == "/a":
+            self.send_response(302)
+            self.send_header("Location", type(self).redirect_to)
+            self.end_headers()
+        else:
+            body = "<html><body><p>llegaste al destino</p></body></html>".encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    def log_message(self, *args):  # silencio en la salida de pytest
+        pass
+
+
+@pytest.fixture
+def redirect_server():
+    server = http.server.HTTPServer(("127.0.0.1", 0), _RedirectHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_port}"
+    server.shutdown()
+    thread.join(timeout=5)
+
+
+def test_redirect_a_red_interna_se_bloquea(redirect_server):
+    """Un 302 hacia una IP interna debe abortar con BlockedRedirectError."""
+    _RedirectHandler.redirect_to = "http://169.254.169.254/latest/meta-data/"
+    with pytest.raises(_web.BlockedRedirectError):
+        _web._http_get(f"{redirect_server}/a", timeout=5.0)
+
+
+def test_redirect_a_url_publica_se_sigue(redirect_server, monkeypatch):
+    """Un 302 hacia una URL pública se sigue con normalidad.
+
+    El destino real es el mismo servidor local, así que simulamos que
+    is_public_url lo considera público (en producción resolvería DNS).
+    """
+    _RedirectHandler.redirect_to = f"{redirect_server}/b"
+    monkeypatch.setattr(_web, "is_public_url", lambda url: True)
+    content_type, body = _web._http_get(f"{redirect_server}/a", timeout=5.0)
+    assert "text/html" in content_type
+    assert "llegaste al destino" in body
+
+
+def test_read_page_bloquea_redirect_interno(redirect_server, monkeypatch):
+    """De punta a punta: read_page responde el mensaje de red interna."""
+    _RedirectHandler.redirect_to = "http://127.0.0.1:11434/api/tags"
+    # La URL ORIGINAL pasa el guardia (fingimos que resuelve a una IP pública);
+    # el redirect a loopback es lo que debe morir.
+    url_original = f"{redirect_server}/a"
+    real_is_public = _web.is_public_url
+    monkeypatch.setattr(
+        _web, "is_public_url",
+        lambda url: True if url == url_original else real_is_public(url),
+    )
+    out = search.read_page(url_original)
     assert "red interna" in out

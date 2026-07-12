@@ -11,7 +11,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 
-from crotolamo.tools.base import tool
+from crotolamo.tools.base import run_cmd, tool
 
 # Acción -> argumentos de playerctl. 'status'/'now' se tratan aparte (leen metadata).
 _ACTIONS: dict[str, list[str]] = {
@@ -35,9 +35,7 @@ def _player_arg(player: str = "") -> list[str]:
 
 
 def _run(args: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["playerctl", *args], text=True, capture_output=True, timeout=8
-    )
+    return run_cmd(["playerctl", *args], timeout=8)
 
 
 @tool

@@ -10,7 +10,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from crotolamo.tools.base import tool
+from crotolamo.tools.base import run_cmd, tool
 
 HOME = Path.home()
 
@@ -61,10 +61,7 @@ def list_processes(limit: int = 8) -> str:
         limit: cuántos procesos mostrar.
     """
     try:
-        result = subprocess.run(
-            ["ps", "-eo", "pid,comm,%mem,%cpu", "--sort=-%mem"],
-            text=True, capture_output=True, timeout=10,
-        )
+        result = run_cmd(["ps", "-eo", "pid,comm,%mem,%cpu", "--sort=-%mem"], timeout=10)
     except (OSError, subprocess.TimeoutExpired):
         return "No pude listar los procesos, patrón."
 

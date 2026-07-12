@@ -8,31 +8,13 @@ de desktop/search ya existentes.
 from __future__ import annotations
 
 from crotolamo.persistence import db
-from crotolamo.tools.base import tool
-from crotolamo.tools.desktop import (
-    APP_COMMANDS,
-    COMMON_SITES,
-    FOLDERS,
-    normalize_key,
-    open_app,
-    open_folder,
-    open_url,
-)
+from crotolamo.tools.base import normalize_key, tool
+from crotolamo.tools.desktop import open_app, open_folder, open_url, resolve_target
 from crotolamo.tools.search import search_web
 
-
-def _classify_target(target: str) -> tuple[str, dict]:
-    """Decide qué tipo de acción es el destino de un atajo."""
-    key = normalize_key(target)
-    if key in COMMON_SITES:
-        return "url", {"value": COMMON_SITES[key]}
-    if key in APP_COMMANDS:
-        return "app", {"value": key}
-    if key in FOLDERS:
-        return "folder", {"value": key}
-    if target.startswith(("http://", "https://")):
-        return "url", {"value": target.strip()}
-    return "search", {"engine": "google", "query": target.strip()}
+# La clasificación del destino vive en desktop.resolve_target (dueño de los
+# catálogos de apps/sitios/carpetas). Alias local por compat con código viejo.
+_classify_target = resolve_target
 
 
 @tool
@@ -46,7 +28,7 @@ def learn_shortcut(alias: str, target: str) -> str:
     alias_key = normalize_key(alias)
     if not alias_key or not target.strip():
         return "Me faltó el alias o el destino, patrón."
-    action_type, payload = _classify_target(target)
+    action_type, payload = resolve_target(target)
     db.save_shortcut(alias_key, action_type, payload)
     return f"Aprendí el atajo '{alias}', patrón. Ya puedo dispararlo."
 

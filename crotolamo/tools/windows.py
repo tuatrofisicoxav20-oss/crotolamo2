@@ -11,23 +11,17 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
-import unicodedata
 from typing import Any
 
-from crotolamo.tools.base import tool
+from crotolamo.tools.base import normalize_key as _norm
+from crotolamo.tools.base import run_cmd, tool
 
 _NO_HYPRCTL = "No tengo hyprctl, patrón. Esto solo funciona dentro de Hyprland."
 _MAX_TITLE = 60
 
 
-def _norm(text: str) -> str:
-    """minúsculas + sin acentos, para matchear robusto la voz/typos del patrón."""
-    nfd = unicodedata.normalize("NFD", text.lower())
-    return "".join(c for c in nfd if unicodedata.category(c) != "Mn")
-
-
 def _run(args: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(["hyprctl", *args], text=True, capture_output=True, timeout=5)
+    return run_cmd(["hyprctl", *args], timeout=5)
 
 
 def _clients() -> list[dict[str, Any]] | None:
@@ -55,9 +49,7 @@ def _dispatch(args: list[str]) -> subprocess.CompletedProcess:
 def _pgrep(name: str) -> bool:
     """True si hay algún proceso cuyo comando matchea `name` (sin ventana o no)."""
     try:
-        result = subprocess.run(
-            ["pgrep", "-fi", name], text=True, capture_output=True, timeout=5
-        )
+        result = run_cmd(["pgrep", "-fi", name], timeout=5)
     except (OSError, subprocess.TimeoutExpired):
         return False
     return result.returncode == 0
