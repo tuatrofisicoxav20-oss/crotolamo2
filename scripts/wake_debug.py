@@ -77,8 +77,23 @@ def run(threshold: float | None, verbose: bool) -> int:
     last_heartbeat = start
     window_max = 0.0      # máximo desde el último heartbeat
 
+    # Respeta [voice].input_device: así puedes medir DIRECTAMENTE sobre el source
+    # con cancelación de eco ("crotolamo_aec_source") y comprobar que los
+    # disparos fantasma del TTS desaparecen. Ver desktop/aec.sh.
+    # OJO: nada de reimportar get_settings aquí. Un `import` dentro de la función
+    # convierte el nombre en LOCAL para toda ella, y la línea `settings =
+    # get_settings()` de arriba reventaba con UnboundLocalError. Se usa el import
+    # de módulo.
     try:
-        with sd.InputStream(samplerate=_SAMPLE_RATE, channels=1, dtype="int16") as stream:
+        _device = get_settings().voice.get("input_device")
+    except Exception:  # noqa: BLE001
+        _device = None
+    if _device:
+        print(f"(micrófono: {_device})")
+
+    try:
+        with sd.InputStream(samplerate=_SAMPLE_RATE, channels=1, dtype="int16",
+                            device=_device) as stream:
             while True:
                 block, _ = stream.read(_FRAME)
                 audio = np.squeeze(np.asarray(block, dtype=np.int16))

@@ -14,9 +14,7 @@ import json
 import os
 import threading
 import time
-from pathlib import Path
 
-import pytest
 
 from crotolamo.voice.state import Mode, SharedState, make_file_publisher
 

@@ -29,6 +29,27 @@ _INITIAL_PROMPT = "Transcripción de habla en español de México."
 # coexistir sin pisarse el uno al otro.
 _models: dict[str, object] = {}
 
+# Caché del VAD Silero. Antes se hacía load_silero_vad() en CADA grabación (y hasta
+# 3 veces por orden con smart_endpoint), releyendo el ONNX del disco cada vez. El
+# modelo no tiene configuración: una sola instancia sirve a todos los turnos; su
+# estado de RNN se limpia con reset_states() en cada uso.
+_silero_vad: object | None = None
+
+
+def _get_silero_vad():
+    """OJO: instancia ÚNICA compartida con `loop._SileroVad`. Silero es una RNN con
+    estado; esto es seguro solo porque los dos caminos se excluyen — el modo síncrono
+    usa `_record_silero`, y el modo `listen` (hilos) usa el VAD del EarThread, cuyo
+    hilo de STT transcribe con Whisper, no con Silero. Si algún día ambos corren a la
+    vez, hay que dar una instancia por hilo o el estado se pisará.
+    """
+    global _silero_vad
+    if _silero_vad is None:
+        from silero_vad import load_silero_vad
+
+        _silero_vad = load_silero_vad(onnx=True)
+    return _silero_vad
+
 
 class VoiceUnavailable(RuntimeError):
     """Faltan las dependencias de voz. Instala con: pip install -e '.[voice]'."""
@@ -157,7 +178,8 @@ class STT:
         threshold = None
         calib_rms: list[float] = []
 
-        with sd.InputStream(samplerate=self.sample_rate, channels=1, dtype="float32") as stream:
+        with sd.InputStream(samplerate=self.sample_rate, channels=1, dtype="float32",
+                            device=_voice_cfg().get("input_device")) as stream:
             for i in range(max_chunks):
                 block, _ = stream.read(chunk)
                 block = np.squeeze(block)
@@ -194,11 +216,14 @@ class STT:
         torch = _require("torch")
         from collections import deque
 
-        from silero_vad import load_silero_vad
+        from crotolamo.voice.vad import is_voice, resolve_neg_threshold
 
-        model = load_silero_vad(onnx=True)
+        model = _get_silero_vad()
         model.reset_states()
         threshold = voice.get("vad_threshold", 0.8)
+        # Histéresis (misma decisión que el loop concurrente, ver voice/vad.py):
+        # ausente/None = sin histéresis, comportamiento idéntico al histórico.
+        neg_threshold = resolve_neg_threshold(threshold, voice.get("vad_neg_threshold"))
         pre_ms = voice.get("vad_preactivation_ms", 800)
 
         chunk = 512  # Silero exige 512 muestras a 16 kHz (32 ms).
@@ -213,7 +238,9 @@ class STT:
         speaking = False
         silent_run = 0
 
-        with sd.InputStream(samplerate=self.sample_rate, channels=1, dtype="float32") as stream:
+        # input_device: None = default del sistema; "crotolamo_aec_source" tras el AEC.
+        with sd.InputStream(samplerate=self.sample_rate, channels=1, dtype="float32",
+                            device=voice.get("input_device")) as stream:
             for i in range(max_chunks):
                 block, _ = stream.read(chunk)
                 block = np.squeeze(np.asarray(block, dtype=np.float32))
@@ -221,7 +248,9 @@ class STT:
 
                 if not speaking:
                     pre_buffer.append(block)
-                    if prob >= threshold:
+                    # Entrar exige el umbral ALTO (no despertar con cualquier ruido).
+                    if is_voice(prob, speaking=False, threshold=threshold,
+                                neg_threshold=neg_threshold):
                         speaking = True
                         frames.extend(pre_buffer)  # M2.2: anteponer la pre-activación
                         silent_run = 0
@@ -229,7 +258,9 @@ class STT:
                         break
                 else:
                     frames.append(block)
-                    if prob >= threshold:
+                    # Mantenerse basta con el umbral BAJO (histéresis).
+                    if is_voice(prob, speaking=True, threshold=threshold,
+                                neg_threshold=neg_threshold):
                         silent_run = 0
                     else:
                         silent_run += 1

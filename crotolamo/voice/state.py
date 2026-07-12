@@ -37,6 +37,27 @@ class Mode(Enum):
     SPEAKING = auto()   # reproduciendo respuesta
 
 
+# Canal de control INVERSO (panel -> loop): el panel escribe este archivo para
+# pausar/reanudar la escucha por voz SIN matar el proceso. El loop lo sondea.
+CONTROL_PATH = Path.home() / ".crotolamo" / "control.json"
+
+
+def read_control_enabled(path: Path = CONTROL_PATH) -> bool:
+    """Lee el flag de escucha del canal de control. Default-SEGURO.
+
+    Contrato: el archivo es ``{"listening_enabled": bool}``. Devuelve False SOLO
+    si el flag es explícitamente False; ausente, vacío, corrupto o cualquier otro
+    error de E/S => True. NUNCA arrancar mudo por un archivo que falta.
+    """
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        if isinstance(data, dict) and "listening_enabled" in data:
+            return bool(data["listening_enabled"])
+    except (FileNotFoundError, OSError, json.JSONDecodeError, ValueError):
+        pass
+    return True
+
+
 def make_file_publisher(path: Path) -> Callable[[dict], None]:
     """Devuelve un callable que escribe el dict como JSON de forma atómica en ``path``.
 
@@ -80,19 +101,23 @@ class SharedState:
         self._mode = Mode.IDLE
         self._turn_id = 0
         self._text = ""
+        # Escucha por voz habilitada (default True). El botón del panel la pausa
+        # sin matar el proceso: cuando es False, el EarThread ignora la wake word.
+        self._enabled = True
         self._publisher = publisher
 
     # ------------------------------------------------------------------
     # Publicación interna: siempre se llama SIN el lock tomado para evitar
     # deadlock (el lock en SharedState no es reentrant).
     # ------------------------------------------------------------------
-    def _publish(self, mode: Mode, turn_id: int, text: str) -> None:
+    def _publish(self, mode: Mode, turn_id: int, text: str, enabled: bool) -> None:
         if self._publisher is None:
             return
         state_dict = {
             "mode": mode.name.lower(),
             "turn_id": turn_id,
             "text": text,
+            "enabled": enabled,
             "ts": time.time(),
             "pid": os.getpid(),
         }
@@ -110,8 +135,9 @@ class SharedState:
             self._mode = mode
             _turn = self._turn_id
             _text = self._text
+            _enabled = self._enabled
         # Publicar FUERA del lock
-        self._publish(mode, _turn, _text)
+        self._publish(mode, _turn, _text, _enabled)
 
     def set_text(self, text: str) -> None:
         """Actualiza el texto visible (última frase reconocida o respuesta)."""
@@ -119,7 +145,8 @@ class SharedState:
             self._text = text
             _mode = self._mode
             _turn = self._turn_id
-        self._publish(_mode, _turn, text)
+            _enabled = self._enabled
+        self._publish(_mode, _turn, text, _enabled)
 
     @property
     def turn_id(self) -> int:
@@ -133,13 +160,37 @@ class SharedState:
             _turn = self._turn_id
             _mode = self._mode
             _text = self._text
+            _enabled = self._enabled
         # Publicar FUERA del lock
-        self._publish(_mode, _turn, _text)
+        self._publish(_mode, _turn, _text, _enabled)
         return _turn
 
     def is_current(self, turn: int) -> bool:
         with self._lock:
             return turn == self._turn_id
+
+    # ------------------------------------------------------------------
+    # Escucha por voz habilitada/pausada (canal de control del panel).
+    # ------------------------------------------------------------------
+    def is_enabled(self) -> bool:
+        with self._lock:
+            return self._enabled
+
+    def set_enabled(self, enabled: bool) -> None:
+        """Habilita/pausa la escucha. Publica SOLO si cambia el valor.
+
+        Sin la guarda old != new, el poll del canal de control (varias veces por
+        segundo) reescribiría hud_state.json en cada tick aunque nada cambie.
+        """
+        with self._lock:
+            if enabled == self._enabled:
+                return
+            self._enabled = enabled
+            _mode = self._mode
+            _turn = self._turn_id
+            _text = self._text
+        # Publicar FUERA del lock (para que el panel vea el estado real).
+        self._publish(_mode, _turn, _text, enabled)
 
     def current_snapshot(self) -> dict:
         """Devuelve un snapshot del estado actual (para publicar el idle final)."""
@@ -148,6 +199,7 @@ class SharedState:
                 "mode": self._mode.name.lower(),
                 "turn_id": self._turn_id,
                 "text": self._text,
+                "enabled": self._enabled,
                 "ts": time.time(),
                 "pid": os.getpid(),
             }

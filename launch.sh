@@ -7,6 +7,15 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
+# --- credenciales (API key de GLM) ---
+# OJO: este script lo arranca también el .desktop vía `kitty -e`, que NO es un shell
+# interactivo: ~/.zshrc no se carga y la key no existiría. Sin esto, un doble clic
+# haría que Crotolamo cayera a Ollama en silencio. El archivo tiene permisos 600.
+if [[ -f "$HOME/.config/crotolamo/env" ]]; then
+    # shellcheck source=/dev/null
+    source "$HOME/.config/crotolamo/env"
+fi
+
 # --- elegir intérprete: venv si existe, si no python3 del sistema ---
 if [[ -x "$ROOT/.venv/bin/python" ]]; then
     PY="$ROOT/.venv/bin/python"

@@ -188,7 +188,16 @@ class WakeWordDetector:
         model = self._get_model()
 
         start = time.monotonic()
-        with sd.InputStream(samplerate=_SAMPLE_RATE, channels=1, dtype="int16") as stream:
+        # input_device: None = default del sistema; "crotolamo_aec_source" tras el AEC
+        # (ver desktop/aec.sh). Es el mismo micrófono que usa el resto de la voz.
+        try:
+            from crotolamo.settings import get_settings
+
+            _device = get_settings().voice.get("input_device")
+        except Exception:  # noqa: BLE001 — sin config, el default del sistema
+            _device = None
+        with sd.InputStream(samplerate=_SAMPLE_RATE, channels=1, dtype="int16",
+                            device=_device) as stream:
             while timeout_s is None or (time.monotonic() - start) < timeout_s:
                 block, _ = stream.read(_FRAME)
                 audio = np.squeeze(np.asarray(block, dtype=np.int16))

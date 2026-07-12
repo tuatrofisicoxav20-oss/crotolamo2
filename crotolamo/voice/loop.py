@@ -18,7 +18,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from crotolamo.logging_setup import get_logger
-from crotolamo.voice.state import Mode, SharedState
+from crotolamo.voice.state import Mode, SharedState, read_control_enabled
+from crotolamo.voice.vad import is_voice, resolve_neg_threshold
 from crotolamo.voice.tts import split_sentences
 
 log = get_logger("voice.loop")
@@ -137,17 +138,22 @@ class SttThread(threading.Thread):
                 audio_path, turn = self.in_q.get(timeout=0.2)
             except queue.Empty:
                 continue
-            if not self.state.is_current(turn):
-                continue  # comando abortado antes de transcribir
+            # El WAV se borra pase lo que pase: si el turno se abortó (barge-in)
+            # entre el encolado y aquí, el `continue` de antes saltaba el unlink
+            # y dejaba el temporal huérfano en /tmp para siempre.
             try:
-                text = self.stt.transcribe(audio_path, hotwords=self.hotwords)
-            except Exception as error:  # noqa: BLE001
-                log.warning("stt: %s", error)
-                text = ""
-            try:
-                audio_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+                if not self.state.is_current(turn):
+                    continue  # comando abortado antes de transcribir
+                try:
+                    text = self.stt.transcribe(audio_path, hotwords=self.hotwords)
+                except Exception as error:  # noqa: BLE001
+                    log.warning("stt: %s", error)
+                    text = ""
+            finally:
+                try:
+                    audio_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
             if text.strip() and self.state.is_current(turn):
                 self.state.set_text(text)  # HUD: frase reconocida del usuario
                 self.out_q.put((text, turn))
@@ -185,7 +191,8 @@ class EarThread(threading.Thread):
                  max_command_s: float = 12.0, allow_barge_in: bool = False,
                  chunk_ms: float = 32.0, barge_in_grace_ms: float = 400,
                  barge_in_threshold_margin: float = 0.1,
-                 barge_in_min_chunks: int = 5) -> None:
+                 barge_in_min_chunks: int = 5,
+                 vad_neg_threshold: float | None = None) -> None:
         super().__init__(name="Ear", daemon=True)
         self.mic = mic
         self.wake_fn = wake_fn
@@ -197,6 +204,9 @@ class EarThread(threading.Thread):
         self.state = state
         self.shutdown = shutdown
         self.vad_threshold = vad_threshold
+        # Histéresis: umbral para MANTENERSE en voz, más bajo que el de entrar.
+        # None = sin histéresis (idéntico al comportamiento previo). Ver voice/vad.py.
+        self.vad_neg_threshold = resolve_neg_threshold(vad_threshold, vad_neg_threshold)
         self.allow_barge_in = allow_barge_in
         self._chunk_ms = chunk_ms
         self._silence_chunks = max(1, int(silence_ms / chunk_ms))
@@ -251,6 +261,11 @@ class EarThread(threading.Thread):
         wav = self.to_wav(self._cmd_frames)
         self.stt_q.put((wav, self._turn))
         self.state.set_mode(Mode.THINKING)
+        # Cerrar el turno limpia el estado de la RNN del VAD (si el vad_fn lo
+        # soporta; en tests suele ser un lambda sin reset).
+        reset = getattr(self.vad_fn, "reset", None)
+        if callable(reset):
+            reset()
 
     def run(self) -> None:
         while not self.shutdown.is_set():
@@ -272,6 +287,10 @@ class EarThread(threading.Thread):
             self._prev_mode = mode
 
             if mode is Mode.IDLE:
+                # Escucha pausada desde el panel: ignora la wake word por completo.
+                # (Un turno en curso NO se corta; solo dejamos de despertar de nuevo.)
+                if not self.state.is_enabled():
+                    continue
                 # Cooldown anti-eco: tras un turno, no escuches el wake un momento.
                 if time.monotonic() < self._idle_grace_until:
                     continue
@@ -283,7 +302,11 @@ class EarThread(threading.Thread):
             elif mode is Mode.LISTENING:
                 self._cmd_frames.append(chunk)
                 self._cmd_count += 1
-                if self.vad_fn(chunk) >= self.vad_threshold:
+                # Ya estamos DENTRO del habla (speaking=True): basta el umbral bajo
+                # para seguir en voz, así una micro-pausa no cierra el comando.
+                if is_voice(self.vad_fn(chunk), speaking=True,
+                            threshold=self.vad_threshold,
+                            neg_threshold=self.vad_neg_threshold):
                     self._silent_run = 0
                 else:
                     self._silent_run += 1
@@ -301,11 +324,17 @@ class EarThread(threading.Thread):
 
 # --- adapters reales (solo en hardware; los tests inyectan fakes) ---
 class _RealMic:
-    """Micrófono real: InputStream de sounddevice abierto perezosamente."""
+    """Micrófono real: InputStream de sounddevice abierto perezosamente.
 
-    def __init__(self, sample_rate: int = 16000, frame: int = 512) -> None:
+    device: nombre o índice del dispositivo de entrada. None (default) = el default
+    del sistema. Se usa para apuntar SOLO a Crotolamo al source con cancelación de
+    eco ("crotolamo_aec_source") sin cambiar el default global del escritorio.
+    """
+
+    def __init__(self, sample_rate: int = 16000, frame: int = 512, device=None) -> None:
         self.sample_rate = sample_rate
         self.frame = frame
+        self.device = device
         self._stream = None
 
     def read(self):
@@ -314,7 +343,8 @@ class _RealMic:
 
         if self._stream is None:
             self._stream = sd.InputStream(
-                samplerate=self.sample_rate, channels=1, dtype="float32"
+                samplerate=self.sample_rate, channels=1, dtype="float32",
+                device=self.device,
             )
             self._stream.start()
         block, _ = self._stream.read(self.frame)
@@ -346,6 +376,14 @@ class _SileroVad:
         self._model: Any = None
         self._fallback: bool = False  # True = usar energía RMS
 
+    def reset(self) -> None:
+        """Limpia el estado oculto de la RNN. Silero acumula contexto entre chunks:
+        eso ayuda DENTRO de una frase, pero arrastrado de un turno al siguiente
+        degrada la precisión del VAD conforme avanza la sesión.
+        """
+        if self._model is not None:
+            self._model.reset_states()
+
     def __call__(self, chunk) -> float:
         if self._fallback:
             return self._energy_vad(chunk)
@@ -353,10 +391,13 @@ class _SileroVad:
         try:
             import numpy as np
             import torch
-            from silero_vad import load_silero_vad
+
+            # Comparte la instancia cacheada de stt: antes cada uno cargaba su
+            # propia copia del ONNX, duplicando el modelo en RAM sin motivo.
+            from crotolamo.voice.stt import _get_silero_vad
 
             if self._model is None:
-                self._model = load_silero_vad(onnx=True)
+                self._model = _get_silero_vad()
             arr = np.asarray(chunk, dtype=np.float32)
             return float(self._model(torch.from_numpy(arr.copy()), self.sample_rate))
         except (ImportError, ModuleNotFoundError) as exc:
@@ -404,9 +445,11 @@ class VoiceLoop:
 
     def __init__(self, agent, stt, tts, wake_detector, *, allow_barge_in: bool = False,
                  silence_ms: int = 640, mic=None, wake_fn=None, vad_fn=None,
-                 to_wav=None, hud_publisher=None) -> None:
+                 to_wav=None, hud_publisher=None, control_path=None) -> None:
         self.state = SharedState(publisher=hud_publisher)
         self.shutdown = threading.Event()
+        # Canal de control inverso (panel -> loop). None = sin sondeo (tests).
+        self.control_path = control_path
         self.stt_q: queue.Queue = queue.Queue()
         self.cmd_q: queue.Queue = queue.Queue()
         self.tts_q: queue.Queue = queue.Queue()
@@ -419,7 +462,12 @@ class VoiceLoop:
         except Exception:
             vcfg = {}
         # Adapters reales por defecto; los tests inyectan fakes (no abre audio).
-        self._mic = mic or _RealMic()
+        # input_device: None (default) = micrófono default del sistema. Apúntalo a
+        # "crotolamo_aec_source" tras activar el AEC (ver desktop/aec.sh).
+        self._mic = mic or _RealMic(
+            sample_rate=vcfg.get("sample_rate", 16000),
+            device=vcfg.get("input_device"),
+        )
         ear = EarThread(
             self._mic,
             wake_fn or wake_detector.feed,
@@ -427,9 +475,12 @@ class VoiceLoop:
             to_wav or stt._frames_to_wav,
             tts, self.stt_q, self.tts_q, self.state, self.shutdown,
             allow_barge_in=allow_barge_in, silence_ms=silence_ms,
+            vad_threshold=vcfg.get("vad_threshold", 0.8),
             barge_in_grace_ms=vcfg.get("barge_in_grace_ms", 400),
             barge_in_threshold_margin=vcfg.get("barge_in_threshold_margin", 0.1),
             barge_in_min_chunks=vcfg.get("barge_in_min_chunks", 5),
+            # None (default) = sin histéresis, comportamiento idéntico al previo.
+            vad_neg_threshold=vcfg.get("vad_neg_threshold"),
         )
         self.threads = [
             ear,
@@ -446,9 +497,17 @@ class VoiceLoop:
 
     def run(self) -> None:
         self.start()
+        # Estado inicial de la escucha desde el canal de control (default: activa).
+        if self.control_path is not None:
+            self.state.set_enabled(read_control_enabled(self.control_path))
         try:
             while not self.shutdown.is_set():
                 self.shutdown.wait(0.3)
+                # Sondeo del canal de control (panel -> loop). set_enabled solo
+                # publica si el valor cambia, así que esto es barato aunque corra
+                # ~3 veces por segundo. Sin thread extra: reutilizamos esta espera.
+                if self.control_path is not None:
+                    self.state.set_enabled(read_control_enabled(self.control_path))
         except KeyboardInterrupt:
             pass
         finally:

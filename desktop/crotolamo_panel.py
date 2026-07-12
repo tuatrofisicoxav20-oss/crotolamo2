@@ -17,8 +17,11 @@ realidad aunque enciendas/apagues el servicio desde otro lado.
 
 from __future__ import annotations
 
+import json
+import os
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 import gi
@@ -30,6 +33,12 @@ from gi.repository import GLib, Gtk  # noqa: E402
 
 SERVICE = "crotolamo.service"
 ENV_FILE = Path.home() / ".config" / "crotolamo" / "listener.env"
+
+# Estado publicado por el loop de voz (solo lectura para el panel).
+HUD_STATE_FILE = Path.home() / ".crotolamo" / "hud_state.json"
+# Canal de control INVERSO (panel -> loop): pausar/reanudar la escucha por voz
+# sin apagar el servicio. El loop lo sondea; escribimos aquí de forma atómica.
+CONTROL_FILE = Path.home() / ".crotolamo" / "control.json"
 
 # Modo de escucha -> argumentos que recibe `python -m crotolamo listen`.
 # El servicio los lee de ENV_FILE (variable CROTOLAMO_LISTEN_ARGS).
@@ -171,6 +180,21 @@ class Panel(Gtk.ApplicationWindow):
         box.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL),
                        False, False, 2)
 
+        # fila: pausar/reanudar la escucha por voz SIN apagar el servicio.
+        # A diferencia del botón grande (que mata el proceso y recarga modelos al
+        # volver, ~segundos), esto solo silencia la wake word: Crotolamo sigue
+        # caliente y reacciona al instante en cuanto lo reactivas.
+        listen_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        lbl_listen = Gtk.Label(label="Escuchar por voz")
+        lbl_listen.get_style_context().add_class("crot-row")
+        lbl_listen.set_xalign(0)
+        self.listen_sw = Gtk.Switch()
+        self.listen_sw.set_valign(Gtk.Align.CENTER)
+        self.listen_sw.connect("notify::active", self.on_listen_toggle)
+        listen_row.pack_start(lbl_listen, False, False, 0)
+        listen_row.pack_end(self.listen_sw, False, False, 0)
+        box.pack_start(listen_row, False, False, 0)
+
         # fila: modo de voz
         mode_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         lbl_mode = Gtk.Label(label="Modo")
@@ -256,7 +280,12 @@ class Panel(Gtk.ApplicationWindow):
         cur_key = KEY_BY_ARGS.get(read_mode_args(), "half")
         if self.mode.get_active_id() != cur_key:
             self.mode.set_active_id(cur_key)
+        # reflejar el estado REAL de la escucha (lo que publica el loop), no lo
+        # que el panel cree; así el switch no miente si cambia desde otro lado.
+        self.listen_sw.set_active(read_listening_enabled())
         self._syncing = False
+        # Pausar la escucha solo tiene sentido con el servicio corriendo.
+        self.listen_sw.set_sensitive(active == "active")
 
         if active == "active":
             self._set_visual("state-on", "microphone-sensitivity-high-symbolic")
@@ -337,6 +366,13 @@ class Panel(Gtk.ApplicationWindow):
         else:
             self._do_async("disable", SERVICE)
 
+    def on_listen_toggle(self, switch: Gtk.Switch, _param) -> None:
+        if self._syncing:
+            return
+        # Escribe el flag; el loop lo sondea (~3x/s) y el próximo refresh lee de
+        # vuelta el estado real publicado, así que no forzamos nada aquí.
+        write_listening_enabled(switch.get_active())
+
     def on_log(self, _btn: Gtk.Button) -> None:
         cmd = ["journalctl", "--user", "-u", SERVICE, "-n", "200", "-f"]
         term = _find_terminal()
@@ -388,6 +424,46 @@ def write_mode_args(args: str) -> None:
     try:
         ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
         ENV_FILE.write_text(f"CROTOLAMO_LISTEN_ARGS={args}\n")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# --- helpers del canal de pausa de escucha (panel <-> loop) -------------------
+
+def read_listening_enabled() -> bool:
+    """Si la escucha por voz está activa, según el estado que publica el loop.
+
+    Default-SEGURO: ausente/corrupto/sin campo => True. El panel refleja la
+    realidad leyendo aquí, no lo que él cree haber escrito.
+    """
+    try:
+        data = json.loads(HUD_STATE_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and "enabled" in data:
+            return bool(data["enabled"])
+    except (FileNotFoundError, OSError, json.JSONDecodeError, ValueError):
+        pass
+    return True
+
+
+def write_listening_enabled(enabled: bool) -> None:
+    """Escribe el flag de control de forma ATÓMICA (tmp + os.replace).
+
+    El loop nunca debe leer un archivo a medias; cualquier error de E/S solo se
+    ignora (no revienta la UI).
+    """
+    try:
+        CONTROL_FILE.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=CONTROL_FILE.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({"listening_enabled": enabled}, f)
+        except Exception:  # noqa: BLE001
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        os.replace(tmp, CONTROL_FILE)
     except Exception:  # noqa: BLE001
         pass
 
