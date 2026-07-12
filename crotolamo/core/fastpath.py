@@ -72,6 +72,9 @@ def _known_apps() -> set[str]:
         apps.update(_norm(k) for k in APP_COMMANDS)
     except Exception:  # noqa: BLE001
         pass
+    # "terminal" no vive en APP_COMMANDS (open_app la resuelve vía
+    # _detect_terminal), pero sigue siendo un destino válido del atajo.
+    apps.add("terminal")
     return apps
 
 

@@ -116,6 +116,52 @@ def test_si_ambos_caen_propaga_el_error_del_local():
         FallbackLLM(nube, local).chat([])
 
 
+def test_toolagent_completa_el_turno_si_el_primario_cae_a_media_iteracion(monkeypatch):
+    """Integración ToolAgent + FallbackLLM: la nube pide una tool y REVIENTA en la
+    2ª iteración del loop; el respaldo local debe redactar la respuesta final."""
+    from crotolamo.core.agent import ToolAgent
+    from crotolamo.core.memory import Conversation
+    from crotolamo.safety.guard import Guard
+    from crotolamo.tools import default_registry, desktop
+
+    monkeypatch.setattr(desktop, "run_detached", lambda args: None)
+
+    class _Primario:
+        model = "glm"
+
+        def __init__(self):
+            self.llamadas = 0
+
+        def chat(self, messages, tools=None):
+            self.llamadas += 1
+            if self.llamadas == 1:
+                return ChatResponse(
+                    content="",
+                    tool_calls=[{"name": "open_url", "arguments": {"url": "x.com"}}],
+                    raw_message={"tool_calls": [{
+                        "function": {"name": "open_url", "arguments": {"url": "x.com"}},
+                    }]},
+                )
+            raise LLMError("glm caído a media faena")
+
+    class _Local:
+        model = "ollama"
+
+        def chat(self, messages, tools=None):
+            return ChatResponse(content="Abierta desde el local, patrón.")
+
+    nube = _Primario()
+    llm = FallbackLLM(nube, _Local())
+    agent = ToolAgent(
+        llm, Conversation("SYS"), registry=default_registry(),
+        guard=Guard(allowed_roots=[]), fastpath=False,
+    )
+
+    reply = agent.handle_turn("abre x.com")
+    assert reply == "Abierta desde el local, patrón."
+    assert nube.llamadas == 2  # sirvió la 1ª iteración y reventó en la 2ª
+
+
 def test_build_llm_envuelve_en_fallback_cuando_hay_key(monkeypatch):
     from crotolamo.core.engine import build_llm
     from crotolamo.core.glm import GLMClient

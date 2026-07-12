@@ -4,28 +4,33 @@ POR QUÉ EXISTE: en esta lap (12 núcleos, 15 GiB, GPU integrada) inferir un 7B 
 CPU cuesta ~17-22s por turno con tool, y deja la RAM en swap. GLM-4.7-Flash es
 gratuito en Z.ai y responde en ~1-2s, sacando la inferencia de la máquina.
 
-DISEÑO: esto es un ADAPTADOR. Traduce el formato de mensajes de Ollama al de
-OpenAI y devuelve un `ChatResponse` idéntico al de `LLMClient`, con las
-tool_calls ya normalizadas al formato Ollama. Así `Conversation`, `ToolAgent` y
-las tools no se enteran de con qué motor hablan.
+DISEÑO: esto es un ADAPTADOR. La traducción de mensajes Ollama<->OpenAI vive en
+`openai_adapter.py` y el parseo del stream en `sse.py`; aquí queda solo el
+cliente HTTP, que devuelve un `ChatResponse` idéntico al de `LLMClient`. Así
+`Conversation`, `ToolAgent` y las tools no se enteran de con qué motor hablan.
 
-Las dos incompatibilidades reales del contrato:
-  1. OpenAI exige `tool_call_id` en los mensajes de rol "tool" (Ollama usa `name`).
-  2. OpenAI manda `function.arguments` como string JSON (Ollama, como dict).
-
-Cero dependencias: stdlib, igual que `llm.py`.
+Cero dependencias: stdlib, igual que `llm.py`. La red va por `HTTPTransport`
+(keep-alive), compartiendo conexión entre las 2+ llamadas de un turno con tools.
 """
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import time
-import urllib.error
-import urllib.request
-from typing import Any
+from typing import Any, NoReturn
 
-from crotolamo.core.llm import ChatResponse, LLMError, _parse_tool_calls
+from crotolamo.core.engine import HTTPTransport
+from crotolamo.core.llm import ChatResponse, LLMError, _parse_tool_calls, _read_body
+from crotolamo.core.openai_adapter import (  # noqa: F401 - re-export (compat)
+    from_openai_message,
+    to_openai_messages,
+)
+from crotolamo.core.sse import consume_sse
+
+# Alias de compatibilidad: el nombre histórico cuando esto vivía en glm.py.
+_from_openai_message = from_openai_message
 
 _PROF = os.environ.get("CROTOLAMO_LLM_PROF") == "1"
 
@@ -34,6 +39,10 @@ DEFAULT_MODEL = "glm-4.7-flash"  # gratuito para usuarios registrados
 # Variables de entorno donde se busca la API key, en orden. NUNCA se guarda la
 # key en el toml (que va a git); la env es el sitio correcto.
 API_KEY_ENVS = ("CROTOLAMO_GLM_API_KEY", "ZAI_API_KEY", "ZHIPU_API_KEY")
+
+# Un 429 con Retry-After hasta este tope se espera y reintenta in-place, en vez
+# de tumbar el turno (y con él, degradar 60s al modelo local vía FallbackLLM).
+_MAX_RETRY_AFTER_S = 3.0
 
 
 class GLMAuthError(LLMError):
@@ -48,107 +57,15 @@ def _find_api_key() -> str | None:
     return None
 
 
-def _call_id(index: int) -> str:
-    """ID determinista para correlacionar un tool_call con su resultado.
-
-    El historial de `Conversation` no guarda ids (Ollama no los usa), así que los
-    reconstruimos por posición al traducir. Es correcto porque los resultados de
-    tools se añaden SIEMPRE en el mismo orden en que se pidieron las llamadas
-    (ver `ToolAgent.handle_turn`).
-    """
-    return f"call_{index}"
-
-
-def to_openai_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Traduce el historial estilo Ollama al contrato de OpenAI.
-
-    - assistant con tool_calls: añade `id` y `type`, y serializa `arguments` a str.
-    - tool: sustituye `name` por el `tool_call_id` de la llamada correspondiente.
-
-    Los ids se asignan por orden dentro de cada bloque assistant→tools, que es el
-    orden en que `ToolAgent` los produce.
-    """
-    out: list[dict[str, Any]] = []
-    pending: list[str] = []  # ids de las tool_calls del último assistant
-    counter = 0
-
-    for msg in messages:
-        role = msg.get("role")
-
-        if role == "assistant" and msg.get("tool_calls"):
-            pending = []
-            calls_out = []
-            for call in msg["tool_calls"]:
-                fn = call.get("function", {}) or {}
-                args = fn.get("arguments", {})
-                if not isinstance(args, str):
-                    args = json.dumps(args, ensure_ascii=False)
-                cid = call.get("id") or _call_id(counter)
-                counter += 1
-                pending.append(cid)
-                calls_out.append({
-                    "id": cid,
-                    "type": "function",
-                    "function": {"name": fn.get("name", ""), "arguments": args},
-                })
-            # OpenAI acepta content vacío cuando hay tool_calls, pero exige la clave.
-            out.append({
-                "role": "assistant",
-                "content": msg.get("content") or "",
-                "tool_calls": calls_out,
-            })
-            continue
-
-        if role == "tool":
-            if not pending:
-                # `tool` sin un assistant-con-tool_calls que lo preceda EN ESTE
-                # payload. Hoy `Conversation._trim()` recorta por bloques completos
-                # y esto no ocurre, pero si ocurriera emitiríamos un tool_call_id
-                # colgando y OpenAI/GLM devolvería un 400 opaco. Lo descartamos: no
-                # dependemos de una invariante que mantiene otro módulo.
-                continue
-            # Consumimos los ids en el mismo orden en que se pidieron las llamadas.
-            out.append({
-                "role": "tool",
-                "tool_call_id": pending.pop(0),
-                "content": msg.get("content", ""),
-            })
-            continue
-
-        # system / user / assistant sin tools: pasan tal cual (mismo contrato).
-        out.append({"role": role, "content": msg.get("content", "")})
-
-    return out
-
-
-def _from_openai_message(message: dict[str, Any]) -> dict[str, Any]:
-    """Normaliza el mensaje de OpenAI al formato Ollama que espera `ToolAgent`.
-
-    `ToolAgent` reinyecta `response.raw_message["tool_calls"]` al historial tal
-    cual, y `Conversation` lo vuelve a pasar por `to_openai_messages`. Guardarlo
-    en formato Ollama (arguments como dict) mantiene un único formato canónico
-    en memoria, independientemente del motor.
-    """
-    calls = []
-    for call in message.get("tool_calls") or []:
-        fn = call.get("function", {}) or {}
-        args = fn.get("arguments", {})
-        if isinstance(args, str):
-            try:
-                args = json.loads(args) if args.strip() else {}
-            except json.JSONDecodeError:
-                args = {}
-        calls.append({
-            "id": call.get("id"),
-            "function": {"name": fn.get("name", ""), "arguments": args},
-        })
-    out: dict[str, Any] = {
-        "role": "assistant",
-        "content": message.get("content") or "",
-    }
-    if calls:
-        out["tool_calls"] = calls
-    return out
+def _retry_after_s(resp) -> float | None:
+    """Segundos del header Retry-After, o None si falta o no es numérico."""
+    raw = resp.getheader("Retry-After")
+    if not raw:
+        return None
+    try:
+        return float(raw.strip())
+    except ValueError:
+        return None  # formato HTTP-date: lo tratamos como "espera larga"
 
 
 class GLMClient:
@@ -180,6 +97,9 @@ class GLMClient:
         # limit del tier gratuito. Actívalo si quieres razonamiento en preguntas
         # difíciles y no te importa esperar.
         self.thinking = thinking
+        # Conexión HTTPS persistente: un turno con tools hace 2+ llamadas
+        # seguidas; reutilizar el socket ahorra el handshake TCP+TLS de cada una.
+        self._transport = HTTPTransport(self.base_url, timeout=self.timeout)
 
     @classmethod
     def from_settings(cls, settings) -> "GLMClient":
@@ -201,10 +121,7 @@ class GLMClient:
                 "(la sacas gratis en https://z.ai) o cambia [llm].backend a "
                 '"ollama" en la config.'
             )
-        return {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
-        }
+        return {"Authorization": f"Bearer {self.api_key}"}
 
     def _payload(
         self,
@@ -227,49 +144,56 @@ class GLMClient:
             payload["thinking"] = {"type": "disabled"}
         return payload
 
-    def _request(self, payload: dict[str, Any]):
-        return urllib.request.Request(
-            f"{self.base_url}/chat/completions",
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers=self._headers(),
-            method="POST",
-        )
-
-    def _raise_http(self, error: urllib.error.HTTPError) -> None:
-        body = ""
-        try:
-            body = error.read().decode("utf-8", "replace")[:300]
-        except Exception:  # noqa: BLE001 - el cuerpo del error es best-effort
-            pass
-        if error.code in (401, 403):
+    def _raise_http(self, status: int, body: str) -> NoReturn:
+        if status in (401, 403):
             raise GLMAuthError(
-                f"GLM me rechazó la credencial ({error.code}), patrón. "
+                f"GLM me rechazó la credencial ({status}), patrón. "
                 f"Revisa la API key. {body}"
-            ) from error
-        if error.code == 429:
+            )
+        if status == 429:
             raise LLMError(
                 "GLM me está limitando el ritmo (429), patrón. Aguanta tantito."
+            )
+        raise LLMError(f"GLM respondió {status}, patrón: {body}")
+
+    def _post(self, payload: dict[str, Any]) -> http.client.HTTPResponse:
+        """POST a /chat/completions con los errores de red ya en personaje."""
+        headers = self._headers()  # puede lanzar GLMAuthError sin tocar la red
+        try:
+            return self._transport.post_json("/chat/completions", payload, headers)
+        except TimeoutError as error:
+            raise LLMError(f"GLM no respondió a tiempo, patrón. ({error})") from error
+        except (http.client.HTTPException, OSError) as error:
+            raise LLMError(
+                f"No pude hablar con GLM en {self.base_url}, patrón. "
+                f"¿Hay internet? ({error})"
             ) from error
-        raise LLMError(f"GLM respondió {error.code}, patrón: {body}") from error
+
+    def _send(self, payload: dict[str, Any]) -> http.client.HTTPResponse:
+        """Envía y valida el status. Un 429 con Retry-After corto se reintenta
+        UNA vez in-place: sin esto, un límite transitorio de segundos tumbaba el
+        turno y `FallbackLLM` degradaba 60s al modelo local (lento en CPU).
+        """
+        resp = self._post(payload)
+        if resp.status == 429:
+            wait = _retry_after_s(resp)
+            if wait is not None and 0 <= wait <= _MAX_RETRY_AFTER_S:
+                _read_body(resp)  # drenar para poder reutilizar la conexión
+                time.sleep(wait)
+                resp = self._post(payload)
+        if resp.status >= 400:
+            self._raise_http(resp.status, _read_body(resp))
+        return resp
 
     def chat(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
     ) -> ChatResponse:
-        req = self._request(self._payload(messages, tools, stream=False))
-
         t0 = time.time() if _PROF else 0.0
+        resp = self._send(self._payload(messages, tools, stream=False))
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                raw = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as error:
-            self._raise_http(error)
-        except urllib.error.URLError as error:
-            raise LLMError(
-                f"No pude hablar con GLM en {self.base_url}, patrón. "
-                f"¿Hay internet? ({error.reason})"
-            ) from error
+            raw = json.loads(resp.read().decode("utf-8"))
         except (TimeoutError, OSError) as error:
             raise LLMError(f"GLM no respondió a tiempo, patrón. ({error})") from error
         except json.JSONDecodeError as error:
@@ -287,7 +211,7 @@ class GLMClient:
 
         choices = raw.get("choices") or []
         message = (choices[0].get("message", {}) or {}) if choices else {}
-        normalized = _from_openai_message(message)
+        normalized = from_openai_message(message)
         return ChatResponse(
             content=(normalized.get("content") or "").strip(),
             tool_calls=_parse_tool_calls(normalized),
@@ -301,16 +225,9 @@ class GLMClient:
         on_token=None,
     ) -> ChatResponse:
         """Como chat() pero consumiendo el SSE de OpenAI (`data: {...}` por línea)."""
-        req = self._request(self._payload(messages, tools, stream=True))
+        resp = self._send(self._payload(messages, tools, stream=True))
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                content, message = self._consume_sse(resp, on_token)
-        except urllib.error.HTTPError as error:
-            self._raise_http(error)
-        except urllib.error.URLError as error:
-            raise LLMError(
-                f"No pude hablar con GLM en {self.base_url}, patrón. ({error.reason})"
-            ) from error
+            content, message = consume_sse(resp, on_token)
         except (TimeoutError, OSError) as error:
             raise LLMError(f"GLM no respondió a tiempo, patrón. ({error})") from error
 
@@ -320,67 +237,5 @@ class GLMClient:
             raw_message=message,
         )
 
-    @staticmethod
-    def _consume_sse(resp, on_token) -> tuple[str, dict[str, Any]]:
-        """Parsea el Server-Sent Events de /chat/completions?stream=true.
-
-        A diferencia del JSONL de Ollama, aquí los tool_calls llegan FRAGMENTADOS
-        entre deltas: cada delta trae un trozo de `arguments` y un `index` que dice
-        a qué llamada pertenece. Hay que reensamblarlos por índice.
-        """
-        parts: list[str] = []
-        # index -> {"id": str, "name": str, "args": [fragmentos]}
-        acc: dict[int, dict[str, Any]] = {}
-
-        for raw_line in resp:
-            line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
-            line = line.strip()
-            if not line or not line.startswith("data:"):
-                continue
-            data = line[len("data:"):].strip()
-            if data == "[DONE]":
-                break
-            try:
-                obj = json.loads(data)
-            except json.JSONDecodeError:
-                continue
-
-            choices = obj.get("choices") or []
-            if not choices:
-                continue
-            delta = choices[0].get("delta", {}) or {}
-
-            text = delta.get("content") or ""
-            if text:
-                parts.append(text)
-                if on_token:
-                    on_token(text)
-
-            for call in delta.get("tool_calls") or []:
-                idx = call.get("index", 0)
-                slot = acc.setdefault(idx, {"id": None, "name": "", "args": []})
-                if call.get("id"):
-                    slot["id"] = call["id"]
-                fn = call.get("function", {}) or {}
-                if fn.get("name"):
-                    slot["name"] = fn["name"]
-                if fn.get("arguments"):
-                    slot["args"].append(fn["arguments"])
-
-        message: dict[str, Any] = {"role": "assistant", "content": "".join(parts)}
-        if acc:
-            calls = []
-            for idx in sorted(acc):
-                slot = acc[idx]
-                joined = "".join(slot["args"])
-                try:
-                    args = json.loads(joined) if joined.strip() else {}
-                except json.JSONDecodeError:
-                    args = {}
-                calls.append({
-                    "id": slot["id"],
-                    "function": {"name": slot["name"], "arguments": args},
-                })
-            message["tool_calls"] = calls
-
-        return "".join(parts), message
+    # Alias de compatibilidad: el parseo SSE vive ahora en `crotolamo.core.sse`.
+    _consume_sse = staticmethod(consume_sse)

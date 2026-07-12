@@ -5,54 +5,19 @@ handle_turn(text) -> respuesta final en texto.
 
 from __future__ import annotations
 
-import json
-import re
 from typing import Any, Callable
 
 from crotolamo.core.llm import LLMClient, LLMError
+from crotolamo.core.streaming import LiveStreamer as _LiveStreamer
+from crotolamo.core.tool_parsing import (
+    HARD_ERROR_PREFIXES as _HARD_ERROR_PREFIXES,  # noqa: F401 - re-export (compat)
+    coerce_text_tool_calls as _coerce_text_tool_calls,
+    is_hard_error as _is_hard_error,
+)
 from crotolamo.logging_setup import get_logger
 from crotolamo.core.memory import Conversation
 
 log = get_logger("core.agent")
-
-
-def _coerce_text_tool_calls(content: str, known_names: set[str]) -> list[dict[str, Any]]:
-    """Fallback: algunos modelos (qwen2.5-coder en Ollama) emiten el tool-call
-    como JSON dentro de `content` en vez de en el campo nativo `tool_calls`.
-
-    Parseamos ese texto y, solo si referencia una tool conocida, lo tratamos
-    como llamada. Devuelve [] si el contenido es texto conversacional normal.
-    """
-    if not content or "{" not in content:
-        return []
-
-    # Quitar cercas de código ```json ... ``` si las hay.
-    text = content.strip()
-    fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
-    if fence:
-        text = fence.group(1).strip()
-
-    # Intentar el bloque {...} o [...] más externo.
-    start = min((text.find(c) for c in "{[" if c in text), default=-1)
-    end = max(text.rfind("}"), text.rfind("]"))
-    if start == -1 or end <= start:
-        return []
-
-    try:
-        parsed = json.loads(text[start:end + 1])
-    except json.JSONDecodeError:
-        return []
-
-    candidates = parsed if isinstance(parsed, list) else [parsed]
-    calls: list[dict[str, Any]] = []
-    for item in candidates:
-        if not isinstance(item, dict):
-            continue
-        name = item.get("name") or item.get("tool")
-        args = item.get("arguments", item.get("args", {}))
-        if name in known_names and isinstance(args, dict):
-            calls.append({"name": name, "arguments": args})
-    return calls
 
 
 class Agent:
@@ -80,47 +45,6 @@ class Agent:
         return reply
 
 
-class _LiveStreamer:
-    """Streamea tokens al patrón en vivo, salvo que la respuesta empiece como un
-    tool-call JSON ('{', '[' o cerca de código) — en ese caso retiene, para no
-    filtrar el JSON crudo de los tool-calls que qwen emite en `content`.
-
-    `hold_until_done=True` retiene SIEMPRE. Se usa cuando a esta llamada se le
-    enviaron tools: el modelo puede verbalizar su intención ANTES de pedir la tool
-    ("Voy a pausar la música por ti") y en voz eso se hablaría, seguido del
-    resultado real. Medido contra GLM: en streaming emite ese preámbulo; en
-    no-streaming, `content` viene vacío. Si no se enviaron tools, lo que salga ES
-    la respuesta final y se habla en vivo, que es el objetivo de `stream_speak`.
-    """
-
-    def __init__(self, on_token: Callable[[str], None],
-                 hold_until_done: bool = False) -> None:
-        self._on_token = on_token
-        self._buf: list[str] = []
-        self._decision: str | None = "hold" if hold_until_done else None
-
-    def feed(self, chunk: str) -> None:
-        self._buf.append(chunk)
-        if self._decision == "stream":
-            self._on_token(chunk)
-            return
-        if self._decision == "hold":
-            return
-        head = "".join(self._buf).lstrip()
-        if len(head) < 2:
-            return  # aún no hay suficiente para decidir
-        if head[0] in "{[" or head.startswith("```"):
-            self._decision = "hold"
-        else:
-            self._decision = "stream"
-            self._on_token(head)  # soltamos lo acumulado de golpe y seguimos en vivo
-
-    def flush_if_held(self, final_text: str) -> None:
-        """Si retuvimos pero resultó ser texto final, lo emitimos completo."""
-        if self._decision != "stream":
-            self._on_token(final_text)
-
-
 # Callback de confirmación: recibe el motivo, devuelve True si el patrón acepta.
 ConfirmFn = Callable[[str], bool]
 
@@ -142,25 +66,6 @@ DEFAULT_DIRECT_TOOLS: frozenset[str] = frozenset({
     "music_control",
     "list_processes",
 })
-
-# Prefijos con los que la capa de ejecución (Registry.run) marca un fallo DURO de
-# la tool (excepción no controlada o argumentos inválidos). En esos casos NO se
-# hace short-circuit: dejamos que el modelo reaccione. Los "soft-errors" en
-# personaje de las propias tools ("No pude leer /proc/meminfo, patrón.") SÍ son
-# texto listo para el patrón, así que esos sí se devuelven directos.
-_HARD_ERROR_PREFIXES: tuple[str, ...] = (
-    "La tool '",            # "...reventó, patrón: ..."
-    "Argumentos inválidos para '",
-    "No tengo una tool ",   # nombre desconocido (defensivo; no debería pasar aquí)
-)
-
-
-def _is_hard_error(result: str) -> bool:
-    """True si el resultado de una tool es un fallo duro (no apto para short-circuit)."""
-    if not result or not result.strip():
-        return True
-    return result.lstrip().startswith(_HARD_ERROR_PREFIXES)
-
 
 class ToolAgent(Agent):
     """El loop agéntico: el LLM pide tools, las ejecutamos (bajo guard) y le

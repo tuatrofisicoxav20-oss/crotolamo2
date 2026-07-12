@@ -7,12 +7,9 @@ import json
 import pytest
 
 from crotolamo.core.engine import GLM, OLLAMA, resolve_backend
-from crotolamo.core.glm import (
-    GLMAuthError,
-    GLMClient,
-    _from_openai_message,
-    to_openai_messages,
-)
+from crotolamo.core.glm import GLMAuthError, GLMClient
+from crotolamo.core.openai_adapter import from_openai_message, to_openai_messages
+from crotolamo.core.sse import consume_sse
 
 
 class _FakeSettings:
@@ -138,7 +135,7 @@ def test_respuesta_openai_se_normaliza_a_dict_de_arguments():
             "function": {"name": "music_control", "arguments": '{"action":"pause"}'},
         }],
     }
-    out = _from_openai_message(message)
+    out = from_openai_message(message)
     assert out["content"] == ""
     assert out["tool_calls"][0]["function"]["arguments"] == {"action": "pause"}
 
@@ -146,7 +143,7 @@ def test_respuesta_openai_se_normaliza_a_dict_de_arguments():
 def test_arguments_corruptos_no_revientan():
     message = {"role": "assistant", "content": "",
                "tool_calls": [{"function": {"name": "x", "arguments": "{roto"}}]}
-    assert _from_openai_message(message)["tool_calls"][0]["function"]["arguments"] == {}
+    assert from_openai_message(message)["tool_calls"][0]["function"]["arguments"] == {}
 
 
 def test_roundtrip_historial_sobrevive_al_reinyectado():
@@ -157,7 +154,7 @@ def test_roundtrip_historial_sobrevive_al_reinyectado():
         "tool_calls": [{"id": "call_x", "type": "function",
                         "function": {"name": "ram_usage", "arguments": '{"limit":3}'}}],
     }
-    canonical = _from_openai_message(openai_msg)
+    canonical = from_openai_message(openai_msg)
     back = to_openai_messages([canonical])[0]
     assert back["tool_calls"][0]["function"]["name"] == "ram_usage"
     assert json.loads(back["tool_calls"][0]["function"]["arguments"]) == {"limit": 3}
@@ -178,7 +175,7 @@ def test_sse_acumula_texto_y_llama_on_token():
         {"choices": [{"delta": {"content": "patrón"}}]},
     )
     got: list[str] = []
-    content, msg = GLMClient._consume_sse(iter(stream), got.append)
+    content, msg = consume_sse(iter(stream), got.append)
     assert content == "Hola patrón"
     assert got == ["Hola ", "patrón"]
     assert "tool_calls" not in msg
@@ -192,7 +189,7 @@ def test_sse_reensambla_tool_call_fragmentado():
         {"choices": [{"delta": {"tool_calls": [
             {"index": 0, "function": {"arguments": 'ion":"pause"}'}}]}}]},
     )
-    _, msg = GLMClient._consume_sse(iter(stream), None)
+    _, msg = consume_sse(iter(stream), None)
     call = msg["tool_calls"][0]
     assert call["function"]["name"] == "music_control"
     assert call["function"]["arguments"] == {"action": "pause"}
@@ -205,14 +202,14 @@ def test_sse_varias_tool_calls_se_separan_por_index():
             {"index": 1, "function": {"name": "b", "arguments": "{}"}},
         ]}}]},
     )
-    _, msg = GLMClient._consume_sse(iter(stream), None)
+    _, msg = consume_sse(iter(stream), None)
     assert [c["function"]["name"] for c in msg["tool_calls"]] == ["a", "b"]
 
 
 def test_sse_ignora_lineas_basura_y_done():
     stream = [b"\n", b": comentario\n", b"data: no-json\n",
               b'data: {"choices":[{"delta":{"content":"ok"}}]}\n', b"data: [DONE]\n"]
-    content, _ = GLMClient._consume_sse(iter(stream), None)
+    content, _ = consume_sse(iter(stream), None)
     assert content == "ok"
 
 

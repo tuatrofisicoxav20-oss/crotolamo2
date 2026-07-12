@@ -193,11 +193,6 @@ def route_schemas(
     return schemas
 
 
-def all_schemas(registry) -> list[dict[str, Any]]:
-    """Sin routing: todas las tools (comportamiento previo)."""
-    return registry.schemas()
-
-
 def names_for(text: str, registry=None, max_tools: int = MAX_TOOLS_DEFAULT) -> Iterable[str]:
     """Helper para depurar/inspeccionar qué se enrutaría (usado en tests)."""
     names = select_tool_names(text, max_tools)

@@ -24,6 +24,9 @@ def test_open_app_solo_conocidas():
     assert fastpath.match("abre blender") == ("open_app", {"name": "blender"})
     # algo que no es una app conocida -> None (que lo razone el LLM)
     assert fastpath.match("abre la carpeta de descargas") is None
+    # "terminal" ya no vive en APP_COMMANDS pero open_app la resuelve
+    # vía _detect_terminal: el atajo debe seguir funcionando
+    assert fastpath.match("abre la terminal") == ("open_app", {"name": "terminal"})
 
 
 def test_frases_con_matices_caen_al_llm():

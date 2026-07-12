@@ -40,7 +40,8 @@ class FallbackLLM:
         # de la hora del sistema no deje el breaker abierto para siempre.
         self._retry_at: float = 0.0
 
-    # `model` y `host` los leen el logging y el doctor; delegamos en el primario.
+    # `model` (parte del contrato `LLMEngine`) lo leen el logging y el doctor;
+    # delegamos en el cliente activo en este momento.
     @property
     def model(self) -> str:
         return self.active.model

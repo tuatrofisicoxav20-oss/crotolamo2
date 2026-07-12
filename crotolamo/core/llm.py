@@ -1,18 +1,21 @@
 """Cliente de Ollama con tool-calling. Reescritura de C1::ask_ollama.
 
-Habla /api/chat por HTTP (stdlib, sin dependencias). Soporta el campo `tools`
-para tool-calling nativo de qwen2.5-coder. Los errores se devuelven en personaje.
+Habla /api/chat por HTTP (stdlib, sin dependencias) sobre una conexión
+persistente (`HTTPTransport`, keep-alive). Soporta el campo `tools` para
+tool-calling nativo de qwen2.5-coder. Los errores se devuelven en personaje.
 """
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import time
-import urllib.error
-import urllib.request
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, NoReturn
+
+from crotolamo.core.engine import HTTPTransport
+from crotolamo.core.tool_parsing import parse_arguments
 
 # Instrumentación opcional: con CROTOLAMO_LLM_PROF=1 imprime tiempo y tokens por
 # llamada a /api/chat (prompt_eval_count, eval_count). Útil para diagnosticar el
@@ -41,16 +44,19 @@ def _parse_tool_calls(message: dict[str, Any]) -> list[dict[str, Any]]:
     calls = []
     for call in message.get("tool_calls") or []:
         fn = call.get("function", {})
-        args = fn.get("arguments", {})
         # Ollama suele mandar arguments como dict; algunos modelos lo mandan
         # como string JSON. Normalizamos a dict.
-        if isinstance(args, str):
-            try:
-                args = json.loads(args) if args.strip() else {}
-            except json.JSONDecodeError:
-                args = {}
-        calls.append({"name": fn.get("name", ""), "arguments": args or {}})
+        args = parse_arguments(fn.get("arguments", {}))
+        calls.append({"name": fn.get("name", ""), "arguments": args})
     return calls
+
+
+def _read_body(resp) -> str:
+    """Cuerpo de una respuesta de error, best-effort y acotado."""
+    try:
+        return resp.read().decode("utf-8", "replace")[:300]
+    except Exception:  # noqa: BLE001 - el cuerpo del error es best-effort
+        return ""
 
 
 class LLMClient:
@@ -77,6 +83,8 @@ class LLMClient:
         # sigue caliente los turnos siguientes reusan el cache y son baratos.
         # "15m" balancea rapidez en sesión vs. liberar RAM cuando no se usa.
         self.keep_alive = keep_alive
+        # Conexión HTTP persistente: evita abrir TCP nuevo en cada petición.
+        self._transport = HTTPTransport(self.host, timeout=self.timeout)
 
     @classmethod
     def from_settings(cls, settings) -> "LLMClient":
@@ -96,37 +104,66 @@ class LLMClient:
             options["num_ctx"] = self.num_ctx
         return options
 
-    def chat(
+    def _payload(
         self,
         messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None = None,
-    ) -> ChatResponse:
+        tools: list[dict[str, Any]] | None,
+        stream: bool,
+    ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": self.model,
-            "stream": False,
+            "stream": stream,
             "messages": messages,
             "keep_alive": self.keep_alive,
             "options": self._options(),
         }
         if tools:
             payload["tools"] = tools
+        return payload
 
-        req = urllib.request.Request(
-            f"{self.host}/api/chat",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
+    def _raise_http(self, status: int, body: str) -> NoReturn:
+        """Mapea un status HTTP >= 400 de Ollama a un LLMError útil.
 
-        t0 = time.time() if _PROF else 0.0
+        Antes un 404/500 caía en la rama genérica de "¿Está vivo el servicio?",
+        que despista: el servicio SÍ está vivo, es la petición la que falló.
+        """
+        if status == 404:
+            raise LLMError(
+                f"Ollama respondió 404, patrón. ¿Existe el modelo '{self.model}'? "
+                f"Prueba `ollama pull {self.model}`. {body}".rstrip()
+            )
+        if status >= 500:
+            raise LLMError(
+                f"Ollama tropezó por dentro ({status}), patrón: {body}"
+            )
+        raise LLMError(f"Ollama respondió {status}, patrón: {body}")
+
+    def _send(self, payload: dict[str, Any]) -> http.client.HTTPResponse:
+        """POST a /api/chat con los errores de transporte ya en personaje."""
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                raw = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.URLError as error:
+            resp = self._transport.post_json("/api/chat", payload)
+        except TimeoutError as error:
+            raise LLMError(
+                f"Ollama no respondió a tiempo, patrón. ({error})"
+            ) from error
+        except (http.client.HTTPException, OSError) as error:
             raise LLMError(
                 f"No pude hablar con Ollama en {self.host}, patrón. "
-                f"¿Está vivo el servicio? ({error.reason})"
+                f"¿Está vivo el servicio? ({error})"
             ) from error
+        if resp.status >= 400:
+            self._raise_http(resp.status, _read_body(resp))
+        return resp
+
+    def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> ChatResponse:
+        t0 = time.time() if _PROF else 0.0
+        resp = self._send(self._payload(messages, tools, stream=False))
+        try:
+            raw = json.loads(resp.read().decode("utf-8"))
         except (TimeoutError, OSError) as error:
             raise LLMError(
                 f"Ollama no respondió a tiempo, patrón. ({error})"
@@ -162,30 +199,9 @@ class LLMClient:
         respuesta token-a-token (Fase 6). Funciona mejor con GPU o modelos que usan
         el campo nativo tool_calls.
         """
-        payload: dict[str, Any] = {
-            "model": self.model,
-            "stream": True,
-            "messages": messages,
-            "keep_alive": self.keep_alive,
-            "options": self._options(),
-        }
-        if tools:
-            payload["tools"] = tools
-
-        req = urllib.request.Request(
-            f"{self.host}/api/chat",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-
+        resp = self._send(self._payload(messages, tools, stream=True))
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                content, last_message = self._consume_stream(resp, on_token)
-        except urllib.error.URLError as error:
-            raise LLMError(
-                f"No pude hablar con Ollama en {self.host}, patrón. ({error.reason})"
-            ) from error
+            content, last_message = self._consume_stream(resp, on_token)
         except (TimeoutError, OSError) as error:
             raise LLMError(f"Ollama no respondió a tiempo, patrón. ({error})") from error
 
