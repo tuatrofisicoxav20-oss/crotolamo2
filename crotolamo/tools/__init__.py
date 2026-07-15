@@ -9,9 +9,11 @@ def default_registry() -> Registry:
     """Importa los módulos de tools (lo que las registra) y devuelve el registry."""
     # Los imports tienen efecto colateral: cada @tool se registra al importarse.
     from crotolamo.tools import (  # noqa: F401
+        cameras,
         desktop,
         facts,
         files,
+        home,
         media,
         projects,
         search,

@@ -102,3 +102,32 @@ def test_que_dice_internet_enruta_a_web_con_lectura():
 def test_leeme_la_pagina_enruta_a_read_page():
     names = select_tool_names("léeme la página de fedora magazine")
     assert "read_page" in names
+
+
+# --- Domótica y cámaras: sin grupo en el routing, el LLM jamás vería las
+# tools nuevas con tool_routing=true (el default de la config).
+
+def test_prender_luz_enruta_a_home():
+    names = select_tool_names("préndeme la luz de la xbox")
+    assert "light_control" in names
+
+
+def test_apagar_foco_enruta_a_home():
+    names = select_tool_names("apaga el foco de la sala")
+    assert "light_control" in names
+
+
+def test_estado_de_la_luz_enruta_a_home_state():
+    names = select_tool_names("¿está prendida la luz de la xbox?")
+    assert "home_state" in names
+
+
+def test_camaras_enrutan_a_cameras():
+    names = select_tool_names("¿qué vieron las cámaras hoy?")
+    assert "camera_events" in names
+    assert "camera_snapshot" in names
+
+
+def test_alguien_paso_enruta_a_cameras():
+    names = select_tool_names("¿alguien pasó por la entrada?")
+    assert "camera_events" in names

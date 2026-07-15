@@ -121,6 +121,7 @@ por git) con solo las claves que quieras cambiar.
 - [x] **Fase 4** — memoria persistente (SQLite)
 - [x] **Fase 5** — voz: implementada y verificada por **smoke test circular** (`scripts/smoke_voz.py`: TTS→STT sin micrófono); falta validación de campo con micrófono real.
 - [x] **Fase 6** — extensiones: streaming token-a-token, TTS por frases, memoria fuzzy, búsqueda en proyectos, hotkeys
+- [x] **Domótica + cámaras** — tools de Home Assistant (`light_control`, `home_state`) y Frigate (`camera_events`, `camera_snapshot`), REST con urllib puro; probadas con tests que parchean la red (sin HA/Frigate reales). **Falta validar contra el hardware real**: rellenar `[home.lights]` y `[cameras.names]` en la config y exportar `CROTOLAMO_HASS_TOKEN`.
 
 ### Notas de voz (honestas)
 - El **wake word** usa Whisper `tiny` (barato) y el **comando** usa `base`; ambos en CPU.

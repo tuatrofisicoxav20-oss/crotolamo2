@@ -115,6 +115,23 @@ GROUPS: dict[str, dict[str, Any]] = {
             "shortcut", "acceso directo",
         ],
     },
+    "home": {
+        "tools": ["light_control", "home_state"],
+        "keywords": [
+            "luz", "luces", "foco", "focos", "lampara", "prende", "prendeme",
+            "prendida", "apaga", "apagame", "apagada", "enciende", "encendida",
+            "ilumina", "brillo", "domotica", "home assistant", "casa inteligente",
+        ],
+    },
+    "cameras": {
+        "tools": ["camera_events", "camera_snapshot"],
+        "keywords": [
+            "camara", "camaras", "frigate", "vigilancia", "movimiento",
+            "quien paso", "alguien paso", "alguien entro", "quien anduvo",
+            "detectaron", "detecto", "snapshot", "que vieron", "eventos de",
+            "foto de la entrada", "algo raro afuera",
+        ],
+    },
     "search": {
         # search_web abre pestaña; fetch_web_results/read_page LEEN el contenido
         # para poder respondérselo al patrón por voz.

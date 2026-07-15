@@ -219,6 +219,26 @@ stream_speak = true
 wake_silence_ms  = 400
 wake_max_seconds = 8.0
 
+# Domótica vía Home Assistant (tools light_control / home_state).
+[home]
+# URL de tu Home Assistant en la red local. El token de acceso de larga duración
+# va en el entorno (CROTOLAMO_HASS_TOKEN), NUNCA aquí (este archivo va a git).
+base_url = "http://homeassistant.local:8123"
+
+[home.lights]
+# nombre amigable = entity_id real de Home Assistant. RELLENA con los tuyos.
+xbox = "light.xbox_led"   # RELLENA
+
+# Cámaras vía Frigate (tools camera_events / camera_snapshot).
+[cameras]
+# URL de tu Frigate en la red local. Frigate no pide token.
+base_url = "http://frigate.local:5000"
+
+[cameras.names]
+# alias amigable = nombre de la cámara en Frigate. RELLENA (o deja vacío para
+# usar los nombres tal cual los tiene Frigate).
+entrada = "front_door"   # RELLENA
+
 [wake]
 target    = "crotolamo"
 # Subido de 0.67 a 0.72: el wake difuso (Whisper) daba falsos positivos ("romano"
