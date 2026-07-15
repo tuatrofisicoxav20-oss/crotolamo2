@@ -251,3 +251,115 @@ def test_ollama_conexion_rechazada_pregunta_si_esta_vivo():
     client = _ollama([ConnectionRefusedError("refused")])
     with pytest.raises(LLMError, match="vivo el servicio"):
         client.chat(MSGS)
+
+
+# --- HTTPTransport bajo concurrencia (T1): conexión por hilo ---
+# En el modo de voz concurrente, WarmLLM y BrainThread pueden llamar chat()
+# sobre el MISMO cliente a la vez. Con un socket compartido eso corrompe el
+# estado (CannotSendRequest, respuestas cruzadas); con conexión thread-local,
+# cada hilo tiene su keep-alive propio y no hay contención.
+
+def test_transport_es_seguro_entre_hilos(monkeypatch):
+    import threading
+
+    t = HTTPTransport("http://localhost:11434", timeout=5)
+    creadas: list[_FakeConn] = []
+    fabrica_lock = threading.Lock()
+
+    def fabrica():
+        with fabrica_lock:
+            conn = _FakeConn([_Resp(body=f"conn-{len(creadas)}".encode())])
+            creadas.append(conn)
+        return conn
+
+    monkeypatch.setattr(t, "_connect", fabrica)
+
+    n = 8
+    barrera = threading.Barrier(n)
+    cuerpos: list[bytes | None] = [None] * n
+    errores: list[Exception] = []
+
+    def worker(i: int) -> None:
+        try:
+            barrera.wait(timeout=10)  # maximizar el solape: todos a la vez
+            resp = t.post_json("/api/chat", {"hilo": i})
+            cuerpos[i] = resp.read()
+        except Exception as error:  # noqa: BLE001 — el assert de abajo lo reporta
+            errores.append(error)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(timeout=10)
+
+    assert errores == []
+    # Cada hilo recibió UNA respuesta completa y distinta (nada cruzado).
+    assert sorted(cuerpos) == sorted(f"conn-{i}".encode() for i in range(n))
+    # Cada conexión atendió exactamente una petición: nadie compartió socket.
+    assert len(creadas) == n
+    assert all(len(conn.requests) == 1 for conn in creadas)
+
+
+def test_transport_close_solo_afecta_al_hilo_actual(monkeypatch):
+    """close() en un hilo no debe tirar la conexión keep-alive de otro."""
+    import threading
+
+    t = HTTPTransport("http://localhost:11434", timeout=5)
+    conns = []
+
+    def fabrica():
+        conn = _FakeConn([_Resp(body=b"{}"), _Resp(body=b"{}")])
+        conns.append(conn)
+        return conn
+
+    monkeypatch.setattr(t, "_connect", fabrica)
+
+    t.post_json("/api/chat", {}).read()  # hilo principal: abre y drena
+
+    def otro_hilo():
+        t.post_json("/api/chat", {}).read()
+        t.close()  # cierra SU conexión, no la del principal
+
+    th = threading.Thread(target=otro_hilo)
+    th.start()
+    th.join(timeout=10)
+
+    assert len(conns) == 2
+    assert conns[1].cerrada          # la del hilo secundario se cerró
+    assert not conns[0].cerrada      # la del principal sigue viva
+    t.post_json("/api/chat", {})     # y se reutiliza sin reconectar
+    assert len(conns) == 2
+
+
+# --- build_primary_llm: el warm-up no comparte socket ni breaker con el loop ---
+
+def test_build_primary_llm_no_envuelve_en_fallback(monkeypatch):
+    from crotolamo.core.engine import build_llm, build_primary_llm
+    from crotolamo.core.fallback import FallbackLLM
+    from crotolamo.settings import get_settings
+
+    monkeypatch.setenv("CROTOLAMO_GLM_API_KEY", "secreta")
+    monkeypatch.setenv("CROTOLAMO_LLM_BACKEND", "glm")
+    settings = get_settings()
+
+    warm = build_primary_llm(settings)
+    loop_llm = build_llm(settings)
+
+    assert not isinstance(warm, FallbackLLM)   # sin breaker que envenenar
+    assert isinstance(loop_llm, FallbackLLM)
+    # Instancia y transporte PROPIOS: calentar no toca el socket del loop.
+    assert warm is not loop_llm.primary
+    assert warm._transport is not loop_llm.primary._transport
+
+
+def test_build_primary_llm_cae_a_ollama_sin_key(monkeypatch):
+    from crotolamo.core.engine import build_primary_llm
+    from crotolamo.core.llm import LLMClient
+    from crotolamo.settings import get_settings
+
+    for env in ("CROTOLAMO_GLM_API_KEY", "ZAI_API_KEY", "ZHIPU_API_KEY"):
+        monkeypatch.delenv(env, raising=False)
+    monkeypatch.setenv("CROTOLAMO_LLM_BACKEND", "glm")
+
+    assert isinstance(build_primary_llm(get_settings()), LLMClient)

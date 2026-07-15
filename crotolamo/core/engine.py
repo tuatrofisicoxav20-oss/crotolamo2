@@ -17,6 +17,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import threading
 import urllib.parse
 from typing import TYPE_CHECKING, Any, Callable, Protocol
 
@@ -75,6 +76,14 @@ class HTTPTransport:
       la conexión sucia y abre una nueva.
     - Timeouts (de conexión y de lectura, vía el timeout del socket).
 
+    SEGURO ENTRE HILOS vía conexión POR HILO (threading.local): en el modo de
+    voz concurrente, WarmLLM y BrainThread pueden llamar chat() sobre el mismo
+    cliente —y por tanto este transport— a la vez; con un socket único eso lo
+    corrompía (CannotSendRequest, respuestas cruzadas). Cada hilo tiene ahora
+    su propio keep-alive, sin locks ni contención. close() cierra SOLO la
+    conexión del hilo que lo llama (nadie necesita hoy un cierre global; los
+    sockets de hilos muertos los recoge el GC).
+
     Stdlib puro, igual que el resto del proyecto: cero dependencias.
     """
 
@@ -87,8 +96,25 @@ class HTTPTransport:
         self._port = parts.port  # None = puerto por defecto del esquema
         self.base_path = parts.path.rstrip("/")
         self.timeout = timeout
-        self._conn: http.client.HTTPConnection | None = None
-        self._last: http.client.HTTPResponse | None = None
+        # Estado por hilo: .conn (la conexión keep-alive) y .last (la última
+        # respuesta, para detectar streams a medias). Ver docstring.
+        self._local = threading.local()
+
+    @property
+    def _conn(self) -> http.client.HTTPConnection | None:
+        return getattr(self._local, "conn", None)
+
+    @_conn.setter
+    def _conn(self, value: http.client.HTTPConnection | None) -> None:
+        self._local.conn = value
+
+    @property
+    def _last(self) -> http.client.HTTPResponse | None:
+        return getattr(self._local, "last", None)
+
+    @_last.setter
+    def _last(self, value: http.client.HTTPResponse | None) -> None:
+        self._local.last = value
 
     def _connect(self) -> http.client.HTTPConnection:
         if self._https:
@@ -154,6 +180,26 @@ def resolve_backend(settings) -> str:
         log.warning("backend '%s' desconocido; uso '%s'", backend, OLLAMA)
         return OLLAMA
     return backend
+
+
+def build_primary_llm(settings):
+    """Cliente primario SIN envolver en FallbackLLM, con transport propio.
+
+    Para usos auxiliares (hoy: el warm-up del listener) que no deben compartir
+    ni el socket ni el circuit breaker del cliente del loop: un fallo del
+    warm-up sobre el FallbackLLM compartido abriría el breaker 60s y degradaría
+    el primer comando real al modelo local sin motivo.
+    """
+    backend = resolve_backend(settings)
+    if backend == GLM:
+        from crotolamo.core.glm import GLMClient, _find_api_key
+
+        if _find_api_key() is not None:
+            return GLMClient.from_settings(settings)
+
+    from crotolamo.core.llm import LLMClient
+
+    return LLMClient.from_settings(settings)
 
 
 def build_llm(settings):

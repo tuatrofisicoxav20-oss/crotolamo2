@@ -41,3 +41,36 @@ def test_detect_remember_variants():
 def test_detect_remember_ignores_normal_text():
     assert facts.detect_remember("abre youtube") is None
     assert facts.detect_remember("¿qué hora es?") is None
+
+
+# --- T5: schema una sola vez por ruta + WAL + busy_timeout ---
+
+def test_schema_solo_se_ejecuta_una_vez_por_ruta(tmp_path, monkeypatch):
+    """Tras la primera operación, connect() no re-ejecuta el CREATE TABLE:
+    se sabotea _SCHEMA y la segunda operación debe seguir funcionando. Una
+    ruta NUEVA sí lo ejecuta (y revienta con el schema saboteado)."""
+    import sqlite3
+
+    import pytest
+
+    from crotolamo.persistence import db
+
+    dbp = tmp_path / "memoria.sqlite"
+    db.add_fact("uno", db_path=dbp)
+    monkeypatch.setattr(db, "_SCHEMA", "ESTO NO ES SQL;")
+    db.add_fact("dos", db_path=dbp)  # no revienta: el schema ya no se re-corre
+    assert len(db.get_facts(db_path=dbp)) == 2
+
+    otra = tmp_path / "otra.sqlite"
+    with pytest.raises(sqlite3.OperationalError):
+        db.add_fact("tres", db_path=otra)  # ruta nueva SÍ ejecuta el schema
+
+
+def test_wal_y_busy_timeout_activos(tmp_path):
+    """WAL deja leer mientras se escribe; busy_timeout espera en vez de
+    reventar con 'database is locked' (shell + listener sobre el mismo fichero)."""
+    from crotolamo.persistence import db
+
+    with db.connect(tmp_path / "wal.sqlite") as conn:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 3000

@@ -27,6 +27,16 @@ class LLMError(RuntimeError):
     """Error hablando con Ollama, ya con mensaje en personaje."""
 
 
+class TransientLLMError(LLMError):
+    """Fallo de DISPONIBILIDAD del motor: timeout, conexión caída, 5xx, 429.
+
+    Es lo único que debe abrir el circuit breaker de FallbackLLM. Los errores
+    permanentes o de cliente (400 por payload roto, 404 de modelo inexistente,
+    auth rechazada, basura no-JSON) siguen siendo LLMError/GLMAuthError:
+    degradar 60s al modelo local por un bug de formato solo esconde el bug.
+    """
+
+
 @dataclass
 class ChatResponse:
     content: str = ""
@@ -128,12 +138,13 @@ class LLMClient:
         que despista: el servicio SÍ está vivo, es la petición la que falló.
         """
         if status == 404:
+            # Permanente: el modelo no existe; reintentar no lo instala.
             raise LLMError(
                 f"Ollama respondió 404, patrón. ¿Existe el modelo '{self.model}'? "
                 f"Prueba `ollama pull {self.model}`. {body}".rstrip()
             )
         if status >= 500:
-            raise LLMError(
+            raise TransientLLMError(
                 f"Ollama tropezó por dentro ({status}), patrón: {body}"
             )
         raise LLMError(f"Ollama respondió {status}, patrón: {body}")
@@ -143,11 +154,11 @@ class LLMClient:
         try:
             resp = self._transport.post_json("/api/chat", payload)
         except TimeoutError as error:
-            raise LLMError(
+            raise TransientLLMError(
                 f"Ollama no respondió a tiempo, patrón. ({error})"
             ) from error
         except (http.client.HTTPException, OSError) as error:
-            raise LLMError(
+            raise TransientLLMError(
                 f"No pude hablar con Ollama en {self.host}, patrón. "
                 f"¿Está vivo el servicio? ({error})"
             ) from error
@@ -165,7 +176,7 @@ class LLMClient:
         try:
             raw = json.loads(resp.read().decode("utf-8"))
         except (TimeoutError, OSError) as error:
-            raise LLMError(
+            raise TransientLLMError(
                 f"Ollama no respondió a tiempo, patrón. ({error})"
             ) from error
         except json.JSONDecodeError as error:
@@ -203,7 +214,8 @@ class LLMClient:
         try:
             content, last_message = self._consume_stream(resp, on_token)
         except (TimeoutError, OSError) as error:
-            raise LLMError(f"Ollama no respondió a tiempo, patrón. ({error})") from error
+            raise TransientLLMError(
+                f"Ollama no respondió a tiempo, patrón. ({error})") from error
 
         return ChatResponse(
             content=content.strip(),

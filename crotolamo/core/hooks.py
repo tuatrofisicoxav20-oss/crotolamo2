@@ -53,36 +53,53 @@ def meta_preamble_cleaner(reply: str) -> str:
     return cleaned if cleaned else reply
 
 
-def strip_leaked_tool_json(reply: str) -> str:
-    """Post-hook: evita que un tool-call JSON CRUDO se filtre como respuesta final.
-
-    El 3B a veces, en la 2ª llamada, en vez de redactar intenta re-llamar una tool
-    y emite algo como `{"name": "...", "parameters": {}}` que se cuela tal cual al
-    patrón. Detectamos esa forma (JSON con clave 'name' y 'parameters'/'arguments',
-    o lista de esos) y la sustituimos por un mensaje en personaje, en vez de
-    mostrar basura. Conservador: SOLO dispara si TODA la respuesta es ese JSON; el
-    texto normal (aunque mencione llaves) no se toca.
-    """
-    if not reply:
-        return reply
-    stripped = reply.strip()
-    if not (stripped.startswith("{") or stripped.startswith("[")):
-        return reply
+def _es_tool_call_json(text: str) -> bool:
+    """True si `text` completo parsea como un tool-call JSON (o lista de ellos)."""
     try:
-        parsed = json.loads(stripped)
+        parsed = json.loads(text)
     except (json.JSONDecodeError, ValueError):
-        return reply  # no es JSON puro: es texto normal, no lo tocamos
-
+        return False
     items = parsed if isinstance(parsed, list) else [parsed]
-    looks_like_tool_call = any(
+    return bool(items) and any(
         isinstance(it, dict)
         and ("name" in it or "tool" in it)
         and ("parameters" in it or "arguments" in it or "args" in it)
         for it in items
     )
-    if looks_like_tool_call:
+
+
+# Inicio de línea que abre un posible bloque JSON al FINAL de la respuesta.
+_JSON_BLOCK_START = re.compile(r"^[ \t]*[\[{]", re.MULTILINE)
+
+
+def strip_leaked_tool_json(reply: str) -> str:
+    """Post-hook: evita que un tool-call JSON CRUDO se filtre como respuesta final.
+
+    El 3B a veces, en la 2ª llamada, en vez de redactar intenta re-llamar una tool
+    y emite algo como `{"name": "...", "parameters": {}}` que se cuela tal cual al
+    patrón — a veces solo, a veces DESPUÉS de una frase de prosa. Dos casos:
+
+    - Respuesta 100% JSON de tool-call: se sustituye por un mensaje en personaje.
+    - Prosa + bloque JSON de tool-call al final: se conserva la prosa y se tira
+      el bloque.
+
+    Conservador contra falsos positivos: el bloque final debe (a) empezar una
+    línea, (b) parsear como JSON VÁLIDO completo hasta el final y (c) tener la
+    forma de tool-call (name/tool + parameters/arguments/args). Texto con llaves
+    sueltas o JSON de datos legítimo no se toca.
+    """
+    if not reply:
+        return reply
+    stripped = reply.strip()
+    if _es_tool_call_json(stripped):
         return ("Lo tengo, patrón, pero se me trabó la lengua al redactarlo. "
                 "Pregúntamelo otra vez y te lo digo derecho.")
+    # Bloque de tool-call al final tras prosa: probar cada inicio de línea con
+    # { o [ y quedarnos con el primero cuyo resto sea un tool-call completo.
+    for m in _JSON_BLOCK_START.finditer(stripped):
+        prosa = stripped[:m.start()].strip()
+        if prosa and _es_tool_call_json(stripped[m.start():]):
+            return prosa
     return reply
 
 

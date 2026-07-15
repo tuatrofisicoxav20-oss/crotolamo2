@@ -7,6 +7,7 @@ el contexto del modelo.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from typing import Any
 
@@ -34,6 +35,13 @@ class Conversation:
 
     M5 (de GLaDOS): con compaction=True y un summarizer, los turnos viejos no se
     tiran en seco; se RESUMEN en un mensaje anclado tras el system prompt.
+
+    SEGURO ENTRE HILOS: todas las operaciones toman un RLock interno. Hoy en voz
+    solo BrainThread la muta, pero ese invariante no estaba escrito ni defendido;
+    si mañana un segundo consumidor (HUD, log, un panel) lee el historial mientras
+    se escribe, sin lock sería un "list changed size during iteration" aleatorio.
+    Es RLock (reentrante) porque los add_* llaman a _trim por dentro. El overhead
+    con un solo hilo es despreciable.
     """
 
     def __init__(self, system_prompt: str, max_turns: int = 20,
@@ -44,56 +52,66 @@ class Conversation:
         self.compaction = compaction
         self.summarizer = summarizer  # Callable[[str], str] | None
         self._summary: Message | None = None
+        self._lock = threading.RLock()
 
     # --- escritura ---
     def add_user(self, text: str) -> None:
-        self._history.append(Message("user", text))
-        self._trim()
+        with self._lock:
+            self._history.append(Message("user", text))
+            self._trim()
 
     def add_assistant(self, text: str, tool_calls: list[dict[str, Any]] | None = None) -> None:
-        self._history.append(Message("assistant", text, tool_calls=tool_calls))
-        self._trim()  # M5: compactar también tras assistant/tool (arregla m2 del audit)
+        with self._lock:
+            self._history.append(Message("assistant", text, tool_calls=tool_calls))
+            self._trim()  # M5: compactar también tras assistant/tool (arregla m2 del audit)
 
     def add_tool_result(self, name: str, content: str) -> None:
-        self._history.append(Message("tool", content, name=name))
-        self._trim()
+        with self._lock:
+            self._history.append(Message("tool", content, name=name))
+            self._trim()
 
     def set_system(self, text: str) -> None:
-        self._system = Message("system", text)
+        with self._lock:
+            self._system = Message("system", text)
 
     def reset(self) -> None:
-        self._history.clear()
-        self._summary = None
+        with self._lock:
+            self._history.clear()
+            self._summary = None
 
     # --- lectura ---
     def to_messages(self) -> list[dict[str, Any]]:
         """Payload para el LLM: [system, (resumen?), ...historial]."""
-        msgs = [self._system.to_dict()]
-        if self._summary is not None:
-            msgs.append(self._summary.to_dict())
-        return msgs + [m.to_dict() for m in self._history]
+        with self._lock:
+            msgs = [self._system.to_dict()]
+            if self._summary is not None:
+                msgs.append(self._summary.to_dict())
+            return msgs + [m.to_dict() for m in self._history]
 
     @property
     def history(self) -> list[Message]:
-        return list(self._history)
+        with self._lock:
+            return list(self._history)
 
     def _trim(self) -> None:
         """Recorta a max_turns turnos de usuario, preservando bloques completos.
 
         Con compaction activa, el bloque viejo se RESUME en vez de descartarse.
+        Siempre se llama con el lock ya tomado (desde los add_*; RLock).
         """
-        user_count = sum(1 for m in self._history if m.role == "user")
-        while user_count > self.max_turns and self._history:
-            block = [self._history.pop(0)]
-            if block[0].role == "user":
-                user_count -= 1
-            # Arrastramos su respuesta/tools encadenados hasta el próximo user.
-            while self._history and self._history[0].role in {"assistant", "tool"}:
-                block.append(self._history.pop(0))
+        with self._lock:
+            user_count = sum(1 for m in self._history if m.role == "user")
+            while user_count > self.max_turns and self._history:
+                block = [self._history.pop(0)]
+                if block[0].role == "user":
+                    user_count -= 1
+                # Arrastramos su respuesta/tools encadenados hasta el próximo user.
+                while self._history and self._history[0].role in {"assistant", "tool"}:
+                    block.append(self._history.pop(0))
 
-            if self.compaction and self.summarizer is not None:
-                self._absorb_into_summary(block)
-            # Sin compaction: el bloque simplemente se descarta (comportamiento viejo).
+                if self.compaction and self.summarizer is not None:
+                    self._absorb_into_summary(block)
+                # Sin compaction: el bloque simplemente se descarta (comportamiento viejo).
 
     def _absorb_into_summary(self, block: list["Message"]) -> None:
         """Funde un bloque de mensajes viejos en el resumen anclado (M5)."""

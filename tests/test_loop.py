@@ -384,3 +384,60 @@ def test_barge_in_grace_ignores_early_voice():
     finally:
         shutdown.set()
         ear.join(timeout=2.0)
+
+
+# --- B6 (M3.8): las TRES capas de mitigación de eco, fijadas contra regresión ---
+# Si se tunean los números (gracia/margen/persistencia), este test define el
+# comportamiento CONJUNTO esperado de _is_patron_voice.
+
+def _ear_para_eco(min_chunks=3, grace_ms=400, margin=0.1):
+    """EarThread sin arrancar, con vad_fn que interpreta el chunk como su prob."""
+    ear = EarThread(
+        FakeMic([]), wake_fn=lambda c: False, vad_fn=lambda c: float(c),
+        to_wav=lambda f: _NO_WAV, tts=FakeTts(),
+        stt_queue=queue.Queue(), tts_queue=queue.Queue(),
+        state=SharedState(), shutdown=threading.Event(),
+        allow_barge_in=True, barge_in_grace_ms=grace_ms,
+        barge_in_threshold_margin=margin, barge_in_min_chunks=min_chunks,
+    )
+    return ear
+
+
+def test_m38_tres_capas_de_mitigacion_de_eco(monkeypatch):
+    reloj = {"t": 100.0}
+    monkeypatch.setattr("crotolamo.voice.threads.time.monotonic", lambda: reloj["t"])
+    ear = _ear_para_eco(min_chunks=3, grace_ms=400, margin=0.1)
+    ear._speaking_since = 100.0  # el TTS acaba de arrancar
+
+    # Capa 1 (gracia): dentro de los 400ms ni voz clarísima cuenta.
+    for _ in range(10):
+        assert ear._is_patron_voice(0.95, Mode.SPEAKING) is False
+
+    reloj["t"] += 0.5  # pasó la gracia
+
+    # Capa 2 (margen): 0.85 pasa el umbral base (0.8) pero NO el elevado
+    # de SPEAKING (0.8 + 0.1): el eco inflado no dispara.
+    for _ in range(10):
+        assert ear._is_patron_voice(0.85, Mode.SPEAKING) is False
+
+    # Capa 3 (persistencia): voz real sostenida; 2 chunks no bastan, el 3º sí.
+    assert ear._is_patron_voice(0.95, Mode.SPEAKING) is False
+    assert ear._is_patron_voice(0.95, Mode.SPEAKING) is False
+    assert ear._is_patron_voice(0.95, Mode.SPEAKING) is True
+
+    # Un pico suelto con silencio en medio NO acumula: la racha se reinicia.
+    assert ear._is_patron_voice(0.95, Mode.SPEAKING) is False
+    assert ear._is_patron_voice(0.0, Mode.SPEAKING) is False   # rompe la racha
+    assert ear._is_patron_voice(0.95, Mode.SPEAKING) is False  # racha vuelve a 1
+
+
+def test_m38_en_thinking_no_aplica_margen_ni_gracia(monkeypatch):
+    """El margen y la gracia son anti-eco del TTS: solo aplican en SPEAKING.
+    En THINKING (sin audio saliendo) la voz del patrón entra con el umbral base."""
+    reloj = {"t": 100.0}
+    monkeypatch.setattr("crotolamo.voice.threads.time.monotonic", lambda: reloj["t"])
+    ear = _ear_para_eco(min_chunks=2, grace_ms=400, margin=0.1)
+    ear._speaking_since = 100.0  # irrelevante en THINKING
+
+    assert ear._is_patron_voice(0.85, Mode.THINKING) is False  # racha 1/2
+    assert ear._is_patron_voice(0.85, Mode.THINKING) is True   # 2/2: dispara

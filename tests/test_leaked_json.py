@@ -44,3 +44,36 @@ def test_plain_json_data_not_a_tool_call_untouched():
 
 def test_empty_passthrough():
     assert strip_leaked_tool_json("") == ""
+
+
+# --- B4: JSON de tool-call FILTRADO AL FINAL tras prosa (no solo respuesta 100% JSON) ---
+
+def test_prosa_con_tool_call_json_al_final_se_limpia():
+    reply = ('Órale, déjame checar eso.\n\n'
+             '{"name": "ram_usage", "parameters": {}}')
+    out = strip_leaked_tool_json(reply)
+    assert '"name"' not in out
+    assert "Órale, déjame checar eso." in out
+
+
+def test_prosa_con_lista_de_tool_calls_al_final_se_limpia():
+    reply = ('Va, te lo abro.\n'
+             '[{"tool": "open_app", "args": {"app": "opera"}}]')
+    out = strip_leaked_tool_json(reply)
+    assert '"tool"' not in out
+    assert "Va, te lo abro." in out
+
+
+def test_prosa_con_json_que_no_es_tool_call_no_se_toca():
+    reply = 'La config quedó así:\n{"tema": "verde", "tam": 12}'
+    assert strip_leaked_tool_json(reply) == reply
+
+
+def test_prosa_con_llaves_sueltas_no_se_toca():
+    reply = "En Python los dict usan {llaves}, patrón. No es tan {complicado}."
+    assert strip_leaked_tool_json(reply) == reply
+
+
+def test_json_al_final_invalido_no_se_toca():
+    reply = 'Te explico:\n{"name": "roto", sin cerrar'
+    assert strip_leaked_tool_json(reply) == reply

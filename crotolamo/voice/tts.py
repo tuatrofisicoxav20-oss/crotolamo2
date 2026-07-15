@@ -26,13 +26,62 @@ from crotolamo.logging_setup import get_logger
 log = get_logger("voice.tts")
 
 
+# --- Segmentación unificada (split_sentences y StreamSpeaker) ---
+# Un punto NO siempre cierra frase: "40. 5 GB" (decimal partido por espacio) y
+# "Dr. López" (abreviatura) deben hablarse de corrido; cortarlos suena a dos
+# frases truncadas en el TTS. No se busca un segmentador perfecto: solo no
+# romper los casos frecuentes del español MX.
+
+_CANDIDATO = re.compile(r"(?<=[.!?¿¡\n])\s+")
+# Abreviaturas cortas comunes en las respuestas ("no" se trata aparte: como
+# adverbio SÍ cierra frase; solo bloquea el corte si sigue un número: "No. 5").
+_ABREVIATURAS = {"sr", "sra", "srta", "dr", "dra", "etc", "ej", "p.ej", "vs", "av"}
+_PALABRA_ANTES = re.compile(r"([a-záéíóúüñ]+(?:\.[a-záéíóúüñ]+)*)\.$", re.IGNORECASE)
+
+
+def _cierra_frase(text: str, start: int, end: int) -> bool:
+    """True si el candidato (los espacios en text[start:end]) es fin de frase real."""
+    if text[start - 1] != ".":
+        return True  # ! ? ¡ ¿ y salto de línea cortan siempre
+    despues = text[end] if end < len(text) else ""
+    antes = text[:start]
+    if len(antes) >= 2 and antes[-2].isdigit() and despues.isdigit():
+        return False  # decimal partido: "40. 5"
+    m = _PALABRA_ANTES.search(antes)
+    if m:
+        palabra = m.group(1).lower()
+        if palabra in _ABREVIATURAS:
+            return False
+        if palabra == "no" and despues.isdigit():
+            return False  # "No. 5" como número
+    return True
+
+
+def _split(text: str, *, final: bool) -> tuple[list[str], str]:
+    """Divide en (frases_cerradas, resto).
+
+    Con final=False (streaming) un '.' seguido solo de espacios al final del
+    buffer se queda en el resto: sin ver el siguiente carácter no se puede
+    distinguir un fin de frase de un decimal/abreviatura a medias.
+    """
+    pieces: list[str] = []
+    start = 0
+    for m in _CANDIDATO.finditer(text):
+        if m.end() >= len(text) and not final and text[m.start() - 1] == ".":
+            break  # falta contexto: esperar más tokens
+        if not _cierra_frase(text, m.start(), m.end()):
+            continue
+        pieces.append(text[start:m.start()])
+        start = m.end()
+    return [p.strip() for p in pieces if p.strip()], text[start:]
+
+
 def split_sentences(text: str) -> list[str]:
     """Parte el texto en frases para hablarlas una por una (Fase 6, TTS por frases)."""
-    text = text.strip()
-    if not text:
-        return []
-    pieces = re.split(r"(?<=[.!?¿¡\n])\s+", text)
-    return [p.strip() for p in pieces if p.strip()]
+    pieces, resto = _split(text.strip(), final=True)
+    if resto.strip():
+        pieces.append(resto.strip())
+    return pieces
 
 
 class TTS:
@@ -171,8 +220,6 @@ class StreamSpeaker:
         if not spoke: tts.speak_sentences(reply)  # fallback (p.ej. error del LLM)
     """
 
-    _BOUNDARY = re.compile(r"(?<=[.!?\n])\s+")
-
     def __init__(self, tts: TTS, on_first=None) -> None:
         self.tts = tts
         self._on_first = on_first
@@ -202,14 +249,16 @@ class StreamSpeaker:
                 log.warning("StreamSpeaker: %s", error)
 
     def feed(self, token: str) -> None:
-        """on_token del agente: acumula y encola las frases ya cerradas."""
+        """on_token del agente: acumula y encola las frases ya cerradas.
+
+        Usa la MISMA segmentación que split_sentences (_split): en streaming
+        solo se decide con lo que hay, así que un '.' al final del buffer se
+        retiene hasta ver el siguiente carácter (¿decimal? ¿abreviatura?).
+        """
         self._buffer += token
-        parts = self._BOUNDARY.split(self._buffer)
-        if len(parts) > 1:
-            for part in parts[:-1]:
-                if part.strip():
-                    self._q.put(part.strip())
-            self._buffer = parts[-1]
+        pieces, self._buffer = _split(self._buffer, final=False)
+        for piece in pieces:
+            self._q.put(piece)
 
     def finish(self, timeout_s: float = 120.0) -> bool:
         """Habla lo que quede en el buffer, espera la cola y devuelve si habló."""

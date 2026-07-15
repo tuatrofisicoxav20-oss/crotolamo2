@@ -90,3 +90,50 @@ def test_no_compaction_drops_as_before():
         conv.add_user(f"u{i}")
         conv.add_assistant(f"a{i}")
     assert not any("resumen" in m["content"].lower() for m in conv.to_messages())
+
+
+# --- T7: Conversation debe aguantar hilos (BrainThread + cualquier lector) ---
+
+def test_conversation_soporta_escritores_concurrentes():
+    """Dos hilos añadiendo y uno leyendo a la vez: nada de 'list changed size
+    during iteration' y el conteo final consistente. El objetivo es 'no
+    corrompe', no un orden determinista."""
+    import threading
+
+    from crotolamo.core.memory import Conversation
+
+    conv = Conversation("SYS", max_turns=10_000)
+    n = 200
+    barrera = threading.Barrier(3)
+    errores: list[Exception] = []
+
+    def escritor(prefijo: str) -> None:
+        try:
+            barrera.wait(timeout=10)
+            for i in range(n):
+                conv.add_user(f"{prefijo}-{i}")
+                conv.add_assistant(f"eco {prefijo}-{i}")
+        except Exception as error:  # noqa: BLE001
+            errores.append(error)
+
+    def lector() -> None:
+        try:
+            barrera.wait(timeout=10)
+            for _ in range(n):
+                conv.to_messages()
+                conv.history
+        except Exception as error:  # noqa: BLE001
+            errores.append(error)
+
+    threads = [
+        threading.Thread(target=escritor, args=("a",)),
+        threading.Thread(target=escritor, args=("b",)),
+        threading.Thread(target=lector),
+    ]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(timeout=30)
+
+    assert errores == []
+    assert len(conv.history) == 2 * n * 2  # 2 hilos x n turnos x (user+assistant)

@@ -159,6 +159,12 @@ class VoiceLoop:
             self.stop()
 
     def stop(self) -> None:
+        """Apagado ordenado con un límite conocido (B1): si el EarThread está
+        BLOQUEADO dentro de mic.read() (PortAudio sin timeout), el join expira
+        a los 2s y el thread queda vivo; al ser daemon, muere con el proceso
+        (el atajo de teclado usa os._exit justamente por esto). Cerrar el mic
+        antes del join suele desbloquear la lectura, pero no está garantizado.
+        """
         self.shutdown.set()                       # 1) avisar a todos
         self.tts.stop()                           # 2) cortar audio en curso
         if hasattr(self._mic, "close"):

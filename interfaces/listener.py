@@ -307,6 +307,24 @@ def _run_simple_loop(
                 hud_state.set_mode(Mode.IDLE)
 
 
+def make_deny_with_notice(say: Callable[[str], None]) -> Callable[[str], bool]:
+    """confirm_fn del modo CONCURRENTE: deniega con aviso, sin abrir micrófono.
+
+    En el modo concurrente el EarThread ya tiene el mic abierto de forma
+    persistente; el listen_once de voice_confirm abriría un SEGUNDO
+    sd.InputStream sobre el mismo device y chocan. Hasta integrar la
+    confirmación al loop del EarThread, una tool delicada se rechaza avisando
+    en personaje por dónde sí confirmarla (el shell). La factory recibe SOLO
+    say() a propósito: sin STT a la mano, no hay forma de regresar el bug.
+    """
+
+    def deny_with_notice(reason: str) -> bool:
+        say(reason + " Esa está delicada, patrón: dímela por el shell y ahí la confirmo.")
+        return False
+
+    return deny_with_notice
+
+
 def run_listen(argv: list[str] | None = None) -> int:
     _install_signal_handlers()
     settings = get_settings()
@@ -347,8 +365,19 @@ def run_listen(argv: list[str] | None = None) -> int:
             return False
         return wake.contains_any(answer, wake.CONFIRM_VARIANTS)
 
+    # M3: por defecto, loop concurrente. --simple = modo secuencial viejo (fallback).
+    # Barge-in conservador: half-duplex por defecto; --barge-in lo activa (auriculares).
+    # La decisión va ANTES de build_agent porque el confirm_fn depende del modo:
+    # concurrente → deny_with_notice (el EarThread ya tiene el mic; un segundo
+    # InputStream de voice_confirm chocaría con él); simple → voice_confirm.
+    argv = argv or []
+    simple = "--simple" in argv
+    allow_barge_in = ("--barge-in" in argv) and ("--no-barge-in" not in argv)
+    concurrente = not simple and use_oww
+
+    confirm_fn = make_deny_with_notice(say) if concurrente else voice_confirm
     try:
-        agent, _ = build_agent(confirm_fn=voice_confirm)
+        agent, _ = build_agent(confirm_fn=confirm_fn)
     except Exception as error:  # noqa: BLE001
         print(f"No pude armar el agente, patrón: {error}")
         return 1
@@ -358,20 +387,22 @@ def run_listen(argv: list[str] | None = None) -> int:
     # dummy al arrancar lo deja residente (keep_alive lo mantiene) para que la
     # primera orden responda rápido. No bloquea el arranque.
     def _warm_llm() -> None:
+        # Cliente PROPIO, no agent.llm: el del loop puede ser FallbackLLM y
+        # compartir su HTTPTransport entre este hilo y BrainThread corrompía el
+        # socket; además, un fallo del warm-up abriría el circuit breaker 60s.
         try:
-            agent.llm.chat([{"role": "user", "content": "di solo: ok"}])
+            from crotolamo.core.engine import build_primary_llm
+
+            build_primary_llm(settings).chat(
+                [{"role": "user", "content": "di solo: ok"}]
+            )
             log.info("LLM caliente, patrón.")
         except Exception as error:  # noqa: BLE001
             log.warning("no pude calentar el LLM: %s", error)
 
     threading.Thread(target=_warm_llm, name="WarmLLM", daemon=True).start()
 
-    # M3: por defecto, loop concurrente. --simple = modo secuencial viejo (fallback).
-    # Barge-in conservador: half-duplex por defecto; --barge-in lo activa (auriculares).
-    argv = argv or []
-    simple = "--simple" in argv
-    allow_barge_in = ("--barge-in" in argv) and ("--no-barge-in" not in argv)
-    if not simple and use_oww:
+    if concurrente:
         from crotolamo.voice.loop import VoiceLoop
 
         modo_bi = "barge-in (auriculares)" if allow_barge_in else "half-duplex"

@@ -22,7 +22,13 @@ import time
 from typing import Any, NoReturn
 
 from crotolamo.core.engine import HTTPTransport
-from crotolamo.core.llm import ChatResponse, LLMError, _parse_tool_calls, _read_body
+from crotolamo.core.llm import (
+    ChatResponse,
+    LLMError,
+    TransientLLMError,
+    _parse_tool_calls,
+    _read_body,
+)
 from crotolamo.core.openai_adapter import (  # noqa: F401 - re-export (compat)
     from_openai_message,
     to_openai_messages,
@@ -151,9 +157,12 @@ class GLMClient:
                 f"Revisa la API key. {body}"
             )
         if status == 429:
-            raise LLMError(
+            raise TransientLLMError(
                 "GLM me está limitando el ritmo (429), patrón. Aguanta tantito."
             )
+        if status >= 500:
+            raise TransientLLMError(f"GLM respondió {status}, patrón: {body}")
+        # 4xx restantes (400 payload roto, etc.): bug de cliente, NO abre el breaker.
         raise LLMError(f"GLM respondió {status}, patrón: {body}")
 
     def _post(self, payload: dict[str, Any]) -> http.client.HTTPResponse:
@@ -162,9 +171,10 @@ class GLMClient:
         try:
             return self._transport.post_json("/chat/completions", payload, headers)
         except TimeoutError as error:
-            raise LLMError(f"GLM no respondió a tiempo, patrón. ({error})") from error
+            raise TransientLLMError(
+                f"GLM no respondió a tiempo, patrón. ({error})") from error
         except (http.client.HTTPException, OSError) as error:
-            raise LLMError(
+            raise TransientLLMError(
                 f"No pude hablar con GLM en {self.base_url}, patrón. "
                 f"¿Hay internet? ({error})"
             ) from error
@@ -195,7 +205,8 @@ class GLMClient:
         try:
             raw = json.loads(resp.read().decode("utf-8"))
         except (TimeoutError, OSError) as error:
-            raise LLMError(f"GLM no respondió a tiempo, patrón. ({error})") from error
+            raise TransientLLMError(
+                f"GLM no respondió a tiempo, patrón. ({error})") from error
         except json.JSONDecodeError as error:
             raise LLMError("GLM me devolvió basura no-JSON, patrón.") from error
 
@@ -229,7 +240,8 @@ class GLMClient:
         try:
             content, message = consume_sse(resp, on_token)
         except (TimeoutError, OSError) as error:
-            raise LLMError(f"GLM no respondió a tiempo, patrón. ({error})") from error
+            raise TransientLLMError(
+                f"GLM no respondió a tiempo, patrón. ({error})") from error
 
         return ChatResponse(
             content=content.strip(),

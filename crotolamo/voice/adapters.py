@@ -30,6 +30,16 @@ class _RealMic:
         self._stream = None
 
     def read(self):
+        """Lee un frame BLOQUEANTE (~32ms a 16kHz con frame=512).
+
+        LÍMITE CONOCIDO (B1): PortAudio no ofrece read() con timeout; si el
+        driver/dispositivo se atora, esta llamada puede colgar el EarThread y
+        VoiceLoop.stop() no lo cierra por las buenas (por eso el thread es
+        daemon y el apagado duro usa os._exit). No se cambió a modo no
+        bloqueante a propósito: alteraría el timing del hot path (~31 fps) por
+        un fallo que en la práctica no se ha observado; si algún día aparece,
+        el arreglo es un callback de sounddevice + cola con timeout.
+        """
         import numpy as np
         import sounddevice as sd
 

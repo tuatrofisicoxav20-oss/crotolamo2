@@ -38,6 +38,12 @@ def _default_db_path() -> Path:
     return get_settings().paths.get("db", Path.home() / ".crotolamo" / "crotolamo.sqlite")
 
 
+# Rutas cuyo schema ya se ejecutó en ESTE proceso. Re-correr el CREATE TABLE
+# IF NOT EXISTS completo en cada operación era trabajo tirado; un set por ruta
+# (y no un bool) porque los tests abren DBs temporales distintas.
+_SCHEMA_READY: set[Path] = set()
+
+
 @contextmanager
 def connect(db_path: Path | None = None) -> Iterator[sqlite3.Connection]:
     path = Path(db_path) if db_path is not None else _default_db_path()
@@ -45,7 +51,16 @@ def connect(db_path: Path | None = None) -> Iterator[sqlite3.Connection]:
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     try:
-        conn.executescript(_SCHEMA)
+        # busy_timeout es POR CONEXIÓN: dos escritores concurrentes (shell +
+        # listener sobre el mismo .sqlite) esperan hasta 3s en vez de reventar
+        # con "database is locked". WAL además deja LEER mientras se escribe;
+        # queda persistido en el fichero, pero re-pedirlo es idempotente y barato.
+        conn.execute("PRAGMA busy_timeout=3000")
+        conn.execute("PRAGMA journal_mode=WAL")
+        key = path.resolve()
+        if key not in _SCHEMA_READY:
+            conn.executescript(_SCHEMA)
+            _SCHEMA_READY.add(key)
         yield conn
         conn.commit()
     finally:

@@ -107,3 +107,43 @@ def test_num_ctx_desde_settings():
         llm = {"model": "llama3.2:latest", "num_ctx": 2048}
 
     assert LLMClient.from_settings(_S()).num_ctx == 2048
+
+
+# --- Segmentación unificada (T4): decimales y abreviaturas no parten frase ---
+
+def test_split_sentences_no_parte_decimales_ni_abreviaturas():
+    from crotolamo.voice.tts import split_sentences
+
+    assert split_sentences("Tienes 3.5 GB, patrón. Y 40. 5 más.") == [
+        "Tienes 3.5 GB, patrón.", "Y 40. 5 más."]
+    assert split_sentences("Llama al Dr. López.") == ["Llama al Dr. López."]
+    assert split_sentences("Primero esto. Luego lo otro.") == [
+        "Primero esto.", "Luego lo otro."]
+    assert split_sentences("Hay manzanas, peras, etc. en el frutero.") == [
+        "Hay manzanas, peras, etc. en el frutero."]
+    assert split_sentences("La cita es en la Av. Juárez. Llega temprano.") == [
+        "La cita es en la Av. Juárez.", "Llega temprano."]
+    # "No. 5" es número; "Claro que no." sí cierra frase.
+    assert split_sentences("Es el No. 5 de la lista.") == ["Es el No. 5 de la lista."]
+    assert split_sentences("Claro que no. Pero lo intento.") == [
+        "Claro que no.", "Pero lo intento."]
+
+
+def test_stream_speaker_no_parte_cifras_a_medias():
+    """En streaming, un '.' al final del buffer no se corta hasta VER el
+    siguiente carácter: puede ser un decimal partido ('40.' + ' 5 GB')."""
+    tts = _FakeTTS()
+    sp = StreamSpeaker(tts)
+    for token in ["Tienes 40.", " 5 GB libres.", " Listo."]:
+        sp.feed(token)
+    assert sp.finish() is True
+    assert tts.spoken == ["Tienes 40. 5 GB libres.", "Listo."]
+
+
+def test_stream_speaker_no_parte_abreviaturas():
+    tts = _FakeTTS()
+    sp = StreamSpeaker(tts)
+    for token in ["Llama al Dr.", " López.", " Ya le avisé."]:
+        sp.feed(token)
+    assert sp.finish() is True
+    assert tts.spoken == ["Llama al Dr. López.", "Ya le avisé."]

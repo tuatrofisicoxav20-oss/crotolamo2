@@ -5,22 +5,35 @@ from __future__ import annotations
 import pytest
 
 from crotolamo.core.fallback import FallbackLLM
-from crotolamo.core.llm import ChatResponse, LLMError
+from crotolamo.core.glm import GLMAuthError
+from crotolamo.core.llm import ChatResponse, LLMError, TransientLLMError
 
 
 class _Fake:
-    """Cliente de mentiras con el contrato de LLMClient."""
+    """Cliente de mentiras con el contrato de LLMClient.
 
-    def __init__(self, name: str, falla: bool = False, tokens: tuple[str, ...] = ()) -> None:
+    `falla=True` modela un fallo de DISPONIBILIDAD (timeout, wifi caído, 5xx):
+    lanza TransientLLMError, que es lo único que debe abrir el breaker. Para
+    errores permanentes (auth, 400) se pasa `error=` explícito.
+    """
+
+    def __init__(self, name: str, falla: bool = False, tokens: tuple[str, ...] = (),
+                 error: Exception | None = None) -> None:
         self.model = name
         self.falla = falla
         self.tokens = tokens
+        self.error = error
         self.llamadas = 0
+
+    def _boom(self):
+        if self.error is not None:
+            raise self.error
+        if self.falla:
+            raise TransientLLMError(f"{self.model} caído")
 
     def chat(self, messages, tools=None):
         self.llamadas += 1
-        if self.falla:
-            raise LLMError(f"{self.model} caído")
+        self._boom()
         return ChatResponse(content=f"soy {self.model}")
 
     def chat_stream(self, messages, tools=None, on_token=None):
@@ -28,8 +41,7 @@ class _Fake:
         for t in self.tokens:
             if on_token:
                 on_token(t)
-        if self.falla:
-            raise LLMError(f"{self.model} caído")
+        self._boom()
         return ChatResponse(content=f"soy {self.model}")
 
 
@@ -142,7 +154,7 @@ def test_toolagent_completa_el_turno_si_el_primario_cae_a_media_iteracion(monkey
                         "function": {"name": "open_url", "arguments": {"url": "x.com"}},
                     }]},
                 )
-            raise LLMError("glm caído a media faena")
+            raise TransientLLMError("glm caído a media faena")
 
     class _Local:
         model = "ollama"
@@ -175,3 +187,86 @@ def test_build_llm_envuelve_en_fallback_cuando_hay_key(monkeypatch):
     assert isinstance(llm, FallbackLLM)
     assert isinstance(llm.primary, GLMClient)
     assert isinstance(llm.secondary, LLMClient)
+
+
+# --- T6: el breaker SOLO se abre con errores transitorios ---
+
+def test_error_permanente_se_propaga_sin_abrir_el_breaker():
+    """Un 400 (payload mal formado) es un BUG, no una caída: degradar 60s a
+    Ollama en silencio lo escondería. Se propaga y la nube se reintenta al
+    siguiente turno."""
+    nube = _Fake("glm", error=LLMError("GLM respondió 400, patrón: payload roto"))
+    local = _Fake("ollama")
+    llm = FallbackLLM(nube, local, cooldown_s=300)
+
+    with pytest.raises(LLMError, match="400"):
+        llm.chat([])
+    assert local.llamadas == 0        # nada de degradar en silencio
+    assert llm.active is nube          # el breaker NO se abrió
+
+    with pytest.raises(LLMError, match="400"):
+        llm.chat([])
+    assert nube.llamadas == 2          # se volvió a intentar (sin cooldown)
+
+
+def test_auth_error_cae_al_local_sin_reintentar_la_nube():
+    """Una key inválida no se arregla sola: reintentarla cada turno es ruido.
+    Se marca la nube como caída hasta reinicio y se usa el local."""
+    nube = _Fake("glm", error=GLMAuthError("GLM me rechazó la credencial (401), patrón."))
+    local = _Fake("ollama")
+    llm = FallbackLLM(nube, local, cooldown_s=0.0)  # sin cooldown: probaría la nube SIEMPRE
+
+    for _ in range(3):
+        assert llm.chat([]).content == "soy ollama"
+
+    assert nube.llamadas == 1          # un solo intento, no un bucle de 401s
+    assert llm.model == "ollama"
+
+
+def test_streaming_error_permanente_tambien_se_propaga():
+    nube = _Fake("glm", error=LLMError("GLM respondió 400, patrón."))
+    local = _Fake("ollama")
+    llm = FallbackLLM(nube, local)
+    with pytest.raises(LLMError, match="400"):
+        llm.chat_stream([])
+    assert local.llamadas == 0
+    assert llm.active is nube
+
+
+# --- T6: clasificación en los clientes ---
+
+def test_clientes_clasifican_transitorio_vs_permanente(monkeypatch):
+    from tests.test_transport import _Resp, _glm, _ollama
+
+    # GLM: 500 y timeout son transitorios; 400 es permanente; 401 es auth.
+    client, _ = _glm(monkeypatch, [_Resp(status=500, body=b"boom")])
+    with pytest.raises(TransientLLMError):
+        client.chat([{"role": "user", "content": "hola"}])
+
+    client, _ = _glm(monkeypatch, [TimeoutError("timed out")])
+    with pytest.raises(TransientLLMError):
+        client.chat([{"role": "user", "content": "hola"}])
+
+    client, _ = _glm(monkeypatch, [_Resp(status=400, body=b"bad request")])
+    with pytest.raises(LLMError) as exc:
+        client.chat([{"role": "user", "content": "hola"}])
+    assert not isinstance(exc.value, TransientLLMError)
+
+    client, _ = _glm(monkeypatch, [_Resp(status=401, body=b"bad key")])
+    with pytest.raises(GLMAuthError) as exc:
+        client.chat([{"role": "user", "content": "hola"}])
+    assert not isinstance(exc.value, TransientLLMError)
+
+    # Ollama: 500/conexión transitorios; 404 (modelo inexistente) permanente.
+    client = _ollama([_Resp(status=500, body=b"panic")])
+    with pytest.raises(TransientLLMError):
+        client.chat([{"role": "user", "content": "hola"}])
+
+    client = _ollama([ConnectionRefusedError("refused")])
+    with pytest.raises(TransientLLMError):
+        client.chat([{"role": "user", "content": "hola"}])
+
+    client = _ollama([_Resp(status=404, body=b"model not found")])
+    with pytest.raises(LLMError) as exc:
+        client.chat([{"role": "user", "content": "hola"}])
+    assert not isinstance(exc.value, TransientLLMError)

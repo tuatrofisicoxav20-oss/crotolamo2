@@ -9,18 +9,49 @@ Todo con stdlib pura (urllib + html.parser).
 
 from __future__ import annotations
 
+import http.client
 import ipaddress
 import socket
+import ssl
 import urllib.error
 import urllib.request
 from html.parser import HTMLParser
-from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 _USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
 )
 _MAX_DOWNLOAD_BYTES = 1_500_000  # ~1.5 MB: suficiente para cualquier artículo
+
+
+def _ip_is_public(ip_str: str) -> bool:
+    """False si la IP es de la red interna (loopback, LAN, link-local...)."""
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    return not (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+
+
+def _resolve_public_ip(host: str) -> str | None:
+    """UNA resolución DNS: si TODAS las IPs del host son públicas, devuelve la
+    primera (la IP a la que se conectará: pinning); si alguna es interna o el
+    DNS no resuelve, None.
+
+    Resolver y conectar en pasos separados abría un TOCTOU: un DNS malicioso
+    con TTL 0 responde una IP pública en la validación y 127.0.0.1 al conectar
+    (rebinding). Devolver la IP validada y conectar EXACTAMENTE a ella cierra
+    esa ventana. Ante la duda, None: negar es lo seguro.
+    """
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (socket.gaierror, UnicodeError, ValueError):
+        return None
+    ips = [str(info[4][0]) for info in infos]
+    if not ips or not all(_ip_is_public(ip) for ip in ips):
+        return None
+    return ips[0]
 
 
 def is_public_url(url: str) -> bool:
@@ -30,73 +61,116 @@ def is_public_url(url: str) -> bool:
     otra página. Sin este filtro podría pedir `http://localhost:11434` (el propio
     Ollama) o `http://169.254.169.254` (metadatos de nube): eso es SSRF.
 
-    Resolvemos el hostname porque un dominio público puede apuntar a 127.0.0.1.
-    Ante la duda (DNS que no resuelve), devolvemos False: negar es lo seguro.
+    OJO: esto es el pre-check barato (lo usa read_page para responder en
+    personaje sin descargar nada). La garantía fuerte contra rebinding vive en
+    _http_get, que valida y PINNEA la misma resolución.
     """
     host = urlparse(url).hostname
     if not host:
         return False
-    try:
-        infos = socket.getaddrinfo(host, None)
-    except (socket.gaierror, UnicodeError, ValueError):
-        return False
-    if not infos:
-        return False
-    for info in infos:
-        try:
-            ip = ipaddress.ip_address(info[4][0])
-        except ValueError:
-            return False
-        if (ip.is_private or ip.is_loopback or ip.is_link_local
-                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
-            return False
-    return True
+    return _resolve_public_ip(host) is not None
 
 
 class BlockedRedirectError(urllib.error.URLError):
-    """Un redirect (3xx) intentó llevarnos a la red interna: SSRF bloqueado."""
+    """La URL (original o de un redirect) apunta a la red interna: SSRF bloqueado."""
 
 
-class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Redirect handler que revalida cada URL destino contra is_public_url.
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    """HTTPConnection que conecta a una IP ya validada (pinning anti-rebinding).
 
-    urlopen sigue los 3xx automáticamente: sin esto, validar solo la URL
-    original deja pasar un 302 hacia http://169.254.169.254/ o localhost.
+    El header Host sale de `host` (el hostname original), pero el TCP va a
+    `pinned_ip`: así el servidor virtual correcto responde y el resolver ya no
+    pinta nada entre la validación y la conexión.
     """
 
-    def redirect_request(  # type: ignore[override]
-        self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str
-    ) -> Any:
-        if not is_public_url(newurl):
-            raise BlockedRedirectError(
-                f"redirect bloqueado hacia una dirección no pública: {newurl}"
-            )
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+    def __init__(self, host: str, pinned_ip: str, port: int | None,
+                 timeout: float) -> None:
+        super().__init__(host, port, timeout=timeout)
+        self._pinned_ip = pinned_ip
+
+    def connect(self) -> None:
+        self.sock = socket.create_connection(
+            (self._pinned_ip, self.port), timeout=self.timeout)
 
 
-# Opener único con el guardia anti-SSRF en los redirects. Se usa en TODOS los
-# fetch de estas tools (read_page y la búsqueda de fetch_web_results): ambos
-# descargan contenido remoto, así que ambos merecen el mismo cerrojo.
-_SAFE_OPENER = urllib.request.build_opener(_SafeRedirectHandler)
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """Como _PinnedHTTPConnection pero con TLS: el SNI y la validación del
+    certificado usan el hostname original (server_hostname), no la IP."""
+
+    def __init__(self, host: str, pinned_ip: str, port: int | None,
+                 timeout: float) -> None:
+        context = ssl.create_default_context()
+        super().__init__(host, port, timeout=timeout, context=context)
+        self._pinned_ip = pinned_ip
+        self._ssl_context = context
+
+    def connect(self) -> None:
+        raw = socket.create_connection(
+            (self._pinned_ip, self.port), timeout=self.timeout)
+        self.sock = self._ssl_context.wrap_socket(raw, server_hostname=self.host)
+
+
+_MAX_REDIRECTS = 5
+
+
+def _pinned_connection(url: str, timeout: float) -> tuple[http.client.HTTPConnection, str]:
+    """Valida la URL (gate + resolución pinneada) y devuelve (conexión, path)."""
+    parts = urlparse(url)
+    host = parts.hostname
+    if parts.scheme not in ("http", "https") or not host:
+        raise urllib.error.URLError(f"URL rara para un GET: {url!r}")
+    # Gate a nivel URL (barato y parcheable en tests); la garantía real es el
+    # pin de abajo: la conexión va a la MISMA IP que acaba de validarse.
+    if not is_public_url(url):
+        raise BlockedRedirectError(
+            f"bloqueada una dirección no pública: {url}")
+    ip = _resolve_public_ip(host)
+    if ip is None:
+        raise BlockedRedirectError(
+            f"bloqueada una dirección no pública o que no resuelve: {url}")
+    cls = _PinnedHTTPSConnection if parts.scheme == "https" else _PinnedHTTPConnection
+    conn = cls(host, ip, parts.port, timeout)
+    path = parts.path or "/"
+    if parts.query:
+        path += "?" + parts.query
+    return conn, path
 
 
 def _http_get(url: str, timeout: float = 10.0) -> tuple[str, str]:
-    """GET con urllib. Devuelve (content_type, body_texto).
+    """GET con pinning de IP anti-rebinding. Devuelve (content_type, body_texto).
 
-    Helper separado para que los tests lo parcheen sin tocar la red.
-    Lanza OSError/urllib.error.URLError si la red falla, y
-    BlockedRedirectError si un 3xx apunta a la red interna.
+    Helper separado para que los tests lo parcheen sin tocar la red. Cada salto
+    (URL original y cada redirect) se valida y se conecta a la IP de esa misma
+    resolución. Lanza OSError/urllib.error.URLError si la red falla,
+    urllib.error.HTTPError si el status es >= 400, y BlockedRedirectError si
+    algún salto apunta a la red interna.
     """
-    request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
-    with _SAFE_OPENER.open(request, timeout=timeout) as response:  # noqa: S310
-        content_type = (response.headers.get("Content-Type") or "").lower()
-        raw = response.read(_MAX_DOWNLOAD_BYTES)
-        charset = response.headers.get_content_charset() or "utf-8"
-    try:
-        body = raw.decode(charset, errors="replace")
-    except LookupError:  # charset inventado por el servidor
-        body = raw.decode("utf-8", errors="replace")
-    return content_type, body
+    current = url
+    for _ in range(_MAX_REDIRECTS + 1):
+        conn, path = _pinned_connection(current, timeout)
+        try:
+            conn.request("GET", path, headers={"User-Agent": _USER_AGENT})
+            response = conn.getresponse()
+
+            location = response.getheader("Location")
+            if 300 <= response.status < 400 and location:
+                current = urljoin(current, location)
+                continue
+            if response.status >= 400:
+                raise urllib.error.HTTPError(
+                    current, response.status, response.reason, response.headers, None)
+
+            content_type = (response.getheader("Content-Type") or "").lower()
+            raw = response.read(_MAX_DOWNLOAD_BYTES)
+            charset = response.headers.get_content_charset() or "utf-8"
+        finally:
+            conn.close()
+        try:
+            body = raw.decode(charset, errors="replace")
+        except LookupError:  # charset inventado por el servidor
+            body = raw.decode("utf-8", errors="replace")
+        return content_type, body
+    raise urllib.error.URLError(f"demasiados redirects (> {_MAX_REDIRECTS}): {url}")
 
 
 def _decode_ddg_href(href: str) -> str:

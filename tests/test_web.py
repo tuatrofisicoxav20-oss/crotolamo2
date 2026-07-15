@@ -346,9 +346,21 @@ def redirect_server():
     thread.join(timeout=5)
 
 
-def test_redirect_a_red_interna_se_bloquea(redirect_server):
+def _permite_loopback(monkeypatch):
+    """Deja que el pinning acepte el servidor local de mentiras (127.0.0.1),
+    manteniendo la resolución real para cualquier otro host."""
+    real = _web._resolve_public_ip
+    monkeypatch.setattr(
+        _web, "_resolve_public_ip",
+        lambda host: "127.0.0.1" if host == "127.0.0.1" else real(host),
+    )
+
+
+def test_redirect_a_red_interna_se_bloquea(redirect_server, monkeypatch):
     """Un 302 hacia una IP interna debe abortar con BlockedRedirectError."""
     _RedirectHandler.redirect_to = "http://169.254.169.254/latest/meta-data/"
+    _permite_loopback(monkeypatch)
+    monkeypatch.setattr(_web, "is_public_url", lambda url: "169.254" not in url)
     with pytest.raises(_web.BlockedRedirectError):
         _web._http_get(f"{redirect_server}/a", timeout=5.0)
 
@@ -357,9 +369,10 @@ def test_redirect_a_url_publica_se_sigue(redirect_server, monkeypatch):
     """Un 302 hacia una URL pública se sigue con normalidad.
 
     El destino real es el mismo servidor local, así que simulamos que
-    is_public_url lo considera público (en producción resolvería DNS).
+    el guardia lo considera público (en producción resolvería DNS).
     """
     _RedirectHandler.redirect_to = f"{redirect_server}/b"
+    _permite_loopback(monkeypatch)
     monkeypatch.setattr(_web, "is_public_url", lambda url: True)
     content_type, body = _web._http_get(f"{redirect_server}/a", timeout=5.0)
     assert "text/html" in content_type
@@ -372,10 +385,62 @@ def test_read_page_bloquea_redirect_interno(redirect_server, monkeypatch):
     # La URL ORIGINAL pasa el guardia (fingimos que resuelve a una IP pública);
     # el redirect a loopback es lo que debe morir.
     url_original = f"{redirect_server}/a"
-    real_is_public = _web.is_public_url
-    monkeypatch.setattr(
-        _web, "is_public_url",
-        lambda url: True if url == url_original else real_is_public(url),
-    )
+    _permite_loopback(monkeypatch)
+    # Solo la URL original pasa el guardia; el destino del redirect (mismo
+    # loopback, otro puerto) debe morir en el gate por URL de _http_get.
+    monkeypatch.setattr(_web, "is_public_url", lambda url: url == url_original)
     out = search.read_page(url_original)
     assert "red interna" in out
+
+
+# --- DNS rebinding (T3): la IP validada debe ser la IP a la que se conecta ---
+# Un DNS malicioso con TTL 0 puede responder una IP pública en la validación y
+# 127.0.0.1/169.254.169.254 al conectar. El arreglo: UNA resolución, validar
+# TODAS sus IPs, y conectar a esa misma IP (pinning); nunca re-resolver.
+
+def test_dns_rebinding_se_bloquea(monkeypatch):
+    """getaddrinfo cambia de pública a privada entre llamadas: como el pin sale
+    de la MISMA resolución que se valida, la privada nunca recibe conexión."""
+    publica = [(2, 1, 6, "", ("93.184.216.34", 0))]
+    privada = [(2, 1, 6, "", ("127.0.0.1", 0))]
+    respuestas = iter([publica, privada, privada])
+    monkeypatch.setattr(_web.socket, "getaddrinfo",
+                        lambda *a, **kw: next(respuestas))
+
+    def no_conectar(*a, **kw):
+        raise AssertionError("se intentó conectar pese al rebinding")
+
+    monkeypatch.setattr(_web.socket, "create_connection", no_conectar)
+    with pytest.raises(_web.BlockedRedirectError):
+        _web._http_get("http://rebind.evil/", timeout=2.0)
+
+
+def test_http_get_conecta_a_la_ip_validada(monkeypatch):
+    """La conexión TCP va a la IP que pasó la validación, no a un hostname que
+    el resolver podría cambiar en el camino."""
+    monkeypatch.setattr(
+        _web.socket, "getaddrinfo",
+        lambda *a, **kw: [(2, 1, 6, "", ("93.184.216.34", 0))],
+    )
+    conexiones: list[tuple] = []
+
+    def captura(addr, timeout=None, **kw):
+        conexiones.append(addr)
+        raise OSError("cortamos aquí: solo interesa la IP destino")
+
+    monkeypatch.setattr(_web.socket, "create_connection", captura)
+    with pytest.raises(OSError):
+        _web._http_get("http://ejemplo.com/pagina", timeout=2.0)
+    assert conexiones == [("93.184.216.34", 80)]
+
+
+def test_resolucion_mixta_publica_y_privada_se_niega(monkeypatch):
+    """Si el host resuelve a varias IPs y UNA es privada, se niega todo:
+    getaddrinfo puede rotar el orden y la privada acabaría recibiendo el GET."""
+    monkeypatch.setattr(
+        _web.socket, "getaddrinfo",
+        lambda *a, **kw: [(2, 1, 6, "", ("93.184.216.34", 0)),
+                          (2, 1, 6, "", ("10.0.0.5", 0))],
+    )
+    assert _web._resolve_public_ip("mixto.example") is None
+    assert _web.is_public_url("https://mixto.example/") is False
