@@ -64,6 +64,16 @@ class FallbackLLM:
         """El cliente que se usaría ahora mismo."""
         return self.secondary if self._primary_down() else self.primary
 
+    @property
+    def degraded(self) -> bool:
+        """True si ahora mismo respondería el respaldo local (breaker abierto).
+
+        Lo consulta el armado del agente para decidir la dieta de tools: con GLM
+        (nube) se mandan TODAS las tools (razona él); degradado a Ollama local se
+        vuelve al tool-routing chico para que el turno no cueste ~130s en CPU.
+        """
+        return self._primary_down()
+
     def _primary_down(self) -> bool:
         return self._auth_down or self._retry_at > time.monotonic()
 

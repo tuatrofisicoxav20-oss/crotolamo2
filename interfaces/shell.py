@@ -12,7 +12,6 @@ from crotolamo.core.agent import Agent
 from crotolamo.core.engine import build_llm
 from crotolamo.core.memory import Conversation
 from crotolamo.core.persona import system_prompt
-from crotolamo.persistence import facts
 from crotolamo.settings import get_settings
 
 
@@ -56,13 +55,33 @@ def build_agent(confirm_fn=None) -> tuple[Agent, Conversation]:
 
         registry = default_registry()
 
-        # Tool routing (rendimiento en CPU): por defecto ON. Manda solo las tools
-        # relevantes a cada consulta para que el turno sea rápido (~2-5s vs ~130s).
+        # ¿El cerebro es GLM (nube)? Entonces GLM RAZONA TODO: ve todas las
+        # tools en cada turno (también en charla), redacta él cada respuesta y
+        # no hay atajos regex sin LLM. Los atajos (fastpath, routing chico,
+        # direct_tools) existían por el modelo LOCAL lento en CPU; con la nube
+        # a ~1-2s solo le quitaban criterio al modelo.
+        from crotolamo.core.engine import GLM, resolve_backend
+        from crotolamo.core.fallback import FallbackLLM
+
+        glm_brain = resolve_backend(settings) == GLM and isinstance(llm, FallbackLLM)
+
+        # Tool routing (rendimiento en CPU): manda solo las tools relevantes a
+        # cada consulta para que el turno local sea rápido (~2-5s vs ~130s).
         use_routing = settings.llm.get("tool_routing", True)
         max_tools = settings.llm.get("max_tools", 8)
-        route_fn = (
-            (lambda t: route_schemas(registry, t, max_tools)) if use_routing else None
-        )
+
+        if glm_brain:
+            # GLM ve TODO el arsenal; si el breaker degradó a Ollama local
+            # (sin internet), se vuelve al routing chico para no pagar ~130s.
+            def route_fn(text: str):
+                if llm.degraded and use_routing:
+                    return route_schemas(registry, text, max_tools)
+                return registry.schemas()
+        else:
+            route_fn = (
+                (lambda t: route_schemas(registry, t, max_tools))
+                if use_routing else None
+            )
 
         agent: Agent = ToolAgent(
             llm,
@@ -73,7 +92,9 @@ def build_agent(confirm_fn=None) -> tuple[Agent, Conversation]:
             confirm_fn=confirm_fn or _text_confirm,
             pre_hooks=[make_facts_prehook(), datetime_prehook],
             route_fn=route_fn,
-            fastpath=settings.llm.get("fastpath", True),
+            # Con GLM no hay comandos prehechos: todo lo razona y redacta él.
+            fastpath=False if glm_brain else settings.llm.get("fastpath", True),
+            direct_tools=set() if glm_brain else None,
         )
     except Exception:
         agent = Agent(llm, conversation)
@@ -132,13 +153,6 @@ def run_shell(argv: list[str] | None = None) -> int:
             continue
         if low == "/historial":
             _show_history(conversation)
-            continue
-
-        # Fase 4: fast-path "acuérdate que ..." — guarda sin depender del LLM.
-        fact = facts.detect_remember(user)
-        if fact:
-            facts.remember(fact)
-            print(f"\nCrotolamo > Anotado, patrón. Lo recordaré: «{fact}».\n")
             continue
 
         if can_stream and isinstance(agent, ToolAgent):

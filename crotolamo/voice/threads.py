@@ -135,26 +135,29 @@ class SttThread(threading.Thread):
     def run(self) -> None:
         while not self.shutdown.is_set():
             try:
-                audio_path, turn = self.in_q.get(timeout=0.2)
+                audio, turn = self.in_q.get(timeout=0.2)
             except queue.Empty:
                 continue
-            # El WAV se borra pase lo que pase: si el turno se abortó (barge-in)
-            # entre el encolado y aquí, el `continue` de antes saltaba el unlink
-            # y dejaba el temporal huérfano en /tmp para siempre.
+            # `audio` puede ser un ndarray EN MEMORIA (camino caliente, sin
+            # disco) o un Path a WAV (compat/tests). El WAV se borra pase lo
+            # que pase: si el turno se abortó (barge-in) entre el encolado y
+            # aquí, saltarse el unlink dejaba el temporal huérfano en /tmp.
+            is_path = hasattr(audio, "unlink")
             try:
                 if not self.state.is_current(turn):
                     continue  # comando abortado antes de transcribir
                 try:
-                    text = self.stt.transcribe(audio_path, hotwords=self.hotwords)
+                    text = self.stt.transcribe(audio, hotwords=self.hotwords)
                 except Exception as error:  # noqa: BLE001
                     log.warning("stt: %s", error)
                     text = ""
             finally:
-                try:
-                    audio_path.unlink(missing_ok=True)
-                except OSError as error:
-                    log.debug("stt: no pude borrar el WAV temporal %s: %s",
-                              audio_path, error)
+                if is_path:
+                    try:
+                        audio.unlink(missing_ok=True)
+                    except OSError as error:
+                        log.debug("stt: no pude borrar el WAV temporal %s: %s",
+                                  audio, error)
             if text.strip() and self.state.is_current(turn):
                 self.state.set_text(text)  # HUD: frase reconocida del usuario
                 self.out_q.put((text, turn))

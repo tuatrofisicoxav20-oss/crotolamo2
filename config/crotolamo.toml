@@ -81,6 +81,8 @@ max_iterations = 6
 # CPU: ~130s evaluando el prompt), se le mandan solo las relevantes a la consulta
 # (~2-5s). Medido aquí: 6 tools = 2.4s vs 30 tools = 142s. Déjalo en true salvo
 # que quieras depurar. max_tools = tope de tools por turno.
+# OJO: con backend="glm" esto SOLO aplica cuando el respaldo local está activo
+# (sin internet). Con la nube arriba, GLM ve TODAS las tools y razona él.
 tool_routing = true
 max_tools = 8
 # keep_alive: cuánto mantiene Ollama el modelo residente en RAM tras responder.
@@ -99,6 +101,8 @@ num_ctx = 2048
 # música", "qué apps tengo abiertas", "abre opera") ejecutan la tool directo
 # (~0.1s en vez de ~17-22s de LLM). Solo tools seguras; cualquier frase con
 # matices cae al agente normal. false = todo pasa por el LLM.
+# OJO: con backend="glm" se IGNORA (queda en off): nada de comandos prehechos,
+# GLM razona y redacta cada turno. Este knob solo aplica al motor local.
 fastpath = true
 
 # --- Motor en la nube (backend = "glm") ---
@@ -166,9 +170,11 @@ vad_threshold        = 0.8
 # para ENTRAR en voz; vad_neg_threshold es el umbral (más bajo) para MANTENERSE en
 # ella. Sin histéresis, una micro-pausa de respirar/pensar cae bajo 0.8 y empieza a
 # contar silencio -> trunca el comando. Con 0.35, sigues "en voz" durante la pausa.
-# COMENTADO = sin histéresis (comportamiento histórico). Descoméntalo y mide:
+# Activada (misión "entender cada palabra"): sin ella, las pausas de respirar
+# cortaban comandos a media frase y se perdían palabras. Coméntala para volver
+# al comportamiento histórico; mide con:
 #   .venv/bin/python scripts/stt_harness.py record --n 10 --dir stt_bench
-# vad_neg_threshold  = 0.35
+vad_neg_threshold  = 0.35
 # Buffer de pre-activación: ms de audio previos que se anteponen para no perder
 # las primeras sílabas.
 vad_preactivation_ms = 800

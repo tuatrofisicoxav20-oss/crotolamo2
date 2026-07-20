@@ -128,11 +128,11 @@ class STT:
             wav.setframerate(self.sample_rate)
             wav.writeframes(data.tobytes())
 
-    def record_until_silence(self, silence_ms: int | None = None, max_seconds: float = 12.0,
-                             start_timeout_s: float = 4.0) -> Path:
-        """Graba hasta el silencio. Backend según [voice].vad_backend: 'silero' (M2)
-        o 'energy' (fallback). Silero suma un buffer de pre-activación para no
-        perder las primeras sílabas.
+    def _record_frames(self, silence_ms: int | None, max_seconds: float,
+                       start_timeout_s: float) -> list:
+        """Graba hasta el silencio y devuelve los frames float32 crudos. Backend
+        según [voice].vad_backend: 'silero' (M2) o 'energy' (fallback). Silero
+        suma un buffer de pre-activación para no perder las primeras sílabas.
         """
         voice = _voice_cfg()
         if silence_ms is None:
@@ -148,20 +148,48 @@ class STT:
                 log.warning("VAD silero falló (%s); uso energía", error)
         return self._record_energy(silence_ms, max_seconds, start_timeout_s)
 
-    def _frames_to_wav(self, frames: list) -> Path:
-        """Normaliza los frames y los escribe a un WAV temporal."""
+    def record_until_silence(self, silence_ms: int | None = None, max_seconds: float = 12.0,
+                             start_timeout_s: float = 4.0) -> Path:
+        """Compat: graba y devuelve un WAV temporal. El camino caliente ya no
+        pasa por aquí (usa record_audio_until_silence, sin tocar disco)."""
+        return self._frames_to_wav(
+            self._record_frames(silence_ms, max_seconds, start_timeout_s)
+        )
+
+    def record_audio_until_silence(self, silence_ms: int | None = None,
+                                   max_seconds: float = 12.0,
+                                   start_timeout_s: float = 4.0):
+        """Graba hasta el silencio y devuelve el audio float32 EN MEMORIA.
+
+        Misión velocidad: faster-whisper acepta el ndarray directo, así que el
+        WAV temporal (escribir a disco + relerlo + borrarlo por frase) era costo
+        puro. Este es el camino caliente de todos los comandos.
+        """
+        return self._frames_to_audio(
+            self._record_frames(silence_ms, max_seconds, start_timeout_s)
+        )
+
+    def _frames_to_audio(self, frames: list):
+        """Concatena y normaliza los frames a un float32 mono listo para Whisper."""
         np = _require("numpy")
         audio = np.concatenate(frames) if frames else np.zeros(1, dtype="float32")
+        audio = np.ascontiguousarray(audio, dtype=np.float32).reshape(-1)
         peak = float(np.max(np.abs(audio))) if audio.size else 0.0
         if peak > 0:
             audio = audio / peak * 0.9
+        return audio
+
+    def _frames_to_wav(self, frames: list) -> Path:
+        """Normaliza los frames y los escribe a un WAV temporal (compat/tests)."""
+        np = _require("numpy")
+        audio = self._frames_to_audio(frames)
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             path = Path(tmp.name)
         self._write_wav(path, np.int16(audio * 32767))
         return path
 
     def _record_energy(self, silence_ms: int, max_seconds: float,
-                       start_timeout_s: float) -> Path:
+                       start_timeout_s: float) -> list:
         """VAD por energía RMS. Calibra el piso de ruido con ~10 chunks (M1 audit)."""
         np = _require("numpy")
         sd = _require("sounddevice")
@@ -205,10 +233,10 @@ class STT:
                 if not speaking and i >= start_chunks:
                     break
 
-        return self._frames_to_wav(frames)
+        return frames
 
     def _record_silero(self, silence_ms: int, max_seconds: float,
-                       start_timeout_s: float, voice: dict) -> Path:
+                       start_timeout_s: float, voice: dict) -> list:
         """VAD neuronal Silero (de GLaDOS, M2). Probabilidad de voz por chunk de
         32 ms + buffer circular de pre-activación para no perder el inicio.
         """
@@ -273,24 +301,28 @@ class STT:
                         if silent_run >= silence_chunks:
                             break
 
-        return self._frames_to_wav(frames)
+        return frames
 
     # --- transcripción ---
-    def transcribe(self, path: Path, hotwords: str | None = None) -> str:
-        """Transcribe el WAV. `hotwords` (faster-whisper >= 1.0.2) sesga el
-        decoder hacia nombres propios ("Crotolamo", "Tletl"...) SOLO en la
-        llamada que lo pida — el caller decide; aquí no se hardcodea nada.
-        La ruta de wake NO debe pasarlo: igual que initial_prompt, un sesgo
-        con "crotolamo" sobre silencio/ruido aumentaría falsos despertares.
+    def transcribe(self, audio, hotwords: str | None = None) -> str:
+        """Transcribe un WAV (Path/str) o un ndarray float32 16kHz EN MEMORIA.
+
+        `hotwords` (faster-whisper >= 1.0.2) sesga el decoder hacia nombres
+        propios ("Crotolamo", "Tletl"...) SOLO en la llamada que lo pida — el
+        caller decide; aquí no se hardcodea nada. La ruta de wake NO debe
+        pasarlo: igual que initial_prompt, un sesgo con "crotolamo" sobre
+        silencio/ruido aumentaría falsos despertares.
         """
         model = self._get_model()
+        if isinstance(audio, (str, Path)):
+            audio = str(audio)  # faster-whisper acepta la ruta tal cual
         # I4: vad_filter=False — ya recortamos por energía en record_until_silence;
         # el doble VAD (energía + el de Whisper) se comía audio.
         # Anti-alucinación: temperature=0 (determinista, sin "inventar" sobre música
         # o silencio) en vez del fallback 0..1 por defecto, que es la causa de los
         # fantasmas tipo "yo te voy a amar" cuando suena Spotify.
         segments, _ = model.transcribe(
-            str(path), language=self.language, beam_size=self.beam_size, vad_filter=False,
+            audio, language=self.language, beam_size=self.beam_size, vad_filter=False,
             condition_on_previous_text=False, initial_prompt=self.initial_prompt,
             temperature=0.0, hotwords=hotwords,
         )
@@ -315,27 +347,23 @@ class STT:
 
     def _listen_transcribe(self, hotwords: str | None = None,
                            min_audio_s: float = 0.0, **vad_kwargs) -> str:
-        """Graba y transcribe. min_audio_s: si el WAV quedó más corto (el VAD
-        nunca detectó voz: grabación vacía), devuelve "" SIN pasar por Whisper
-        — el modelo paddea a ventanas de 30s, así que transcribir silencio
-        cuesta ~1s con el micrófono cerrado. En el bucle del wake eso era una
-        ventana SORDA cada ciclo silencioso; ahora el mic reabre de inmediato.
+        """Graba y transcribe EN MEMORIA (sin WAV temporal). min_audio_s: si la
+        grabación quedó más corta (el VAD nunca detectó voz), devuelve "" SIN
+        pasar por Whisper — el modelo paddea a ventanas de 30s, así que
+        transcribir silencio cuesta ~1s con el micrófono cerrado. En el bucle
+        del wake eso era una ventana SORDA cada ciclo silencioso; ahora el mic
+        reabre de inmediato.
         """
-        path = self.record_until_silence(**vad_kwargs)
-        try:
-            if min_audio_s > 0 and _wav_seconds(path) < min_audio_s:
-                return ""
-            return self.transcribe(path, hotwords=hotwords)
-        finally:
-            try:
-                path.unlink(missing_ok=True)
-            except OSError as error:
-                log.debug("no pude borrar el WAV temporal %s: %s", path, error)
+        audio = self.record_audio_until_silence(**vad_kwargs)
+        if min_audio_s > 0 and (audio.size / self.sample_rate) < min_audio_s:
+            return ""
+        return self.transcribe(audio, hotwords=hotwords)
 
     def listen_smart(self, silence_ms: int | None = None, max_seconds: float = 12.0,
                      start_timeout_s: float = 4.0, rounds: int = 2,
                      continue_timeout_s: float = 2.5,
-                     hotwords: str | None = None) -> str:
+                     hotwords: str | None = None,
+                     min_audio_s: float = 0.0) -> str:
         """Escucha con endpointing inteligente: si la frase parece INCOMPLETA
         (pausa de pensar: termina en "de", "para", coma...), reabre la escucha
         `continue_timeout_s` segundos y concatena la continuación, hasta
@@ -345,15 +373,15 @@ class STT:
         from crotolamo.voice.endpoint import seems_incomplete
 
         text = self._listen_transcribe(
-            hotwords=hotwords, silence_ms=silence_ms, max_seconds=max_seconds,
-            start_timeout_s=start_timeout_s,
+            hotwords=hotwords, min_audio_s=min_audio_s, silence_ms=silence_ms,
+            max_seconds=max_seconds, start_timeout_s=start_timeout_s,
         )
         for _ in range(max(0, rounds)):
             if not text.strip() or not seems_incomplete(text):
                 break
             extra = self._listen_transcribe(
-                hotwords=hotwords, silence_ms=silence_ms, max_seconds=max_seconds,
-                start_timeout_s=continue_timeout_s,
+                hotwords=hotwords, min_audio_s=min_audio_s, silence_ms=silence_ms,
+                max_seconds=max_seconds, start_timeout_s=continue_timeout_s,
             )
             if not extra.strip():
                 break

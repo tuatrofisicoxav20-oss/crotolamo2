@@ -92,7 +92,9 @@ class VoiceLoop:
             self._mic,
             wake_fn or wake_detector.feed,
             vad_fn or _SileroVad(),
-            to_wav or stt._frames_to_wav,
+            # Camino caliente EN MEMORIA: los frames van directo a Whisper como
+            # ndarray (SttThread lo acepta), sin WAV temporal por comando.
+            to_wav or stt._frames_to_audio,
             tts, self.stt_q, self.tts_q, self.state, self.shutdown,
             allow_barge_in=allow_barge_in, silence_ms=silence_ms,
             vad_threshold=vcfg.get("vad_threshold", 0.8),

@@ -170,13 +170,16 @@ def _run_simple_loop(
     """
 
     def listen_command(start_timeout_s: float = 4.0) -> str:
+        # min_audio_s: si nadie habló, NO se transcribe el silencio (Whisper
+        # paddea a 30s; eso costaba ~1s de mic sordo por ventana vacía).
         if cfg.smart_endpoint:
             return stt.listen_smart(
                 silence_ms=cfg.silence_ms, start_timeout_s=start_timeout_s,
                 rounds=cfg.endpoint_rounds, continue_timeout_s=cfg.endpoint_continue_s,
-                hotwords=cfg.hotwords,
+                hotwords=cfg.hotwords, min_audio_s=0.3,
             )
-        return stt.listen_once(silence_ms=cfg.silence_ms, start_timeout_s=start_timeout_s)
+        return stt.listen_once(silence_ms=cfg.silence_ms, start_timeout_s=start_timeout_s,
+                               min_audio_s=0.3)
 
     while True:
         try:
@@ -339,6 +342,23 @@ def run_listen(argv: list[str] | None = None) -> int:
         initial_prompt=None,
     )
     tts = TTS.from_settings(settings)
+
+    # Precalentar la VOZ en segundo plano: Whisper (comando y wake) y Piper se
+    # cargaban en el PRIMER uso, así que la primera orden pagaba varios segundos
+    # de carga de modelos (sorda al transcribir, muda al responder). Cargarlos
+    # al arrancar deja el primer turno igual de rápido que los demás.
+    def _warm_voice() -> None:
+        try:
+            stt._get_model()
+            if wake_stt.model_size != stt.model_size:
+                wake_stt._get_model()
+            if tts.available():
+                tts._get_voice()
+            log.info("voz caliente (Whisper y Piper cargados)")
+        except Exception as error:  # noqa: BLE001 - sin extra [voice], se avisa al usar
+            log.warning("no pude precalentar la voz: %s", error)
+
+    threading.Thread(target=_warm_voice, name="WarmVoice", daemon=True).start()
 
     # M1: wake word dedicado con openWakeWord; si no está, fallback al difuso (Whisper).
     # [wake].use_oww = false fuerza el wake DIFUSO (Whisper), que sí reconoce

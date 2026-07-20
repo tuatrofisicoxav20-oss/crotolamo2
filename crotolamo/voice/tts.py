@@ -138,17 +138,52 @@ class TTS:
             return
 
         try:
-            audio, sample_rate = self.synthesize_pcm(text)
+            self._speak_streaming(text)
         except Exception as error:  # noqa: BLE001 - una voz rota no debe matar el agente
-            log.warning("error sintetizando con Piper: %s", error)
-            return
+            log.warning("error sintetizando/reproduciendo con Piper: %s", error)
 
-        if audio.size == 0:
-            return
+    def _speak_streaming(self, text: str) -> bool:
+        """Sintetiza y reproduce por CHUNKS conforme Piper los genera.
+
+        Antes se sintetizaba la frase ENTERA (list + concatenate) y recién ahí
+        sonaba: la latencia a la primera palabra era toda la síntesis. Ahora el
+        primer chunk suena en cuanto existe. Se escribe en rebanadas cortas
+        (~90ms) vigilando el stop, así el corte (barge-in) sigue siendo casi
+        inmediato. Devuelve False si se cortó a media frase.
+        """
+        import numpy as np
+        import sounddevice as sd
+
+        voice = self._get_voice()
+        self._stop_flag.clear()
+        stream = None
+        step = 2048  # muestras por escritura: corte perceptible en <100ms
         try:
-            self._play_interruptible(audio, sample_rate)
-        except Exception as error:  # noqa: BLE001 - p.ej. sin dispositivo de audio en headless
-            log.warning("no pude reproducir el audio: %s", error)
+            for chunk in voice.synthesize(text):
+                if self._stop_flag.is_set():
+                    return False
+                audio = np.ascontiguousarray(chunk.audio_int16_array).reshape(-1)
+                if audio.size == 0:
+                    continue
+                if stream is None:
+                    stream = sd.OutputStream(
+                        samplerate=int(chunk.sample_rate), channels=1, dtype="int16",
+                    )
+                    stream.start()
+                for i in range(0, audio.size, step):
+                    if self._stop_flag.is_set():
+                        return False
+                    stream.write(audio[i:i + step])
+            return True
+        finally:
+            if stream is not None:
+                try:
+                    if self._stop_flag.is_set():
+                        stream.abort()
+                    stream.stop()
+                    stream.close()
+                except Exception:  # noqa: BLE001 - cerrar audio es best-effort
+                    pass
 
     def _play_interruptible(self, audio, sample_rate: int) -> bool:
         """Reproduce vigilando el stop en pasos cortos (sd.wait() no es interrumpible).
