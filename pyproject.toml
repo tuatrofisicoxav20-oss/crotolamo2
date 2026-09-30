@@ -48,6 +48,13 @@ target-version = "py311"
 # reference/ es código viejo de C1 guardado como referencia: no se lintea.
 extend-exclude = ["reference"]
 
+[tool.ruff.lint]
+# Conjunto de reglas EXPLÍCITO (el default clásico de ruff: pyflakes + los E
+# de sintaxis/import/comparación). Sin esto, la versión de ruff que instale CI
+# decide las reglas: una más nueva activaba UP/PIE/RUF100 y tumbaba el lint con
+# ~115 avisos que en local no existían.
+select = ["E4", "E7", "E9", "F"]
+
 [tool.mypy]
 # Básico y pragmático (L3): no perseguir perfección. Solo chequea lo anotado y
 # tolera las libs de voz sin stubs.
