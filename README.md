@@ -105,7 +105,7 @@ O a mano:
 
 ```bash
 python -m crotolamo --version
-python -m crotolamo doctor      # auditor de salud
+python -m crotolamo doctor      # auditor de salud: REQUERIDOS (key, nube, stt, tts, aec) y opcionales; se ajusta en [doctor]
 python -m crotolamo shell       # REPL de texto
 python -m crotolamo listen      # bucle de voz wake-word (requiere extra [voice])
 ```

@@ -50,6 +50,51 @@ crotolamo1 = "~/Documentos/crotolamo2/reference/c1_checkpoint/chapi_assistant"
 # Nivel de log de diagnóstico (DEBUG/INFO/WARNING/ERROR). La env CROTOLAMO_LOG manda.
 level = "INFO"
 
+# Doctor (`python -m crotolamo doctor`): qué pila debe auditar. Los defaults
+# describen lo que trae ESTE repo: nube OpenAI-compatible vía [llm.glm] (con su
+# key en la env), STT faster-whisper, TTS Piper ([paths].voces + [voice].piper_voice),
+# AEC de PipeWire (desktop/aec.sh) y un servicio de música. El doctor no adivina:
+# si tu stack es otro, apúntalo aquí (mejor en crotolamo.local.toml). Ejemplo
+# para la pila Groq + Parakeet + Kokoro + Soloist:
+#   [llm.glm]  base_url = "https://api.groq.com/openai/v1"   (y model = el de Groq)
+#   [doctor]   stt_module = "onnx_asr"
+#              tts_model  = "~/Documentos/crotolamo2/voices/kokoro-v1.0.onnx"
+#              tts_voices = "~/Documentos/crotolamo2/voices/voices-v1.0.bin"
+#              tts_voice  = "em_alex"
+# Un REQUERIDO en rojo (key, nube, stt, tts, aec) hace salir con 1; los
+# opcionales (Ollama de respaldo, música, Spotify, listeners...) solo se reportan.
+[doctor]
+# STT principal: módulo Python que debe importar ("faster_whisper"; "onnx_asr" para
+# Parakeet). stt_model: ruta (con ~) de un modelo en disco que debe existir; vacío
+# = no hay archivo que comprobar (faster-whisper descarga y cachea el suyo).
+stt_module = "faster_whisper"
+stt_model  = ""
+# TTS principal. tts_model vacío = Piper: se comprueba [paths].voces/[voice].piper_voice
+# (y su .onnx.json al lado). Con tts_model (p.ej. Kokoro) se comprueba ese archivo;
+# tts_voices = archivo de voces (.bin/.npz de numpy o .json) y tts_voice = la voz
+# que debe contener. Vacíos = no se comprueban.
+tts_model  = ""
+tts_voices = ""
+tts_voice  = ""
+# Nodos PipeWire de la cancelación de eco (los crea desktop/aec.sh). Deben existir,
+# ser el source y el sink por DEFECTO (sin el sink como default, el AEC no tiene
+# referencia y Crotolamo se activa con su propia voz) y el source sin mute. Si
+# [voice].input_device apunta al source, que no sea el default solo avisa.
+# aec_source = "" y aec_sink = "" desactivan el check (máquina sin AEC).
+aec_source = "crotolamo_aec_source"
+aec_sink   = "crotolamo_aec_sink"
+# Servicio de música: unidad de `systemctl --user` y su WebSocket local.
+# musica_service = "" desactiva el check del servicio (el del WebSocket sigue).
+musica_service = "soloist.service"
+musica_host    = "127.0.0.1"
+musica_port    = 9090
+# Fecha (TOML, sin comillas) en que caduca la credencial del servicio de música y
+# con cuántos días de antelación avisar (⚠️). Ponla a "" para no vigilarla.
+musica_caduca     = 2026-11-29
+musica_aviso_dias = 14
+# Env con el client id de Spotify. Solo se comprueba que exista; nunca se imprime.
+spotify_client_id_env = "SPOTIFY_CLIENT_ID"
+
 [llm]
 # Motor de inferencia: "ollama" (local, CPU) o "glm" (nube, Z.ai).
 #
