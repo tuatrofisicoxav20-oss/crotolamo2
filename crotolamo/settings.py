@@ -69,6 +69,13 @@ class Settings:
     def persona(self) -> dict[str, Any]:
         return self.raw.get("persona", {})
 
+    @property
+    def mcp(self) -> dict[str, Any]:
+        """Sección [mcp] (M4). Los servers van como tablas nombradas
+        [mcp.servers.<nombre>] para que _deep_merge los fusione con el local.toml
+        (un array de tablas se pisaría entero)."""
+        return self.raw.get("mcp", {})
+
     def validate_critical(self) -> list[str]:
         """Devuelve lista de problemas con rutas críticas (no lanza)."""
         problems = []

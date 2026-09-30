@@ -17,19 +17,50 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Iterator
 
 from crotolamo.safety.paths import path_inside_roots
 from crotolamo.tools.base import Tool
 
 # Nombres de argumentos que típicamente contienen rutas de archivo (Fase 3).
-_PATH_ARG_NAMES = {"path", "ruta", "file", "archivo", "dest", "destino", "src", "origen", "dir"}
+# Los plurales (M4) cubren las listas de rutas de los servers MCP
+# (p.ej. read_multiple_files(paths=[...]) del server de filesystem).
+_PATH_ARG_NAMES = {
+    "path", "ruta", "file", "archivo", "dest", "destino", "src", "origen", "dir",
+    "paths", "rutas",
+}
 
 # Prefijos que delatan una ruta del sistema de archivos (señal aparte del nombre).
 _PATH_PREFIXES = ("/", "~/", "./", "../")
 
+# Tope de anidamiento al recorrer argumentos (M4). Los argumentos de una tool MCP
+# son JSON arbitrario; con 8 niveles sobra para cualquier esquema real y un JSON
+# patológico (miles de niveles) no nos revienta la pila. Más hondo, no se mira.
+_MAX_DEPTH = 8
+
 
 def _looks_like_path(value: str) -> bool:
     return value.startswith(_PATH_PREFIXES)
+
+
+def _iter_strings(value: Any, key: str, depth: int = 0) -> Iterator[tuple[str, str]]:
+    """Recorre un argumento (posiblemente anidado) y va soltando (nombre, string).
+
+    Cada string lleva como "nombre" la clave del dict más cercano que lo contiene
+    (los elementos de una lista heredan la clave de la lista): así una lista bajo
+    `paths` se clasifica igual que un `path` suelto. Recursión simple con tope.
+    """
+    if isinstance(value, str):
+        if value:
+            yield key, value
+    elif depth >= _MAX_DEPTH:
+        return
+    elif isinstance(value, dict):
+        for sub_key, sub_value in value.items():
+            yield from _iter_strings(sub_value, str(sub_key), depth + 1)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_strings(item, key, depth + 1)
 
 
 @dataclass
@@ -78,10 +109,11 @@ class Guard:
         """Decide si una llamada a tool puede correr."""
         # 1) Clasificar en zonas cualquier argumento que sea una ruta:
         #    por nombre conocido (señal fuerte) O porque el valor parece un path.
+        #    Se recorren también listas y dicts anidados (M4): las tools MCP
+        #    reciben JSON arbitrario y una ruta escondida en {"opciones":
+        #    {"ruta": "/etc/passwd"}} merece el mismo corral que una de primer nivel.
         confirm_reason = ""
-        for arg_name, value in arguments.items():
-            if not isinstance(value, str) or not value:
-                continue
+        for arg_name, value in _iter_strings(arguments, ""):
             is_path_arg = arg_name.lower() in _PATH_ARG_NAMES or _looks_like_path(value)
             if not is_path_arg:
                 continue

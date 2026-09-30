@@ -2,7 +2,31 @@
 
 from __future__ import annotations
 
+from crotolamo.logging_setup import get_logger
 from crotolamo.tools.base import GLOBAL_REGISTRY, Registry, Tool, tool
+
+log = get_logger("tools")
+
+
+def _register_mcp_if_enabled() -> None:
+    """M4: suma las tools de los servers MCP de `[mcp]` al registry global.
+
+    Solo si `[mcp].enabled = true`; y pase lo que pase (config rota, server que
+    no arranca, bug del puente) aquí se loguea y se sigue: el arranque de
+    Crotolamo no depende de ningún proceso externo. El bridge es idempotente,
+    así que llamar default_registry() varias veces no relanza nada.
+    """
+    try:
+        from crotolamo.settings import get_settings
+
+        settings = get_settings()
+        if not settings.mcp.get("enabled", False):
+            return
+        from crotolamo.mcp.bridge import register_mcp_tools
+
+        register_mcp_tools(GLOBAL_REGISTRY, settings)
+    except Exception as error:  # noqa: BLE001 — MCP es opcional; nunca tumba el arranque
+        log.warning("no pude registrar las tools MCP: %s", error)
 
 
 def default_registry() -> Registry:
@@ -22,6 +46,7 @@ def default_registry() -> Registry:
         windows,
     )
 
+    _register_mcp_if_enabled()
     return GLOBAL_REGISTRY
 
 

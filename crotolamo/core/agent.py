@@ -136,8 +136,12 @@ class ToolAgent(Agent):
         # que rompería el short-circuit (lo trataría como fallo duro). Filtramos
         # los kwargs no declarados por ESTA tool antes de ejecutar. No oculta
         # errores de args REQUERIDOS ausentes: esos siguen reventando como antes.
-        declared = set(tool.parameters.get("properties", {}).keys())
-        arguments = {k: v for k, v in arguments.items() if k in declared}
+        # Las tools con strict_args=False (MCP, M4) se saltan el filtro: su
+        # esquema lo dicta el server y puede ser anidado o abierto
+        # (additionalProperties); mutilarlo rompería llamadas legítimas.
+        if getattr(tool, "strict_args", True):
+            declared = set(tool.parameters.get("properties", {}).keys())
+            arguments = {k: v for k, v in arguments.items() if k in declared}
 
         decision = self.guard.check(tool, arguments)
         if not decision.allowed:
