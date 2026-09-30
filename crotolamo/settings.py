@@ -85,6 +85,22 @@ class Settings:
         return problems
 
 
+def _path_list(paths_raw: dict, key: str, default: list[str]) -> list[Path]:
+    """Lista de rutas de [paths].<key>, validada.
+
+    Un typo como `allowed_roots = "~/Documentos"` (string en vez de lista) se
+    iteraba carácter a carácter y metía "/" como raíz permitida: TODO el disco
+    quedaba en zona libre sin confirmación. Mejor no arrancar que arrancar así.
+    """
+    raw = paths_raw.get(key, default)
+    if not isinstance(raw, list) or not all(isinstance(p, str) for p in raw):
+        raise ValueError(
+            f"[paths].{key} debe ser una lista de rutas (strings), "
+            f"no {type(raw).__name__}: {raw!r}"
+        )
+    return [_expand(p) for p in raw]
+
+
 def load_settings(config_path: Path | None = None) -> Settings:
     """Carga la configuración fusionando default + local."""
     path = config_path or DEFAULT_CONFIG
@@ -105,9 +121,9 @@ def load_settings(config_path: Path | None = None) -> Settings:
         if key not in {"allowed_roots"} and isinstance(value, str)
     }
 
-    allowed_roots = [_expand(p) for p in paths_raw.get("allowed_roots", [])]
+    allowed_roots = _path_list(paths_raw, "allowed_roots", [])
     # [paths].confirm_roots puede no existir aún en el toml: default ["~"].
-    confirm_roots = [_expand(p) for p in paths_raw.get("confirm_roots", ["~"])]
+    confirm_roots = _path_list(paths_raw, "confirm_roots", ["~"])
     projects = {name: _expand(p) for name, p in data.get("projects", {}).items()}
 
     return Settings(

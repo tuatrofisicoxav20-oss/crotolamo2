@@ -39,8 +39,22 @@ _PATH_PREFIXES = ("/", "~/", "./", "../")
 _MAX_DEPTH = 8
 
 
+# Argumentos que llevan CONTENIDO (texto libre), nunca rutas: a ellos no se les
+# aplica la heurística de prefijo. Sin esta lista, write_file(content="/usr/bin/
+# env python3 ...") se bloqueaba como "ruta fuera del corral" y remember_fact(
+# texto="~/proyectos es donde guardo todo") pedía confirmación (y en el modo
+# concurrente se cancelaba). El nombre de argumento que SÍ es ruta
+# (_PATH_ARG_NAMES) sigue mandando aunque el valor no lleve prefijo.
+_CONTENT_ARG_NAMES = {
+    "content", "contenido", "text", "texto", "query", "pattern", "patron", "patrón",
+    "title", "titulo", "título", "body", "message", "mensaje", "prompt", "reason",
+    "note", "nota", "fact", "hecho", "value", "valor",
+}
+
+
 def _looks_like_path(value: str) -> bool:
-    return value.startswith(_PATH_PREFIXES)
+    # Un valor con saltos de línea es contenido (un script, una nota), no una ruta.
+    return value.startswith(_PATH_PREFIXES) and "\n" not in value
 
 
 def _iter_strings(value: Any, key: str, depth: int = 0) -> Iterator[tuple[str, str]]:
@@ -114,7 +128,10 @@ class Guard:
         #    {"ruta": "/etc/passwd"}} merece el mismo corral que una de primer nivel.
         confirm_reason = ""
         for arg_name, value in _iter_strings(arguments, ""):
-            is_path_arg = arg_name.lower() in _PATH_ARG_NAMES or _looks_like_path(value)
+            name = arg_name.lower()
+            is_path_arg = name in _PATH_ARG_NAMES or (
+                name not in _CONTENT_ARG_NAMES and _looks_like_path(value)
+            )
             if not is_path_arg:
                 continue
             candidate = Path(value)

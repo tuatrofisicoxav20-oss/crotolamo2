@@ -151,6 +151,23 @@ class ToolAgent(Agent):
 
         return self.registry.run(name, arguments)
 
+    def _safe_execute(self, name: str, arguments: dict) -> str:
+        """_execute_call que NUNCA propaga: siempre hay un resultado que anotar.
+
+        Registry.run ya atrapa lo que revienta DENTRO de la tool, pero el guard
+        (p.ej. un '\\0' en la ruta) o el confirm_fn (STT/sounddevice) pueden
+        lanzar antes. Si eso escapaba tras add_assistant(tool_calls=...), el
+        historial quedaba con un assistant pidiendo tools sin su resultado y
+        las APIs OpenAI-compatibles (GLM) rechazaban TODOS los turnos siguientes
+        hasta /reset. El prefijo "La tool '" lo marca como fallo duro (sin
+        short-circuit), igual que un reventón dentro de la tool.
+        """
+        try:
+            return self._execute_call(name, arguments)
+        except Exception as error:  # noqa: BLE001 - un fallo del guard/confirm no rompe el turno
+            log.exception("la tool '%s' reventó fuera del registry", name)
+            return f"La tool '{name}' reventó, patrón: {error}"
+
     def _is_direct(self, name: str) -> bool:
         """True si la tool es de retorno directo: o bien está en el set inyectado
         `direct_tools`, o bien su definición lleva el flag `Tool.direct=True`.
@@ -187,7 +204,7 @@ class ToolAgent(Agent):
             hit = fastpath_mod.match(routing_text)
             if hit is not None:
                 fast_name, fast_args = hit
-                result = self._execute_call(fast_name, fast_args)
+                result = self._safe_execute(fast_name, fast_args)
                 if not _is_hard_error(result):
                     reply = self._apply(self.post_hooks, result)
                     self.conversation.add_user(text)
@@ -247,7 +264,7 @@ class ToolAgent(Agent):
 
             results: list[tuple[str, str]] = []
             for call in calls:
-                result = self._execute_call(call["name"], call.get("arguments", {}))
+                result = self._safe_execute(call["name"], call.get("arguments", {}))
                 self.conversation.add_tool_result(call["name"], result)
                 results.append((call["name"], result))
 
