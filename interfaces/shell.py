@@ -8,6 +8,8 @@ Comandos del shell:
 
 from __future__ import annotations
 
+from typing import Any, Callable
+
 from crotolamo.core.agent import Agent
 from crotolamo.core.engine import build_llm
 from crotolamo.core.memory import Conversation
@@ -70,13 +72,16 @@ def build_agent(confirm_fn=None) -> tuple[Agent, Conversation]:
         use_routing = settings.llm.get("tool_routing", True)
         max_tools = settings.llm.get("max_tools", 8)
 
+        route_fn: Callable[[str], list[dict[str, Any]]] | None
         if glm_brain:
             # GLM ve TODO el arsenal; si el breaker degradó a Ollama local
             # (sin internet), se vuelve al routing chico para no pagar ~130s.
-            def route_fn(text: str):
+            def _route_glm(text: str) -> list[dict[str, Any]]:
                 if llm.degraded and use_routing:
                     return route_schemas(registry, text, max_tools)
                 return registry.schemas()
+
+            route_fn = _route_glm
         else:
             route_fn = (
                 (lambda t: route_schemas(registry, t, max_tools))
