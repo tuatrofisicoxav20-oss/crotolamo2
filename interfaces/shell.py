@@ -14,7 +14,10 @@ from crotolamo.core.agent import Agent
 from crotolamo.core.engine import build_llm
 from crotolamo.core.memory import Conversation
 from crotolamo.core.persona import system_prompt
+from crotolamo.logging_setup import get_logger
 from crotolamo.settings import get_settings
+
+log = get_logger("shell")
 
 
 def build_agent(confirm_fn=None) -> tuple[Agent, Conversation]:
@@ -102,6 +105,12 @@ def build_agent(confirm_fn=None) -> tuple[Agent, Conversation]:
             direct_tools=set() if glm_brain else None,
         )
     except Exception:
+        # Degradar a un agente SIN tools mantiene a Crotolamo hablando, pero no
+        # puede ser silencioso: un ImportError en un módulo de tools dejaba al
+        # asistente sordo a "abre X" sin ninguna pista en el log.
+        log.exception(
+            "no pude armar las tools; Crotolamo arranca SIN herramientas (solo charla)"
+        )
         agent = Agent(llm, conversation)
 
     return agent, conversation
