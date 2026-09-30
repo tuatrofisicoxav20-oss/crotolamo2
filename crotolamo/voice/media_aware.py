@@ -96,10 +96,16 @@ class PlayerctlBackend:
 
     def playing_players(self) -> list[str]:
         result = self._run(["-a", "metadata", "--format", "{{playerName}}\t{{status}}"])
-        if result is None or result.returncode != 0:
-            # returncode != 0 incluye el "No players found" de playerctl.
+        if result is None:
             return []
-        return _parse_playing(result.stdout or "")
+        stdout = result.stdout or ""
+        # returncode != 0 con stdout vacío es el "No players found" de
+        # playerctl. Pero también sale != 0 si UN reproductor no tiene metadata
+        # (una pestaña sin pista) aunque los demás sí imprimieron su línea: en
+        # ese caso lo que hay en stdout vale.
+        if result.returncode != 0 and not stdout.strip():
+            return []
+        return _parse_playing(stdout)
 
     def get_volume(self, player: str) -> str | None:
         if not player.strip():
@@ -115,6 +121,19 @@ class PlayerctlBackend:
             return False
         result = self._run(["-p", player, "volume", value])
         return result is not None and result.returncode == 0
+
+
+def sane_media_threshold(normal: float, media: float | None, where: str) -> float | None:
+    """El umbral con música nunca puede ser MENOR que el normal: con
+    [wake].threshold = 0.9 y el default wake_threshold_media = 0.85, la música
+    RELAJARÍA el wake (efecto inverso). Se sube al normal con aviso."""
+    if media is None:
+        return None
+    if media < normal:
+        log.warning("%s: umbral con música %.2f < umbral normal %.2f; uso %.2f",
+                    where, media, normal, normal)
+        return normal
+    return media
 
 
 def _parse_playing(stdout: str) -> list[str]:
@@ -281,6 +300,9 @@ class Ducker:
         self._worker: threading.Thread | None = None
         self._worker_lock = threading.Lock()
         self._closed = False
+        # Se activa cuando close() ya esperó al worker: a partir de ahí ningún
+        # duck (tardío o encolado por error) puede pisar el restore final.
+        self._no_more_duck = False
         # Último "deseo" recibido por on_mode: el publisher dispara en CADA
         # cambio de estado (texto, turno, enabled) con el modo vigente; solo se
         # encola trabajo cuando cambia idle <-> no-idle. Su lock hace atómico el
@@ -288,6 +310,16 @@ class Ducker:
         # y sin él dos publicaciones casi simultáneas podrían perder un restore.
         self._want_duck: bool | None = None
         self._mode_lock = threading.Lock()
+        # Reproductores que ya avisaron que no exponen volumen (Firefox por
+        # MPRIS, p.ej.): el WARNING va una vez; después, DEBUG en cada wake.
+        self._warned: set[str] = set()
+
+    def _warn_once(self, name: str, message: str, *args: object) -> None:
+        if name in self._warned:
+            log.debug(message, *args)
+            return
+        self._warned.add(name)
+        log.warning(message, *args)
 
     # --- API síncrona ---
     def is_ducked(self) -> bool:
@@ -295,8 +327,14 @@ class Ducker:
             return bool(self._saved)
 
     def duck(self) -> None:
-        """Baja el volumen de TODO lo que suena (sondeo fresco) a volumen*factor."""
-        if not self.enabled:
+        """Baja el volumen de TODO lo que suena (sondeo fresco) a volumen*factor.
+
+        Una vez que close() terminó de esperar al worker, es no-op: si el worker
+        seguía atascado (D-Bus colgado) con un duck en cola, ese duck se
+        aplicaría DESPUÉS del restore final del apagado y la música quedaría
+        atorada baja. Lo encolado ANTES de close sí se procesa, en orden.
+        """
+        if not self.enabled or self._no_more_duck:
             return
         with self._lock:
             if self._saved:
@@ -328,7 +366,8 @@ class Ducker:
                 log.warning("duck: no pude leer el volumen de %s: %s", name, error)
                 continue
             if raw is None:
-                log.warning("duck: no pude leer el volumen de %s; lo dejo como está", name)
+                self._warn_once(name, "duck: no pude leer el volumen de %s; lo dejo como está",
+                                name)
                 continue
             try:
                 current = float(raw)
@@ -346,7 +385,7 @@ class Ducker:
                 log.warning("duck: no pude bajar el volumen de %s: %s", name, error)
                 continue
             if not ok:
-                log.warning("duck: %s rechazó el volumen %s", name, target)
+                self._warn_once(name, "duck: %s rechazó el volumen %s", name, target)
                 continue
             log.debug("duck: %s %s -> %s", name, raw, target)
 
@@ -444,7 +483,10 @@ class Ducker:
         with self._worker_lock:
             self._closed = True
             worker = self._worker
-        if worker is None or not worker.is_alive():
-            return
-        self._q.put(None)
-        worker.join(timeout=timeout_s)
+        try:
+            if worker is None or not worker.is_alive():
+                return
+            self._q.put(None)
+            worker.join(timeout=timeout_s)
+        finally:
+            self._no_more_duck = True

@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import threading
 from typing import Any
@@ -193,13 +194,49 @@ class StdioMCPClient:
             target=self._drain_stderr, name=f"mcp-{self.name}-stderr", daemon=True,
         )
         self._stderr_thread.start()
-        log.debug("MCP '%s': lanzado pid=%s (%s)", self.name, self._proc.pid, self.command)
+        # Solo el ejecutable: el argv completo puede llevar un token expandido
+        # de $VARS y acabaría en el log.
+        log.debug("MCP '%s': lanzado pid=%s (%s)", self.name, self._proc.pid, self.command[0])
+
+    def _signal_group(self, proc: subprocess.Popen[bytes], sig: int) -> None:
+        """Señal a TODO el grupo de procesos del server (somos su líder por
+        start_new_session). Con un wrapper (npx, uvx, sh -c) el hijo directo es
+        el launcher; el nieto que habla el protocolo retiene NUESTRAS tuberías,
+        y matar solo al hijo dejaba al lector sin EOF y el cierre colgado."""
+        try:
+            if hasattr(os, "killpg"):
+                os.killpg(proc.pid, sig)
+            else:  # pragma: no cover - solo Linux en este proyecto
+                proc.send_signal(sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                proc.send_signal(sig)
+            except (ProcessLookupError, OSError):
+                pass
+
+    def _reader_alive(self) -> bool:
+        return self._reader is not None and self._reader.is_alive()
+
+    def _stop_process(self, proc: subprocess.Popen[bytes], sig: int, timeout: float) -> bool:
+        """Manda `sig` al grupo si hace falta y espera al hijo. True si terminó."""
+        if proc.poll() is None or self._reader_alive():
+            self._signal_group(proc, sig)
+        try:
+            proc.wait(timeout=timeout)
+            return True
+        except subprocess.TimeoutExpired:
+            return False
 
     def close(self) -> None:
         """Cierra el server: stdin, luego SIGTERM, luego SIGKILL si se resiste.
 
-        Idempotente. Cerrar stdin primero es la señal "educada" de la spec: un
-        server bien hecho termina solo al ver EOF; el resto es red de seguridad.
+        Idempotente y ACOTADO (~6 s peor caso). Cerrar stdin primero es la señal
+        "educada" de la spec: un server bien hecho termina solo al ver EOF; el
+        resto es red de seguridad. Las señales van al grupo entero (ver
+        _signal_group) y las tuberías solo se cierran si sus hilos ya salieron:
+        cerrar un BufferedReader con el lector bloqueado dentro de read() se
+        cuelga sin plazo (espera el lock del buffer), y eso colgaba el arranque
+        entero cuando un server no completaba el handshake.
         """
         if self._closed:
             return
@@ -208,32 +245,41 @@ class StdioMCPClient:
         self._mark_dead("cliente cerrado")
         if proc is None:
             return
-        for step in (self._close_stdin, proc.terminate):
-            try:
-                step()
-            except (OSError, ValueError):
-                pass
         try:
-            proc.wait(timeout=2)
-        except subprocess.TimeoutExpired:
+            self._close_stdin()
+        except (OSError, ValueError):
+            pass
+        if not self._stop_process(proc, signal.SIGTERM, timeout=2.0):
             log.debug("MCP '%s': no terminó con SIGTERM; SIGKILL", self.name)
-            try:
-                proc.kill()
-                proc.wait(timeout=2)
-            except (OSError, subprocess.TimeoutExpired):
-                pass
-        # Los hilos ven EOF al morir el proceso; les damos un respiro para no
-        # dejar descriptores abiertos a medias.
+            self._stop_process(proc, signal.SIGKILL, timeout=2.0)
+        # Los hilos ven EOF al morir el grupo; les damos un respiro.
         for thread in (self._reader, self._stderr_thread):
             if thread is not None and thread is not threading.current_thread():
                 thread.join(timeout=1)
-        for pipe in (proc.stdout, proc.stderr):
+        for thread, pipe in ((self._reader, proc.stdout), (self._stderr_thread, proc.stderr)):
+            if pipe is None or (thread is not None and thread.is_alive()):
+                # Alguien retiene el otro extremo (un nieto inmortal): el hilo
+                # daemon muere con el proceso; cerrar aquí se colgaría.
+                continue
             try:
-                if pipe is not None:
-                    pipe.close()
+                pipe.close()
             except (OSError, ValueError):
                 pass
         log.debug("MCP '%s': cerrado (returncode=%s)", self.name, proc.returncode)
+
+    def terminate_now(self) -> None:
+        """Apagado por señal del listener (os._exit se salta atexit): cierra
+        stdin y manda SIGTERM al grupo SIN esperar. Best-effort, nunca lanza."""
+        self._closed = True
+        proc = self._proc
+        self._mark_dead("apagado")
+        if proc is None:
+            return
+        try:
+            self._close_stdin()
+        except (OSError, ValueError):
+            pass
+        self._signal_group(proc, signal.SIGTERM)
 
     def _close_stdin(self) -> None:
         proc = self._proc
@@ -410,11 +456,15 @@ class StdioMCPClient:
                     reason = f"basura no-JSON en stdout: {line[:80]!r}"
                     log.warning("MCP '%s': %s", self.name, reason)
                     break
-                if isinstance(message, list):  # batch JSON-RPC (versiones viejas)
-                    for item in message:
-                        self._dispatch(item)
-                else:
-                    self._dispatch(message)
+                try:
+                    if isinstance(message, list):  # batch JSON-RPC (versiones viejas)
+                        for item in message:
+                            self._dispatch(item)
+                    else:
+                        self._dispatch(message)
+                except Exception as error:  # noqa: BLE001 - un mensaje raro no mata el lector
+                    log.warning("MCP '%s': mensaje que no pude despachar (%s): %.80r",
+                                self.name, error, line)
         except (OSError, ValueError) as error:
             reason = f"error leyendo stdout: {error}"
         finally:
@@ -432,6 +482,12 @@ class StdioMCPClient:
             return
         if not has_id:
             log.debug("MCP '%s': mensaje sin id ni method, ignorado", self.name)
+            return
+        if not isinstance(message["id"], int) or isinstance(message["id"], bool):
+            # Nuestros ids son enteros: cualquier otra cosa (una lista, un dict,
+            # un string) no puede ser respuesta a algo nuestro y, si no es
+            # hasheable, reventaría el hilo lector al buscarla en _pending.
+            log.debug("MCP '%s': respuesta con id inválido %r, ignorada", self.name, message["id"])
             return
         with self._pending_lock:
             pending = self._pending.pop(message["id"], None)

@@ -109,9 +109,19 @@ class MCPConfig:
     servers: list[MCPServerConfig] = field(default_factory=list)
 
 
-def _expand(value: str) -> str:
-    """~ y $VARS, como el resto de rutas de la config (settings._expand)."""
-    return os.path.expandvars(os.path.expanduser(value))
+_UNEXPANDED = re.compile(r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?")
+
+
+def _expand(value: str, where: str = "[mcp]") -> str:
+    """~ y $VARS, como el resto de rutas de la config (settings._expand).
+
+    Una variable sin definir se queda LITERAL ("$TOKEN") y se manda tal cual al
+    server: mejor avisar que descubrirlo por un 401 opaco.
+    """
+    out = os.path.expandvars(os.path.expanduser(value))
+    if _UNEXPANDED.search(out):
+        log.warning("%s: variable de entorno sin definir en %r; se manda tal cual", where, value)
+    return out
 
 
 def _positive_number(raw: Any, default: float, key: str, where: str) -> float:
@@ -156,7 +166,7 @@ def _parse_server(name: str, table: Any, defaults: MCPConfig) -> MCPServerConfig
     if isinstance(env_raw, dict):
         for key, value in env_raw.items():
             if isinstance(value, (str, int, float)) and not isinstance(value, bool):
-                env[str(key)] = _expand(str(value))
+                env[str(key)] = _expand(str(value), f"{where}.env")
             else:
                 log.warning("%s: env.%s no es un escalar; lo ignoro", where, key)
     elif env_raw:
@@ -165,7 +175,7 @@ def _parse_server(name: str, table: Any, defaults: MCPConfig) -> MCPServerConfig
     cwd_raw = table.get("cwd")
     cwd: str | None = None
     if isinstance(cwd_raw, str) and cwd_raw:
-        cwd = _expand(cwd_raw)
+        cwd = _expand(cwd_raw, f"{where}.cwd")
     elif cwd_raw is not None:
         log.warning("%s: `cwd` debe ser un string; lo ignoro", where)
 
@@ -181,7 +191,7 @@ def _parse_server(name: str, table: Any, defaults: MCPConfig) -> MCPServerConfig
 
     return MCPServerConfig(
         name=name,
-        command=[_expand(c) for c in command],
+        command=[_expand(c, f"{where}.command") for c in command],
         env=env,
         cwd=cwd,
         timeout_s=_positive_number(table.get("timeout_s"), defaults.timeout_s, "timeout_s", where),
@@ -205,8 +215,15 @@ def load_mcp_config(settings: Any) -> MCPConfig:
     if not isinstance(raw, dict):
         raw = {}
 
+    enabled_raw = raw.get("enabled", False)
+    if not isinstance(enabled_raw, bool):
+        # `enabled = "false"` (string) es truthy en Python: activaría MCP por un
+        # typo de comillas. Solo un booleano TOML cuenta.
+        log.warning("[mcp].enabled=%r no es booleano (true/false sin comillas); queda apagado",
+                    enabled_raw)
+        enabled_raw = False
     cfg = MCPConfig(
-        enabled=bool(raw.get("enabled", False)),
+        enabled=enabled_raw,
         timeout_s=_positive_number(raw.get("timeout_s"), DEFAULT_TIMEOUT_S, "timeout_s", "[mcp]"),
         startup_timeout_s=_positive_number(
             raw.get("startup_timeout_s"), DEFAULT_STARTUP_TIMEOUT_S, "startup_timeout_s", "[mcp]",
@@ -301,9 +318,13 @@ def default_keywords(server: MCPServerConfig, raw_tools: list[dict[str, Any]]) -
 
     add(server.name, 2)
     add(server.prefix, 2)
+    # Trozos de 5+ letras: "get", "set", "run" o "list" (3) matcheaban DENTRO de
+    # palabras españolas ("resetea", "target") y convertían charla en turnos con
+    # tools. Con 5 se quedan "issue", "search", "create"...; lo que de verdad
+    # enruta sigue siendo el nombre del server.
     for raw_tool in raw_tools:
         for piece in re.split(r"[^a-z0-9]+", normalize_key(str(raw_tool.get("name", "")))):
-            add(piece, 3)
+            add(piece, 5)
     for raw_tool in raw_tools:
         for piece in re.findall(r"[a-z]{5,}", normalize_key(str(raw_tool.get("description", "")))):
             if len(words) >= MAX_DERIVED_KEYWORDS:
@@ -325,6 +346,10 @@ class _ServerState:
     group: str
     strikes: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
+    # Todos los registries donde se repusieron estas tools (el camino
+    # idempotente puede recibir otro registry, p.ej. build_registry()): al
+    # desconectar hay que retirarlas de TODOS, no solo del primero.
+    registries: list[Registry] = field(default_factory=list)
 
 
 _STATE: dict[str, _ServerState] = {}
@@ -392,12 +417,21 @@ def _make_caller(server_name: str, remote_name: str) -> Callable[..., str]:
             _drop(state, f"transporte roto ({error})")
             return _soft(server_name, "se cayó, patrón. Lo desconecté y retiré sus tools.")
         except MCPError as error:
-            return _soft(server_name, f"devolvió un error, patrón: {error}")
+            # Un error JSON-RPC (args inválidos, tool desconocida) es una
+            # RESPUESTA del server: está vivo. Resetea los strikes igual que un
+            # éxito; si no, timeout -> error -> timeout lo desconectaba aunque
+            # contestó en medio.
+            with state.lock:
+                state.strikes = 0
+            return _soft(
+                server_name, f"devolvió un error, patrón: {truncate_for_context(str(error))}",
+            )
 
         with state.lock:
             state.strikes = 0
         if is_error:
-            return _soft(server_name, f"reportó un fallo, patrón: {text.strip() or 'sin detalles'}")
+            detail = truncate_for_context(text.strip()) or "sin detalles"
+            return _soft(server_name, f"reportó un fallo, patrón: {detail}")
         if not text.strip():
             return _soft(server_name, "respondió sin contenido, patrón.")
         return truncate_for_context(text)
@@ -498,6 +532,8 @@ def register_mcp_tools(registry: Registry, settings: Any) -> list[str]:
                 for tool in existing.tools:
                     if registry.get(tool.name) is None:
                         registry.register(tool)
+                if registry is not existing.registry and registry not in existing.registries:
+                    existing.registries.append(registry)
                 registered.extend(t.name for t in existing.tools)
                 continue
             _drop(existing, "el proceso murió")
@@ -512,10 +548,14 @@ def unregister_server(registry: Registry, name: str) -> bool:
         state = _STATE.pop(name, None)
     if state is None:
         return False
+    targets = [registry, state.registry, *state.registries]
     for tool in state.tools:
-        registry.unregister(tool.name)
-        if state.registry is not registry:
-            state.registry.unregister(tool.name)
+        seen: list[Registry] = []
+        for target in targets:
+            if any(target is s for s in seen):
+                continue
+            seen.append(target)
+            target.unregister(tool.name)
     router.unregister_group(state.group)
     state.client.close()
     log.info("MCP '%s': desconectado (%d tools retiradas)", name, len(state.tools))
@@ -528,3 +568,17 @@ def close_all() -> None:
         states = list(_STATE.values())
     for state in states:
         unregister_server(state.registry, state.config.name)
+
+
+def terminate_all() -> None:
+    """Para el apagado por SEÑAL del listener, que sale con os._exit y se salta
+    atexit: manda SIGTERM al grupo de cada server sin esperar a nadie. Sin
+    esto, un wrapper (npx, sh -c) o un server que ignora el EOF de stdin
+    quedaba huérfano al parar el servicio. Best-effort, nunca lanza."""
+    with _STATE_LOCK:
+        states = list(_STATE.values())
+    for state in states:
+        try:
+            state.client.terminate_now()
+        except Exception:  # noqa: BLE001 - el proceso está saliendo
+            pass

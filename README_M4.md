@@ -26,7 +26,11 @@ tool-call del LLM -> guard (rutas, recursivo) -> confirmación -> tools/call -> 
 - `crotolamo/mcp/client.py` — `StdioMCPClient`: transporte, futuros por `id`,
   `ping`, timeouts (`MCPTimeout`) y transporte roto (`MCPTransportError`).
 - `crotolamo/mcp/bridge.py` — config, traducción a `Tool`, política de
-  confirmación, strikes, desregistro en caliente y cierre `atexit`.
+  confirmación, strikes, desregistro en caliente y cierre `atexit` (y
+  `terminate_all()` para el apagado por señal del listener, que sale con
+  `os._exit` y se salta `atexit`). Las señales de cierre van al **grupo de
+  procesos** del server: con un wrapper (`npx`, `uvx`, `sh -c`) el hijo directo
+  es el launcher y el nieto es quien habla el protocolo.
 
 ## Configuración
 
@@ -94,7 +98,11 @@ argumentos (hasta 8 niveles) buscando strings que parezcan rutas, con las
 mismas tres zonas de siempre (libre / confirmar / bloqueado). Una ruta
 escondida en `{"opciones": {"ruta": "/etc/passwd"}}` o en `paths: [...]` se
 bloquea antes de llegar al server. Más hondo de 8 niveles ya no se inspecciona
-(el tope existe para que un JSON patológico no reviente la pila).
+(el tope existe para que un JSON patológico no reviente la pila), pero **no se
+permite a ciegas**: la llamada pide confirmación al patrón (fail-closed). La
+exención de "argumentos de contenido" (`content`, `texto`, `query`...) solo
+aplica al argumento de primer nivel; un string escondido en una lista o dict
+bajo esos nombres se inspecciona como cualquier otro.
 
 ## Timeouts y strikes
 

@@ -220,6 +220,14 @@ class ToolAgent(Agent):
         known = set(self.registry.names())
 
         for _ in range(self.max_iterations):
+            # Una tool retirada a mitad de turno (un server MCP desconectado por
+            # timeouts, M4) no debe seguir a la vista del modelo en la siguiente
+            # iteración: filtramos por presencia en el registry (barato).
+            if schemas:
+                schemas = [
+                    s for s in schemas
+                    if self.registry.get(s.get("function", {}).get("name", "")) is not None
+                ]
             # Con tools a la vista, el modelo puede anunciar lo que va a hacer antes
             # de pedirla; retenemos hasta saber si hubo tool_call. Sin tools (charla),
             # se habla en vivo.

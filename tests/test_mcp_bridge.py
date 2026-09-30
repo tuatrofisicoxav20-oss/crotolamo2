@@ -262,9 +262,10 @@ def test_guard_recursivo_bloquea_rutas_anidadas_y_permite_las_del_corral(tmp_pat
     assert guard.check(tool, {"query": "hola", "n": 3, "tags": ["a", "b"]}).allowed is True
 
 
-def test_guard_recursivo_para_en_profundidad_8(tmp_path):
+def test_guard_recursivo_para_en_profundidad_8_pero_no_deja_pasar(tmp_path):
     """El tope existe para que un JSON patológico no reviente la pila: más hondo
-    de 8 niveles ya no se inspecciona (documentado en README_M4)."""
+    de 8 niveles ya no se inspecciona, pero NO se permite a ciegas: se pide
+    confirmación (fail-closed; documentado en README_M4)."""
     guard = Guard(allowed_roots=[tmp_path])
     tool = Tool(name="t", func=lambda **k: "ok", description="d", parameters={})
 
@@ -275,7 +276,15 @@ def test_guard_recursivo_para_en_profundidad_8(tmp_path):
         return value
 
     assert guard.check(tool, anidar(6, "/etc/passwd")).allowed is False
-    assert guard.check(tool, anidar(12, "/etc/passwd")).allowed is True
+    hondo = guard.check(tool, anidar(12, "/etc/passwd"))
+    assert hondo.allowed and hondo.needs_confirmation
+    assert "niveles" in hondo.reason
+    # Lo mismo con listas anidadas bajo un nombre de ruta.
+    listas: object = "/etc/passwd"
+    for _ in range(9):
+        listas = [listas]
+    d = guard.check(tool, {"paths": listas})
+    assert d.needs_confirmation or not d.allowed
 
 
 def test_guard_bloquea_una_tool_mcp_antes_de_llegar_al_server(tmp_path):
@@ -325,7 +334,7 @@ def test_exito_resetea_los_strikes():
     registry, _ = registrar({"fake": fake_server(timeout_s=0.3)})
     assert registry.run("mcp_fake_lenta", {"segundos": 0.5}).startswith("El server MCP")
     assert bridge.strikes_for("fake") == 1
-    time.sleep(0.4)  # el fake es monohilo: que termine de dormir
+    time.sleep(1.0)  # el fake es monohilo: que termine de dormir (margen ancho para CI)
     assert registry.run("mcp_fake_echo", {"text": "ok"}) == '{"text": "ok"}'
     assert bridge.strikes_for("fake") == 0
     # Otro timeout vuelve a ser el PRIMERO: no desregistra.
@@ -387,7 +396,10 @@ def test_keywords_por_defecto_derivan_del_server_y_sus_tools():
     registrar({"fake": fake_server()})
     kws = router.dynamic_groups()["mcp:fake"]["keywords"]
     assert "fake" in kws
-    assert "echo" in kws and "borrar" in kws and "sin" in kws and "hints" in kws
+    assert "borrar" in kws and "hints" in kws
+    # Trozos cortos ("sin", "echo") ya no: de 3-4 letras matchean dentro de
+    # palabras españolas y convertían charla en turnos con tools.
+    assert "sin" not in kws and "echo" not in kws
     assert len(kws) <= bridge.MAX_DERIVED_KEYWORDS
     assert "mcp_fake_echo" in router.select_tool_names("usa el server fake")
 

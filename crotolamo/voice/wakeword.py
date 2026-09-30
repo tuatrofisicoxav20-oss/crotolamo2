@@ -51,11 +51,16 @@ class WakeWordDetector:
 
     @classmethod
     def from_settings(cls, settings) -> "WakeWordDetector":
+        from crotolamo.voice.media_aware import sane_media_threshold
+
         wake = settings.wake
+        threshold = wake.get("oww_threshold", 0.5)
         return cls(
             model_name=wake.get("oww_model", "hey_jarvis"),
-            threshold=wake.get("oww_threshold", 0.5),
-            threshold_media=wake.get("oww_threshold_media", 0.7),
+            threshold=threshold,
+            threshold_media=sane_media_threshold(
+                threshold, wake.get("oww_threshold_media", 0.7), "[wake].oww_threshold_media",
+            ),
             debug=os.environ.get("CROTOLAMO_WAKE_DEBUG", "") not in ("", "0"),
         )
 

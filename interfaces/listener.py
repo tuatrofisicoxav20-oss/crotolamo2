@@ -21,7 +21,13 @@ from typing import Any, Callable
 from crotolamo.logging_setup import get_logger
 from crotolamo.settings import Settings, get_settings
 from crotolamo.voice import wake
-from crotolamo.voice.media_aware import Ducker, MediaBackend, MediaMonitor, PlayerctlBackend
+from crotolamo.voice.media_aware import (
+    Ducker,
+    MediaBackend,
+    MediaMonitor,
+    PlayerctlBackend,
+    sane_media_threshold,
+)
 from crotolamo.voice.state import (
     CONTROL_PATH,
     Mode,
@@ -73,13 +79,16 @@ class ListenerConfig:
     @classmethod
     def from_settings(cls, settings: Settings) -> "ListenerConfig":
         voice = settings.voice
+        threshold = settings.wake.get("threshold", 0.67)
         return cls(
-            threshold=settings.wake.get("threshold", 0.67),
+            threshold=threshold,
             variants=settings.wake.get("variants"),
             # Con música en Playing el wake difuso exige más (la música mete
             # falsos despertares) y el reproductor se atenúa mientras dura la
             # interacción. media_poll_s: cadencia del sondeo en segundo plano.
-            threshold_media=voice.get("wake_threshold_media", 0.85),
+            threshold_media=sane_media_threshold(
+                threshold, voice.get("wake_threshold_media", 0.85), "[voice].wake_threshold_media",
+            ) or threshold,
             media_poll_s=voice.get("media_poll_s", 1.5),
             duck=voice.get("wake_duck", True),
             duck_volume=voice.get("wake_duck_volume", 0.2),
@@ -181,7 +190,20 @@ def _graceful_exit(signum, _frame) -> None:
         pass
     _restore_media_best_effort()
     _write_idle_hud()
+    _terminate_mcp_best_effort()
     os._exit(0)
+
+
+def _terminate_mcp_best_effort() -> None:
+    """Los servers MCP (M4) se cierran por atexit, que os._exit se salta: aquí
+    se les manda SIGTERM al grupo sin esperar. Sin esto, un wrapper (npx) o un
+    server que ignora el EOF de stdin quedaba huérfano al parar el servicio."""
+    try:
+        from crotolamo.mcp import bridge
+
+        bridge.terminate_all()
+    except Exception:  # noqa: BLE001 — nunca propagar desde aquí
+        pass
 
 
 def _install_signal_handlers() -> None:
@@ -442,7 +464,19 @@ def run_listen(argv: list[str] | None = None) -> int:
     ducker = Ducker(media_backends, factor=cfg.duck_volume, enabled=cfg.duck)
     _ACTIVE_DUCKER = ducker  # para el apagado por señal (os._exit)
     wake_detector.attach_media(media)
-    media.start()
+    # El sondeo (un playerctl cada media_poll_s, para siempre) solo tiene
+    # sentido si alguna de las dos defensas está activa; si no, ni se arranca
+    # (is_playing() queda en False y todo sigue como sin música).
+    oww_media = wake_detector.threshold_media
+    media_util = (
+        cfg.duck
+        or cfg.threshold_media > cfg.threshold
+        or (oww_media is not None and oww_media > wake_detector.threshold)
+    )
+    if media_util:
+        media.start()
+    else:
+        log.info("wake con música desactivado (sin ducking y sin umbral distinto): no sondeo")
 
     def say(text: str) -> None:
         print(text, flush=True)
