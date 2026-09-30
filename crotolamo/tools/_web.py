@@ -195,6 +195,14 @@ class _DDGResultsParser(HTMLParser):
     y <a class="result__snippet" ...>snippet</a> (a veces es un <div>).
     """
 
+    # Elementos vacíos de HTML: nunca tienen cierre, así que no cuentan para
+    # el anidamiento. Contarlos dejaba al parser "dentro" del título/snippet
+    # para siempre y se perdían TODOS los resultados siguientes al primer <br>.
+    _VOID_TAGS = frozenset({
+        "area", "base", "br", "col", "embed", "hr", "img", "input", "link",
+        "meta", "param", "source", "track", "wbr",
+    })
+
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.results: list[dict[str, str]] = []
@@ -205,7 +213,10 @@ class _DDGResultsParser(HTMLParser):
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if self._mode is not None:
-            self._depth += 1
+            if tag == "br":
+                self._buffer.append(" ")  # un salto de línea separa palabras
+            elif tag not in self._VOID_TAGS:
+                self._depth += 1
             return
         classes = (dict(attrs).get("class") or "").split()
         if tag == "a" and "result__a" in classes:
@@ -217,8 +228,16 @@ class _DDGResultsParser(HTMLParser):
             self._mode = "snippet"
             self._buffer = []
 
-    def handle_endtag(self, tag: str) -> None:
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        # <br/> dentro de un título/snippet: ni abre ni cierra nada. El default
+        # de HTMLParser (starttag + endtag) descuadraría el contador.
         if self._mode is None:
+            super().handle_startendtag(tag, attrs)
+        elif tag == "br":
+            self._buffer.append(" ")
+
+    def handle_endtag(self, tag: str) -> None:
+        if self._mode is None or tag in self._VOID_TAGS:
             return
         if self._depth > 0:
             self._depth -= 1

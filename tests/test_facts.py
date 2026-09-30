@@ -66,6 +66,37 @@ def test_schema_solo_se_ejecuta_una_vez_por_ruta(tmp_path, monkeypatch):
         db.add_fact("tres", db_path=otra)  # ruta nueva SÍ ejecuta el schema
 
 
+def test_db_borrada_en_caliente_se_recrea_con_schema(tmp_path):
+    """Si el .sqlite desaparece con el proceso vivo (borrado a mano, limpieza de
+    ~/.crotolamo), el caché _SCHEMA_READY ya no vale: connect() recreaba un
+    fichero vacío y hechos/atajos respondían "no such table" hasta reiniciar."""
+    dbp = tmp_path / "memoria.sqlite"
+    facts.remember("el patrón usa Fedora", db_path=dbp)
+    dbp.unlink()
+
+    assert facts.recall(db_path=dbp) == []  # sin sqlite3.OperationalError
+    facts.remember("hecho nuevo", db_path=dbp)
+    assert [f["texto"] for f in facts.recall(db_path=dbp)] == ["hecho nuevo"]
+    # Los atajos comparten el fichero: también deben seguir funcionando.
+    db.save_shortcut("x", "url", {"value": "a"}, db_path=dbp)
+    assert db.get_shortcut("x", db_path=dbp)["value"] == "a"
+
+
+def test_facts_context_inyecta_los_mas_recientes(tmp_path):
+    """recall() ordena por id ascendente: [:30] eran los 30 más VIEJOS y a
+    partir del hecho 31 nada nuevo entraba al prompt. Van los 30 más recientes,
+    en orden cronológico."""
+    dbp = tmp_path / "m.sqlite"
+    for i in range(35):
+        facts.remember(f"hecho {i}", db_path=dbp)
+
+    lines = facts.facts_context(db_path=dbp).splitlines()
+    assert len(lines) == 30
+    assert lines[0].endswith("hecho 5") and lines[-1].endswith("hecho 34")
+    assert not any(line.endswith("hecho 0") for line in lines)
+    assert facts.facts_context(db_path=dbp, limit=0) == ""
+
+
 def test_wal_y_busy_timeout_activos(tmp_path):
     """WAL deja leer mientras se escribe; busy_timeout espera en vez de
     reventar con 'database is locked' (shell + listener sobre el mismo fichero)."""

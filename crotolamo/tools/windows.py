@@ -48,8 +48,14 @@ def _dispatch(args: list[str]) -> subprocess.CompletedProcess:
 
 def _pgrep(name: str) -> bool:
     """True si hay algún proceso cuyo comando matchea `name` (sin ventana o no)."""
+    name = name.strip()
+    # `pgrep -fi ""` matchea CUALQUIER proceso (patrón vacío = todo): con un
+    # nombre vacío se afirmaba que había "un proceso suyo corriendo". Y `--`
+    # para que un nombre que empiece por guion no se lea como opción de pgrep.
+    if not name:
+        return False
     try:
-        result = run_cmd(["pgrep", "-fi", name], timeout=5)
+        result = run_cmd(["pgrep", "-fi", "--", name], timeout=5)
     except (OSError, subprocess.TimeoutExpired):
         return False
     return result.returncode == 0

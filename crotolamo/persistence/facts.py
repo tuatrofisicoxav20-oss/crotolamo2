@@ -48,8 +48,16 @@ def search(query: str, top: int = 5, db_path: Path | None = None) -> list[dict]:
 
 
 def facts_context(db_path: Path | None = None, limit: int = 30) -> str:
-    """Devuelve los hechos formateados para inyectar en el system prompt."""
-    facts = recall(db_path=db_path)[:limit]
+    """Devuelve los hechos formateados para inyectar en el system prompt.
+
+    Van los `limit` MÁS RECIENTES, en orden cronológico. recall() ordena por id
+    ascendente, así que `[:limit]` eran los más VIEJOS: a partir del hecho 31
+    ningún hecho nuevo entraba al prompt y Crotolamo "olvidaba" lo recién
+    aprendido.
+    """
+    if limit <= 0:
+        return ""
+    facts = recall(db_path=db_path)[-limit:]
     if not facts:
         return ""
     lines = [f"- ({f['categoria']}) {f['texto']}" for f in facts]

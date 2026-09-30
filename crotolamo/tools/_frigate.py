@@ -31,6 +31,20 @@ def base_url() -> str:
     return str(base).rstrip("/")
 
 
+def _build_opener() -> urllib.request.OpenerDirector:
+    """Opener SIN proxy.
+
+    urlopen usa el opener global, que trae el ProxyHandler por defecto (lee
+    http_proxy/https_proxy del entorno): con un proxy configurado la request
+    iba al proxy en vez de a Frigate, que vive en la LAN. ProxyHandler({}) lo
+    sustituye por uno vacío. Factoría para que los tests lo reconstruyan.
+    """
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+_OPENER = _build_opener()
+
+
 def _http_json(url: str, timeout: float = _TIMEOUT) -> Any:
     """GET con urllib que devuelve el body parseado como JSON.
 
@@ -39,7 +53,7 @@ def _http_json(url: str, timeout: float = _TIMEOUT) -> Any:
     json.JSONDecodeError si el body no es JSON.
     """
     request = urllib.request.Request(url)
-    with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
+    with _OPENER.open(request, timeout=timeout) as response:  # noqa: S310
         raw = response.read(_MAX_BODY)
     return json.loads(raw) if raw.strip() else []
 

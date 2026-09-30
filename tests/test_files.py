@@ -1,7 +1,9 @@
+from pathlib import Path
+
 import pytest
 
 from crotolamo import settings as settings_mod
-from crotolamo.tools import files
+from crotolamo.tools import default_registry, files
 
 
 @pytest.fixture(autouse=True)
@@ -96,3 +98,41 @@ def test_outside_both_zones_still_rejected(tmp_path, monkeypatch):
     monkeypatch.setattr(real, "confirm_roots", [tmp_path / "confirmable"])
     out = files.write_file(str(tmp_path / "otra" / "x.txt"), "hola")
     assert "corral" in out.lower() or "permitidas" in out.lower()
+
+
+# --- errores del sistema de archivos: en personaje, nunca "reventó" ---
+
+def test_list_dir_sin_permisos_responde_en_personaje(tmp_path, monkeypatch):
+    def sin_permiso(self):
+        raise PermissionError(13, "Permission denied", str(self))
+
+    monkeypatch.setattr(Path, "iterdir", sin_permiso)
+    out = default_registry().run("list_dir", {"path": str(tmp_path)})
+    assert "reventó" not in out
+    assert "No pude listar" in out and "patrón" in out
+
+
+# --- TOCTOU: las tools operan sobre la MISMA ruta resuelta que pasó el corral ---
+
+def test_resolve_devuelve_la_ruta_canonica(tmp_path):
+    real = tmp_path / "real.txt"
+    real.write_text("x")
+    link = tmp_path / "enlace.txt"
+    link.symlink_to(real)
+    assert files._resolve(str(link)) == real.resolve()
+
+
+def test_ruta_irresoluble_no_revienta_y_queda_fuera_del_corral():
+    # Un '\0' hace que resolve() lance ValueError: vuelve tal cual y el corral la rechaza.
+    out = files.read_file("a\0b")
+    assert "corral" in out.lower() or "permitidas" in out.lower()
+
+
+def test_write_a_traves_de_enlace_opera_sobre_la_ruta_canonica(tmp_path):
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    link_dir = tmp_path / "enlace"
+    link_dir.symlink_to(real_dir, target_is_directory=True)
+    out = files.write_file(str(link_dir / "n.txt"), "hola")
+    assert (real_dir / "n.txt").read_text() == "hola"
+    assert str((real_dir / "n.txt").resolve()) in out  # la tool habla de la ruta canónica

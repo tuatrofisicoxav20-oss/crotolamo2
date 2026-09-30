@@ -13,7 +13,10 @@ def path_inside_roots(candidate, roots) -> bool:
     """
     try:
         resolved = Path(candidate).expanduser().resolve()
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError, ValueError):
+        # ValueError: un '\0' en la ruta ("embedded null byte"). La ruta la
+        # elige el LLM; sin capturarlo la excepción subía hasta el agente en
+        # vez de negar. Lo que no se puede resolver, no está en el corral.
         return False
     for root in roots:
         try:
