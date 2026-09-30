@@ -21,6 +21,7 @@ from typing import Any, Callable
 from crotolamo.logging_setup import get_logger
 from crotolamo.settings import Settings, get_settings
 from crotolamo.voice import wake
+from crotolamo.voice.media_aware import Ducker, MediaBackend, MediaMonitor, PlayerctlBackend
 from crotolamo.voice.state import (
     CONTROL_PATH,
     Mode,
@@ -63,6 +64,11 @@ class ListenerConfig:
     # Velocidad percibida.
     ack: str = "beep"  # "beep" | "voz" | "off"
     stream_speak: bool = True
+    # Wake con música sonando (ver crotolamo/voice/media_aware.py).
+    threshold_media: float = 0.85
+    media_poll_s: float = 1.5
+    duck: bool = True
+    duck_volume: float = 0.2
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "ListenerConfig":
@@ -70,6 +76,13 @@ class ListenerConfig:
         return cls(
             threshold=settings.wake.get("threshold", 0.67),
             variants=settings.wake.get("variants"),
+            # Con música en Playing el wake difuso exige más (la música mete
+            # falsos despertares) y el reproductor se atenúa mientras dura la
+            # interacción. media_poll_s: cadencia del sondeo en segundo plano.
+            threshold_media=voice.get("wake_threshold_media", 0.85),
+            media_poll_s=voice.get("media_poll_s", 1.5),
+            duck=voice.get("wake_duck", True),
+            duck_volume=voice.get("wake_duck_volume", 0.2),
             wake_silence_ms=voice.get("wake_silence_ms", 400),
             wake_max_s=voice.get("wake_max_seconds", 8.0),
             silence_ms=voice.get("vad_silence_ms", 800),
@@ -124,6 +137,27 @@ def _write_idle_hud(path: Path = _HUD_STATE_PATH) -> None:
         pass
 
 
+# Ducker vivo (si lo hay), para que el apagado por señal devuelva la música a
+# su volumen: os._exit se salta los finally que la restaurarían. Ver _graceful_exit.
+_ACTIVE_DUCKER: Ducker | None = None
+
+
+def _restore_media_best_effort() -> None:
+    """Repone el volumen de la música desde el manejador de señal (best-effort).
+
+    Igual que _write_idle_hud: defensiva, acotada en tiempo y jamás propaga. Si
+    el hilo principal murió a medio duck con el lock tomado, emergency_restore
+    espera un instante y restaura sin él (el proceso está saliendo de todos modos).
+    """
+    ducker = _ACTIVE_DUCKER
+    if ducker is None:
+        return
+    try:
+        ducker.emergency_restore()
+    except Exception:  # noqa: BLE001 — nunca propagar desde aquí
+        pass
+
+
 def _graceful_exit(signum, _frame) -> None:
     """Apagado a prueba de core-dumps cuando corre como servicio (systemd).
 
@@ -134,12 +168,15 @@ def _graceful_exit(signum, _frame) -> None:
     código 0 y sin volcado de memoria. Es lo correcto para un Ctrl-C o un stop.
 
     NOTA: os._exit(0) omite finally/atexit, por eso escribimos el idle HUD AQUÍ,
-    antes de salir, en vez de confiar en stop() o un finally exterior.
+    antes de salir, en vez de confiar en stop() o un finally exterior. Por la
+    misma razón se restaura aquí la música atenuada (ducking): un Ctrl-C a media
+    orden no debe dejar Spotify bajito.
     """
     try:
         print("Crotolamo apagado, patrón.", flush=True)
     except Exception:  # noqa: BLE001
         pass
+    _restore_media_best_effort()
     _write_idle_hud()
     os._exit(0)
 
@@ -163,10 +200,17 @@ def _run_simple_loop(
     cfg: ListenerConfig,
     hud_state: SharedState,
     say: Callable[[str], None],
+    media: MediaMonitor | None = None,
+    ducker: Ducker | None = None,
 ) -> int:
     """Bucle secuencial clásico (--simple o sin openWakeWord): espera el wake,
     graba la orden, la atiende y vuelve a esperar. Extraído de run_listen para
     que el arranque (settings/agente) y el loop vivan separados.
+
+    media/ducker (media_aware.py) son opcionales: con None el bucle se comporta
+    EXACTAMENTE como antes. Con monitor, el wake difuso usa su umbral dinámico
+    (más alto con música sonando); con ducker, la música se atenúa durante toda
+    la interacción y se restaura pase lo que pase.
     """
 
     def listen_command(start_timeout_s: float = 4.0) -> str:
@@ -210,8 +254,12 @@ def _run_simple_loop(
                     # viejo guard de "máximo 3 palabras", pero SIN rechazar
                     # "crotolamo <orden>" dicho de corrido: esa orden pegada se
                     # atiende directo, sin segundo turno de escucha.
+                    # Umbral dinámico: con música en Playing el monitor pide
+                    # más parecido (las letras de canciones alucinan wakes).
+                    # Lee un caché: no bloquea.
+                    threshold = media.threshold() if media is not None else cfg.threshold
                     activated, inline_cmd = wake.split_wake_command(
-                        heard, cfg.threshold, cfg.variants
+                        heard, threshold, cfg.variants
                     )
                     if not activated:
                         continue
@@ -228,73 +276,84 @@ def _run_simple_loop(
                 continue
             hud_state.set_enabled(True)
 
-            # Convocado: el HUD debe APARECER (listening). Si la orden venía
-            # pegada al wake, se atiende de inmediato (ni bip hace falta). Si
-            # no, acuse según config: "beep" suena SIN bloquear (la grabación
-            # abre de inmediato y el patrón puede hablar ya); "voz" es el
-            # clásico "Te escucho" (~1s de espera); "off" nada — solo el HUD.
-            hud_state.set_mode(Mode.LISTENING)
-            if inline_cmd:
-                command = inline_cmd
-            else:
-                if cfg.ack == "voz":
-                    say("Te escucho, patrón.")
-                elif cfg.ack != "off":
-                    tts.beep()
-                    print("Te escucho, patrón.", flush=True)
-                command = listen_command()
+            # TODA la interacción (acuse, escucha de la orden, bucle de
+            # followup) va dentro de este try: la música se atenúa al entrar y
+            # el finally la restaura en CUALQUIER salida (error, timeout, orden
+            # vacía, KeyboardInterrupt). Nunca dejar Spotify bajito.
+            try:
+                if ducker is not None:
+                    ducker.duck()
 
-            if not command.strip():
-                say("No te escuché claro, patrón.")
-                continue  # el finally publica idle -> HUD se oculta
+                # Convocado: el HUD debe APARECER (listening). Si la orden venía
+                # pegada al wake, se atiende de inmediato (ni bip hace falta). Si
+                # no, acuse según config: "beep" suena SIN bloquear (la grabación
+                # abre de inmediato y el patrón puede hablar ya); "voz" es el
+                # clásico "Te escucho" (~1s de espera); "off" nada — solo el HUD.
+                hud_state.set_mode(Mode.LISTENING)
+                if inline_cmd:
+                    command = inline_cmd
+                else:
+                    if cfg.ack == "voz":
+                        say("Te escucho, patrón.")
+                    elif cfg.ack != "off":
+                        tts.beep()
+                        print("Te escucho, patrón.", flush=True)
+                    command = listen_command()
 
-            # Conversación: atender el comando y, si followup_s > 0, seguir
-            # escuchando esa ventana sin exigir el wake word otra vez. La
-            # ventana se cierra sola si el patrón ya no dice nada (la
-            # grabación corta por start_timeout sin voz -> texto vacío).
-            while command.strip():
-                print(f"Orden: {command}", flush=True)
-                hud_state.set_text(command)
-                hud_state.set_mode(Mode.THINKING)
-                # stream_speak: habla cada frase EN CUANTO el LLM la cierra,
-                # en vez de esperar la respuesta completa (la primera palabra
-                # suena segundos antes). Fallback al camino clásico si el
-                # streamer no llegó a hablar (p.ej. LLMError devuelto como
-                # texto sin pasar por on_token).
-                if cfg.stream_speak:
-                    speaker = StreamSpeaker(
-                        tts, on_first=lambda: hud_state.set_mode(Mode.SPEAKING)
-                    )
-                    try:
-                        reply = agent.handle_turn(command, on_token=speaker.feed)
-                    finally:
-                        spoke = speaker.finish()
-                    print(reply, flush=True)
-                    hud_state.set_text(reply)
-                    if not spoke and reply.strip():
+                if not command.strip():
+                    say("No te escuché claro, patrón.")
+                    continue  # el finally publica idle -> HUD se oculta
+
+                # Conversación: atender el comando y, si followup_s > 0, seguir
+                # escuchando esa ventana sin exigir el wake word otra vez. La
+                # ventana se cierra sola si el patrón ya no dice nada (la
+                # grabación corta por start_timeout sin voz -> texto vacío).
+                while command.strip():
+                    print(f"Orden: {command}", flush=True)
+                    hud_state.set_text(command)
+                    hud_state.set_mode(Mode.THINKING)
+                    # stream_speak: habla cada frase EN CUANTO el LLM la cierra,
+                    # en vez de esperar la respuesta completa (la primera palabra
+                    # suena segundos antes). Fallback al camino clásico si el
+                    # streamer no llegó a hablar (p.ej. LLMError devuelto como
+                    # texto sin pasar por on_token).
+                    if cfg.stream_speak:
+                        speaker = StreamSpeaker(
+                            tts, on_first=lambda: hud_state.set_mode(Mode.SPEAKING)
+                        )
+                        try:
+                            reply = agent.handle_turn(command, on_token=speaker.feed)
+                        finally:
+                            spoke = speaker.finish()
+                        print(reply, flush=True)
+                        hud_state.set_text(reply)
+                        if not spoke and reply.strip():
+                            hud_state.set_mode(Mode.SPEAKING)
+                            try:
+                                tts.speak_sentences(reply)
+                            except Exception as error:  # noqa: BLE001
+                                log.warning("voz falló: %s", error)
+                    else:
+                        reply = agent.handle_turn(command)
+                        print(reply, flush=True)
+                        hud_state.set_text(reply)
                         hud_state.set_mode(Mode.SPEAKING)
                         try:
-                            tts.speak_sentences(reply)
+                            tts.speak_sentences(reply)  # Fase 6: TTS por frases
                         except Exception as error:  # noqa: BLE001
                             log.warning("voz falló: %s", error)
-                else:
-                    reply = agent.handle_turn(command)
-                    print(reply, flush=True)
-                    hud_state.set_text(reply)
-                    hud_state.set_mode(Mode.SPEAKING)
-                    try:
-                        tts.speak_sentences(reply)  # Fase 6: TTS por frases
-                    except Exception as error:  # noqa: BLE001
-                        log.warning("voz falló: %s", error)
-                time.sleep(0.5)
+                    time.sleep(0.5)
 
-                if cfg.followup_s <= 0:
-                    break
-                hud_state.set_mode(Mode.LISTENING)
-                print("(sigo escuchando...)", flush=True)
-                command = wake.strip_wake_word(
-                    listen_command(start_timeout_s=cfg.followup_s)
-                )
+                    if cfg.followup_s <= 0:
+                        break
+                    hud_state.set_mode(Mode.LISTENING)
+                    print("(sigo escuchando...)", flush=True)
+                    command = wake.strip_wake_word(
+                        listen_command(start_timeout_s=cfg.followup_s)
+                    )
+            finally:
+                if ducker is not None:
+                    ducker.restore()
 
         except KeyboardInterrupt:
             say("Crotolamo apagado, patrón.")
@@ -368,6 +427,20 @@ def run_listen(argv: list[str] | None = None) -> int:
     wake_detector = WakeWordDetector.from_settings(settings)
     use_oww = settings.wake.get("use_oww", True) and wake_detector.available()
 
+    # Wake consciente de la música (media_aware.py), compartido por los dos
+    # loops: un sondeo en segundo plano dice si algo suena (umbral de wake más
+    # alto, en el difuso y en openWakeWord) y el ducker atenúa el reproductor
+    # mientras Crotolamo escucha y responde. Sin playerctl, todo es no-op.
+    global _ACTIVE_DUCKER
+    media_backends: list[MediaBackend] = [PlayerctlBackend()]
+    media = MediaMonitor(media_backends, poll_s=cfg.media_poll_s,
+                         threshold_normal=cfg.threshold,
+                         threshold_media=cfg.threshold_media)
+    ducker = Ducker(media_backends, factor=cfg.duck_volume, enabled=cfg.duck)
+    _ACTIVE_DUCKER = ducker  # para el apagado por señal (os._exit)
+    wake_detector.attach_media(media)
+    media.start()
+
     def say(text: str) -> None:
         print(text, flush=True)
         try:
@@ -430,11 +503,13 @@ def run_listen(argv: list[str] | None = None) -> int:
         try:
             VoiceLoop(agent, stt, tts, wake_detector,
                       allow_barge_in=allow_barge_in, silence_ms=cfg.silence_ms,
-                      hud_publisher=hud_publisher, control_path=CONTROL_PATH).run()
+                      hud_publisher=hud_publisher, control_path=CONTROL_PATH,
+                      ducker=ducker).run()
         finally:
             # Escribir idle final al salir del loop (KeyboardInterrupt, stop(), etc.).
             # Si _graceful_exit llegó primero (os._exit), este bloque no ejecuta;
             # _write_idle_hud() ya fue llamado desde el manejador de señal.
+            media.stop()
             _write_idle_hud()
         return 0
 
@@ -452,9 +527,10 @@ def run_listen(argv: list[str] | None = None) -> int:
         return _run_simple_loop(
             agent=agent, stt=stt, wake_stt=wake_stt, tts=tts,
             wake_detector=wake_detector, use_oww=use_oww, cfg=cfg,
-            hud_state=hud_state, say=say,
+            hud_state=hud_state, say=say, media=media, ducker=ducker,
         )
     finally:
+        media.stop()
         _write_idle_hud()
 
 

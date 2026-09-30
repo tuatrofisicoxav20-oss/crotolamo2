@@ -224,6 +224,18 @@ stream_speak = true
 # escucha). El tope no estorba al caso corto: el silencio corta antes.
 wake_silence_ms  = 400
 wake_max_seconds = 8.0
+# --- Wake con música sonando ---
+# Con Spotify/YouTube sonando, Whisper transcribe letras y de vez en cuando algo
+# suena a "crotolamo" (falsos despertares); y ya despierto, la música tapa la
+# orden. Un hilo sondea playerctl (MPRIS) en segundo plano y cachea si hay algún
+# reproductor en Playing: con música el wake exige un umbral más alto y, al
+# activarse, la música se atenúa hasta que Crotolamo termina de responder (se
+# restaura al volumen EXACTO que tenía). La voz propia (Piper) nunca cuenta como
+# música. Sin playerctl instalado, todo esto es un no-op.
+wake_threshold_media = 0.85   # umbral del wake difuso mientras algo suena (playerctl en Playing); sin música se usa [wake].threshold
+media_poll_s = 1.5            # cada cuánto se sondea en segundo plano si hay música (caché; el oído nunca espera)
+wake_duck = true              # atenuar la música al activarse y restaurarla al terminar
+wake_duck_volume = 0.2        # fracción del volumen actual mientras Crotolamo escucha y responde
 
 # Domótica vía Home Assistant (tools light_control / home_state).
 [home]
@@ -254,6 +266,10 @@ threshold = 0.72
 # así que se usa un modelo PUENTE soportado hasta entrenar uno propio.
 oww_model     = "hey_jarvis"
 oww_threshold = 0.5
+# Umbral de openWakeWord mientras suena música (mismo sondeo que
+# [voice].wake_threshold_media). Escala DISTINTA a la del wake difuso: aquí 0.5
+# es lo normal y 0.7 ya es estricto; por eso son dos knobs y no uno.
+oww_threshold_media = 0.7
 # Variantes CERCANAS a "crotolamo" (cómo lo transcribe mal Whisper). Se podaron
 # las muy lejanas ("corto la mano", "control amo", "cuatro lamo", "proto/troto
 # lamo") que provocaban falsos positivos. Se añadieron mishears reales del log

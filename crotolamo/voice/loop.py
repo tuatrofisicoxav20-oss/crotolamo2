@@ -48,6 +48,28 @@ __all__ = [
 log = get_logger("voice.loop")
 
 
+def _publisher_with_ducker(hud_publisher, ducker):
+    """Publisher de SharedState que además avisa al Ducker del modo vigente.
+
+    SharedState publica un dict con "mode" en cada transición; el Ducker baja
+    la música al salir de idle y la restaura al volver (ver media_aware.py).
+    Se compone AQUÍ, sin tocar state.py: el ducking es una preocupación del
+    orquestador, no del estado. on_mode solo encola (los hilos de audio que
+    publican no esperan ningún subprocess) y un fallo suyo nunca impide la
+    publicación al HUD.
+    """
+
+    def _publish(state_dict: dict) -> None:
+        try:
+            ducker.on_mode(state_dict.get("mode", "idle"))
+        except Exception as error:  # noqa: BLE001 - el ducking no tumba el HUD
+            log.warning("ducker: %s", error)
+        if hud_publisher is not None:
+            hud_publisher(state_dict)
+
+    return _publish
+
+
 class VoiceLoop:
     """Orquestador: arma los 4 threads y los apaga limpio (M3.7).
 
@@ -56,12 +78,19 @@ class VoiceLoop:
                        tiempo real. Si es None (default), no se publica nada.
                        Usar ``make_file_publisher(path)`` de state.py para escritura
                        atómica a archivo.
+        ducker: Ducker de media_aware.py (opcional). Atenúa la música mientras
+                el loop no está en idle y la restaura al volver; se engancha al
+                publisher del estado. None (default) = sin ducking, nada cambia.
     """
 
     def __init__(self, agent, stt, tts, wake_detector, *, allow_barge_in: bool = False,
                  silence_ms: int = 640, mic=None, wake_fn=None, vad_fn=None,
-                 to_wav=None, hud_publisher=None, control_path=None) -> None:
-        self.state = SharedState(publisher=hud_publisher)
+                 to_wav=None, hud_publisher=None, control_path=None, ducker=None) -> None:
+        self.ducker = ducker
+        publisher = hud_publisher
+        if ducker is not None:
+            publisher = _publisher_with_ducker(hud_publisher, ducker)
+        self.state = SharedState(publisher=publisher)
         self.shutdown = threading.Event()
         # Canal de control inverso (panel -> loop). None = sin sondeo (tests).
         self.control_path = control_path
@@ -168,8 +197,18 @@ class VoiceLoop:
         antes del join suele desbloquear la lectura, pero no está garantizado.
         """
         self.shutdown.set()                       # 1) avisar a todos
-        self.tts.stop()                           # 2) cortar audio en curso
-        if hasattr(self._mic, "close"):
-            self._mic.close()
-        for t in self.threads:                    # 3) esperar (todos miran shutdown)
+        try:
+            self.tts.stop()                       # 2) cortar audio en curso
+            if hasattr(self._mic, "close"):
+                self._mic.close()
+        finally:
+            # 3) devolver la música ANTES de esperar a los hilos: el join del
+            # oído puede tardar hasta 2s (PortAudio) y no hay razón para que
+            # Spotify siga bajito mientras tanto. close() primero (procesa lo
+            # ya encolado por on_mode, en orden, y deja de aceptar más) y
+            # restore() después, síncrono: garantía final pase lo que pase.
+            if self.ducker is not None:
+                self.ducker.close()
+                self.ducker.restore()
+        for t in self.threads:                    # 4) esperar (todos miran shutdown)
             t.join(timeout=2.0)
