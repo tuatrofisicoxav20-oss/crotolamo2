@@ -74,6 +74,29 @@ def test_clasica_is_the_original_prompt():
     assert "sarcástico" in persona.STYLES["clasica"]
 
 
+def test_todas_las_personas_llevan_las_reglas_de_voz():
+    """La respuesta se ESCUCHA: todas las personas piden frases cortas y sin formato."""
+    for style, prompt in persona.STYLES.items():
+        assert "ESCUCHA" in prompt, style
+        assert "sin asteriscos" in prompt, style
+        assert "sin listas" in prompt, style
+        assert "Sin emojis" in prompt, style
+        assert "Sin URLs" in prompt, style
+        assert "dos o tres frases" in prompt, style
+        assert "como se pronuncian" in prompt, style
+        # El bloque de voz va DESPUÉS de la personalidad: no cambia el tono.
+        assert prompt.index("ESCUCHA") > prompt.index("Personalidad:"), style
+
+
+def test_reglas_de_voz_no_cambian_el_tono():
+    assert "sarcástico" in persona.STYLES["clasica"]
+    assert "órale" in persona.STYLES["desmadrosa"]
+    assert "groserías LIGERAS" in persona.STYLES["desmadrosa"]
+    # Y el bloque es idéntico en ambas: una sola fuente de verdad.
+    assert persona._VOZ in persona.STYLES["clasica"]
+    assert persona._VOZ in persona.STYLES["desmadrosa"]
+
+
 def test_desmadrosa_keeps_operational_rules():
     prompt = persona.STYLES["desmadrosa"]
     # Español y brevedad (sale por TTS).

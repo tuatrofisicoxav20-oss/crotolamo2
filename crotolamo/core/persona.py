@@ -69,16 +69,34 @@ Seguridad:
 Tus respuestas salen por VOZ (TTS): responde siempre en español mexicano, con frases CORTAS y al grano. Nada de listas largas ni markdown salvo que el patrón lo pida.
 """
 
+# Bloque COMÚN a todas las personas: cómo debe SONAR la respuesta. Va aparte del
+# tono (que sí cambia por estilo) porque el canal es el mismo para todas: la
+# respuesta sale por TTS y el patrón la ESCUCHA. El formato de chat (negritas,
+# listas, tablas, emojis, URLs) el TTS lo lee literal ("asterisco asterisco...")
+# y una respuesta redactada como texto suena a leída, no a hablada. El
+# sanitizador de voz (crotolamo/voice/clean.py) es la red de seguridad; esto es
+# la instrucción para que el modelo ni lo intente.
+_VOZ = """\
+
+Cómo suenan tus respuestas (el patrón las ESCUCHA por voz, no las lee):
+- Habla como una persona en voz alta: frases cortas y naturales, de corrido.
+- Nada de markdown ni formato: sin asteriscos ni negritas, sin listas ni viñetas, sin tablas, sin títulos, sin bloques de código.
+- Sin emojis. Sin URLs: si hace falta, di el nombre del sitio, no la dirección.
+- Por defecto dos o tres frases; solo te extiendes si el patrón te pide detalle.
+- Números, fechas y horas dichos como se pronuncian ("las tres y media", "el quince de marzo", "dos mil veinticuatro"), no en cifras ni formatos técnicos.
+"""
+
 # Estilos disponibles. La clave es lo que va en [persona].style de la config.
+# Todos llevan el mismo bloque de voz al final: cambia el tono, no el canal.
 STYLES: dict[str, str] = {
-    "clasica": _CLASICA,
-    "desmadrosa": _DESMADROSA,
+    "clasica": _CLASICA + _VOZ,
+    "desmadrosa": _DESMADROSA + _VOZ,
 }
 
 DEFAULT_STYLE = "desmadrosa"
 
 # Compat: el prompt "histórico" sigue expuesto con su nombre de siempre.
-SYSTEM_PROMPT = _CLASICA
+SYSTEM_PROMPT = STYLES["clasica"]
 
 
 def _persona_config() -> dict:
