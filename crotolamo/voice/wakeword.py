@@ -169,7 +169,10 @@ class WakeWordDetector:
             import sounddevice  # noqa: F401
 
             return True
-        except ImportError:
+        except (ImportError, OSError):
+            # OSError: sounddevice importa pero no encuentra libportaudio
+            # ("PortAudio library not found"). Sin esto el listener reventaba
+            # con traceback en vez de caer al modo simple.
             return False
 
     def feed(self, chunk) -> bool:

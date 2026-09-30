@@ -176,6 +176,10 @@ class VoiceLoop:
         # Estado inicial de la escucha desde el canal de control (default: activa).
         if self.control_path is not None:
             self._poll_control()
+        # Publicar el estado inicial SIEMPRE: pisa un hud_state.json rancio de
+        # un proceso anterior que murió a medio turno (el HUD se quedaba en
+        # "PENSANDO" hasta el siguiente cambio de modo).
+        self.state.publish_now()
         try:
             while not self.shutdown.is_set():
                 self.shutdown.wait(0.3)

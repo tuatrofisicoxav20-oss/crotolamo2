@@ -119,6 +119,9 @@ def _write_idle_hud(path: Path = _HUD_STATE_PATH) -> None:
             "mode": "idle",
             "turn_id": 0,
             "text": "",
+            # Mismo esquema que SharedState._publish: sin `enabled` el panel
+            # caía al default (activa) aunque la escucha estuviera pausada.
+            "enabled": read_control_enabled(),
             "ts": time.time(),
             "pid": os.getpid(),
         }
@@ -522,6 +525,9 @@ def run_listen(argv: list[str] | None = None) -> int:
     hud_state = SharedState(publisher=make_file_publisher(_HUD_STATE_PATH))
     # Estado inicial de la escucha desde el canal de control (default: activa).
     hud_state.set_enabled(read_control_enabled())
+    # Publicar SIEMPRE el estado inicial: pisa un hud_state.json rancio de un
+    # proceso anterior que murió a medio turno (set_enabled solo publica si cambia).
+    hud_state.publish_now()
 
     try:
         return _run_simple_loop(

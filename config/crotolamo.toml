@@ -262,6 +262,12 @@ target    = "crotolamo"
 # Subido de 0.67 a 0.72: el wake difuso (Whisper) daba falsos positivos ("romano"
 # disparaba). Más estricto = menos fantasmas, a costa de exigir mejor pronunciación.
 threshold = 0.72
+# QUÉ WAKE (y qué loop) corre. true = openWakeWord + loop CONCURRENTE (Ear/Stt/
+# Brain/Mouth, barge-in); false = wake DIFUSO con Whisper + loop SIMPLE
+# (secuencial). Si openwakeword no está instalado se cae solo al difuso. OJO:
+# varias claves de [voice] solo aplican al modo simple: ack, stream_speak,
+# smart_endpoint/endpoint_*, followup_s, wake_silence_ms/wake_max_seconds.
+use_oww = true
 # M1: wake word dedicado con openWakeWord. 'crotolamo' no tiene modelo pre-entrenado,
 # así que se usa un modelo PUENTE soportado hasta entrenar uno propio.
 oww_model     = "hey_jarvis"
