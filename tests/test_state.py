@@ -25,6 +25,16 @@ def test_new_turn_increments_and_is_current():
     assert not s.is_current(1)
 
 
+def test_new_turn_limpia_el_texto_visible():
+    """Al abrir un turno el HUD no debe seguir mostrando la respuesta anterior."""
+    publicado: list[dict] = []
+    s = SharedState(publisher=publicado.append)
+    s.set_text("Listo, patrón: pausé la música.")
+    s.new_turn()
+    assert s.current_snapshot()["text"] == ""
+    assert publicado[-1]["text"] == "" and publicado[-1]["turn_id"] == 1
+
+
 def test_new_turn_is_threadsafe():
     s = SharedState()
 
