@@ -36,21 +36,28 @@ se construyó para sobrevivir al CPU; con GLM sigue ayudando, pero deja de ser v
 Para usar GLM necesitas una API key (gratis en <https://z.ai>). **Nunca se guarda en
 el TOML** (que va a git): va en el entorno.
 
-La forma recomendada es un archivo con permisos `600`, que `launch.sh` carga solo:
+La forma recomendada es un archivo con permisos `600`, que cargan solos tanto
+`launch.sh` como el servicio systemd (`desktop/crotolamo.service`, el que enciende
+el panel):
 
 ```bash
 mkdir -p ~/.config/crotolamo
-echo 'export CROTOLAMO_GLM_API_KEY="tu-key"' > ~/.config/crotolamo/env
+echo 'CROTOLAMO_GLM_API_KEY="tu-key"' > ~/.config/crotolamo/env
 chmod 600 ~/.config/crotolamo/env
 ```
 
-`launch.sh` lo lee al arrancar, así que funciona también con el `.desktop` (doble
-clic), donde `~/.zshrc` **no** se carga: `Exec=kitty -e launch.sh` no es un shell
-interactivo. Si además quieres la key en tus terminales, añade a `~/.zshrc`:
+**Sin `export`**: systemd (`EnvironmentFile=`) no lo entiende y el servicio caería a
+Ollama en silencio. `launch.sh` exporta lo que lee, así que funciona también con el
+`.desktop` (doble clic), donde `~/.zshrc` **no** se carga: `Exec=kitty -e launch.sh`
+no es un shell interactivo. Si además quieres la key en tus terminales, añade a
+`~/.zshrc`:
 
 ```bash
-[ -f ~/.config/crotolamo/env ] && source ~/.config/crotolamo/env
+[ -f ~/.config/crotolamo/env ] && set -a && source ~/.config/crotolamo/env && set +a
 ```
+
+Si ya tenías el archivo con `export`, quítalo (o reinicia el servicio tras
+cambiarlo: `systemctl --user restart crotolamo`).
 
 O expórtala a mano para una sesión suelta:
 

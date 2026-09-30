@@ -51,7 +51,10 @@ extend-exclude = ["reference"]
 [tool.mypy]
 # Básico y pragmático (L3): no perseguir perfección. Solo chequea lo anotado y
 # tolera las libs de voz sin stubs.
-python_version = "3.11"
+# Sin `python_version` fijo: mypy usa el intérprete que lo corre. Fijarlo a 3.11
+# hacía que, en CI con 3.12, los stubs de numpy >= 2.5 (sintaxis `type X = ...`
+# de PEP 695) rompieran el chequeo antes de mirar el código. La matriz de CI
+# cubre 3.11 y 3.12.
 ignore_missing_imports = true
 check_untyped_defs = false
 warn_unused_ignores = false
