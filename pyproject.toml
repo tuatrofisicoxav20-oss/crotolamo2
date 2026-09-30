@@ -26,6 +26,15 @@ voice = [
     "openwakeword",  # wake word ligero dedicado (M1)
     "silero-vad",    # VAD neuronal + buffer de pre-activación (M2)
 ]
+# Memoria semántica (mem0 + Chroma + fastembed). Versiones FIJADAS: son las
+# validadas (ruedas cp314/abi3 disponibles; scores calibrados con este embedder).
+# Se instala con: pip install -e ".[memoria]"
+memoria = [
+    "mem0ai==2.1.0",
+    "chromadb==1.5.9",
+    "fastembed==0.8.0",
+    "groq==1.7.0",
+]
 dev = [
     "pytest",
     "ruff",

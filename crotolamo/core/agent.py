@@ -85,6 +85,7 @@ class ToolAgent(Agent):
         route_fn: Callable[[str], list[dict[str, Any]]] | None = None,
         direct_tools: set[str] | None = None,
         fastpath: bool = True,
+        after_turn_hooks: list[Callable[[str, str], None]] | None = None,
     ) -> None:
         super().__init__(llm, conversation)
         self.registry = registry
@@ -124,6 +125,10 @@ class ToolAgent(Agent):
             self.post_hooks = [meta_preamble_cleaner, strip_leaked_tool_json]
         else:
             self.post_hooks = post_hooks
+        # Hooks DESPUÉS del turno: reciben (texto del patrón, respuesta) ya con
+        # la respuesta devuelta al caller. Hoy: la memoria semántica encola la
+        # extracción de hechos. Nunca bloquean ni alteran la respuesta.
+        self.after_turn_hooks: list[Callable[[str, str], None]] = list(after_turn_hooks or [])
 
     def _execute_call(self, name: str, arguments: dict) -> str:
         tool = self.registry.get(name)
@@ -186,6 +191,17 @@ class ToolAgent(Agent):
         return value
 
     def handle_turn(self, text: str, on_token=None) -> str:
+        reply = self._handle_turn(text, on_token)
+        # El texto CRUDO del patrón (sin pre-hooks) y la respuesta final. Un hook
+        # roto no toca la respuesta: ya está calculada y ya se habló.
+        for hook in self.after_turn_hooks:
+            try:
+                hook(text, reply)
+            except Exception as error:  # noqa: BLE001
+                log.warning("after-turn hook falló: %s", error)
+        return reply
+
+    def _handle_turn(self, text: str, on_token=None) -> str:
         # Enrutamos sobre el texto LIMPIO del patrón (antes de que los pre-hooks le
         # antepongan fecha/hechos), que es la señal real de intención. El set de
         # tools se fija UNA vez por turno y se mantiene en todas las iteraciones,

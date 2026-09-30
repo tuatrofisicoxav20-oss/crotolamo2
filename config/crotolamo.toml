@@ -180,6 +180,44 @@ max_turns = 20
 # Cuesta una llamada corta al LLM por compactación; default false para no gastar.
 compaction = false
 
+# Memoria SEMÁNTICA de largo plazo (mem0 + Chroma + fastembed): Crotolamo recuerda
+# lo que le cuentas de ti y lo trae cuando viene al caso, sesión tras sesión.
+# Requiere la extra: pip install -e ".[memoria]" (versiones fijadas en pyproject).
+# Almacenamiento FUERA del repo (ruta). Con enabled = true, las tools de hechos
+# SQLite (remember_fact/...) se retiran de la vista del modelo y sus hechos se
+# copian con `python -m crotolamo memoria migrar`. Contenido: SOLO hechos sobre
+# ti (gustos, personas, costumbres, preferencias); nada de proyectos/pendientes
+# (eso irá a Notion) y NUNCA secretos (se rechazan antes de guardar).
+[memoria]
+enabled = false
+# Umbral de score de mem0.search. OJO: NO es coseno. mem0 calcula 1/(1+distancia
+# L2 de Chroma): un par con coseno 0.63 sale como 0.047. MEDIDO (scripts/
+# memoria_calibrar.py, 10 preguntas parafraseadas): el default 0.1 de mem0 pierde
+# 10/10 aciertos, 0.04 pierde 3/10, 0.02-0.03 conserva 10/10. El umbral es solo un
+# suelo de ruido; la calidad la da el ranking con top_k chico. Si cambias el
+# embedder, recalibra: python -m crotolamo memoria calibrar
+umbral = 0.03
+# Recuerdos que se inyectan por turno al contexto del LLM (pocos: son tokens y ruido).
+top_k = 3
+ruta = "~/.local/share/crotolamo/memoria"
+# Tope de espera de la recuperación por turno: si la memoria tarda más, la
+# respuesta sale sin recuerdos (WARNING). La voz nunca espera a la memoria.
+timeout_busqueda_s = 1.5
+# Extracción automática de hechos tras cada turno (en segundo plano, con el LLM
+# de abajo). false = solo se guarda lo que pidas con "acuérdate de que...".
+extraer = true
+# Embeddings locales (fastembed, ONNX, sin GPU). Multilingüe: entiende español.
+modelo_embeddings = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+dims_embeddings = 384
+# LLM que EXTRAE los hechos (no es el cerebro de Crotolamo). "groq" usa el SDK de
+# Groq con la MISMA key de la nube (CROTOLAMO_GLM_API_KEY); "openai" = cualquier
+# endpoint OpenAI-compatible ([llm.glm].base_url, p.ej. Z.ai); "ollama" = modelo
+# local de [llm] (sin key, más lento).
+llm_provider = "groq"
+llm_model = "openai/gpt-oss-120b"
+# Id del usuario dentro de mem0 (por si algún día hay más de un patrón).
+usuario = "patron"
+
 # Apps que el patrón puede abrir por nombre (open_app). Edítalas para tu entorno
 # (Hyprland): clave = lista de argumentos del comando. El 'terminal' se AUTODETECTA
 # (kitty/foot/alacritty/...) si no lo defines aquí; el explorador de archivos también

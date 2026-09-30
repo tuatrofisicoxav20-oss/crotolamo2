@@ -70,6 +70,11 @@ class Settings:
         return self.raw.get("persona", {})
 
     @property
+    def memoria(self) -> dict[str, Any]:
+        """[memoria]: memoria semántica con mem0 (ver core/memoria.py)."""
+        return self.raw.get("memoria", {})
+
+    @property
     def mcp(self) -> dict[str, Any]:
         """Sección [mcp] (M4). Los servers van como tablas nombradas
         [mcp.servers.<nombre>] para que _deep_merge los fusione con el local.toml

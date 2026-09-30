@@ -113,6 +113,35 @@ python -m crotolamo listen      # bucle de voz wake-word (requiere extra [voice]
 Para la voz: `pip install -e ".[voice]"` (faster-whisper, sounddevice, piper-tts) y
 un modelo Piper `.onnx` en `[paths].voces`.
 
+### Memoria semántica (mem0): que te conozca con el tiempo
+
+Aparte del historial de la sesión y de los hechos literales en SQLite, Crotolamo
+puede recordar lo que le cuentas de ti y traerlo cuando viene al caso, sesión tras
+sesión (mem0 + Chroma + fastembed, todo local salvo el LLM que extrae los hechos).
+
+```bash
+pip install -e ".[memoria]"          # versiones fijadas (validadas con ruedas cp314)
+# config/crotolamo.local.toml:  [memoria]  enabled = true
+python -m crotolamo memoria migrar   # copia los hechos SQLite existentes (una vez)
+python -m crotolamo memoria listar   # qué recuerda; también buscar <q> | olvidar <q>
+python -m crotolamo memoria calibrar # mide los scores reales y sugiere el umbral
+```
+
+Cómo funciona: antes de cada respuesta se buscan los `top_k` recuerdos relevantes
+(con presupuesto de tiempo: si la memoria tarda o falla, se responde sin ella y se
+loguea) y se anteponen al mensaje; después de responder, mem0 extrae hechos nuevos
+**en segundo plano**, sin retrasar la voz. Por voz: «acuérdate de que...»,
+«¿qué sabes de mí?», «olvida lo de...». Con `enabled = true` las tools de hechos
+SQLite se retiran de la vista del modelo (una sola familia de "recordar").
+
+Reglas de contenido (en las tools y en el prompt de extracción): **solo hechos sobre
+ti** (gustos, personas, costumbres, preferencias); nada de proyectos ni pendientes
+(eso irá a Notion); **nunca secretos**: un turno con pinta de API key, contraseña o
+token se rechaza antes de llegar a la memoria. Telemetría de mem0 apagada siempre.
+Los scores de mem0 no son coseno (`1/(1+distancia L2)`): el umbral 0.03 viene de
+medir; si cambias el embedder, recalibra. Almacenamiento en `[memoria].ruta`
+(`~/.local/share/crotolamo/memoria`), fuera del repo.
+
 ## Configuración
 
 Todo vive en `config/crotolamo.toml` — **cero rutas hardcodeadas**. Para overrides

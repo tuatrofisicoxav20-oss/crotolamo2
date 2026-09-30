@@ -53,7 +53,13 @@ def build_agent(confirm_fn=None) -> tuple[Agent, Conversation]:
     # La Fase 2 cablea el registry de tools; si está disponible, lo usamos.
     try:
         from crotolamo.core.agent import ToolAgent  # type: ignore
-        from crotolamo.core.hooks import datetime_prehook, make_facts_prehook
+        from crotolamo.core.hooks import (
+            datetime_prehook,
+            make_facts_prehook,
+            make_memoria_posthook,
+            make_memoria_prehook,
+        )
+        from crotolamo.core.memoria import get_memoria
         from crotolamo.core.router import route_schemas
         from crotolamo.tools import default_registry
         from crotolamo.safety.guard import Guard
@@ -91,6 +97,20 @@ def build_agent(confirm_fn=None) -> tuple[Agent, Conversation]:
                 if use_routing else None
             )
 
+        # Memoria semántica (mem0): con [memoria].enabled, los recuerdos
+        # relevantes entran en CADA turno (pre-hook, con presupuesto de tiempo)
+        # y la extracción de hechos va en segundo plano tras responder
+        # (after-turn hook). Sustituye a la inyección única de hechos SQLite:
+        # tras `crotolamo memoria migrar` ya viven aquí. Sin ella, todo como antes.
+        memoria = get_memoria()
+        if memoria.enabled:
+            memoria.precalentar()
+            pre_hooks = [make_memoria_prehook(memoria), datetime_prehook]
+            after_turn_hooks = [make_memoria_posthook(memoria)]
+        else:
+            pre_hooks = [make_facts_prehook(), datetime_prehook]
+            after_turn_hooks = []
+
         agent: Agent = ToolAgent(
             llm,
             conversation,
@@ -98,7 +118,8 @@ def build_agent(confirm_fn=None) -> tuple[Agent, Conversation]:
             guard=Guard.from_settings(settings),
             max_iterations=settings.llm.get("max_iterations", 6),
             confirm_fn=confirm_fn or _text_confirm,
-            pre_hooks=[make_facts_prehook(), datetime_prehook],
+            pre_hooks=pre_hooks,
+            after_turn_hooks=after_turn_hooks,
             route_fn=route_fn,
             # Con GLM no hay comandos prehechos: todo lo razona y redacta él.
             fastpath=False if glm_brain else settings.llm.get("fastpath", True),

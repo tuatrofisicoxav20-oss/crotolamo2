@@ -92,6 +92,17 @@ GROUPS: dict[str, dict[str, Any]] = {
             "contenido de", "ensename los", "ver los archivos",
         ],
     },
+    # Memoria semántica (mem0). Mismos disparadores que "facts": solo una de las
+    # dos familias está registrada a la vez (route_schemas ignora las ausentes).
+    "memoria": {
+        "tools": ["recordar_de_mi", "buscar_recuerdos", "olvidar_recuerdo"],
+        "keywords": [
+            "recuerda", "acuerdate", "acuerda", "recordar", "recuerdas", "te acuerdas",
+            "olvida", "olvidate", "olvidalo", "que sabes de mi", "que sabes sobre mi",
+            "anota que", "memoriza", "ten en cuenta", "hecho sobre", "mi memoria",
+            "que te conte", "te dije que", "te he dicho", "sabes como", "sabes que",
+        ],
+    },
     "facts": {
         "tools": ["remember_fact", "recall_facts", "search_facts", "forget_fact"],
         "keywords": [

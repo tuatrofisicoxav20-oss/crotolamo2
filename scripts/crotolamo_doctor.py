@@ -696,6 +696,36 @@ def _check_silero(ctx: _Ctx) -> list[Check]:
     return [Check("voz-silero", True, "silero-vad importable (VAD neuronal activo)")]
 
 
+def _check_memoria(ctx: _Ctx) -> list[Check]:
+    """Memoria semántica (mem0): deps importables, ruta escribible, telemetría off."""
+    from crotolamo.core.memoria import MemoriaConfig
+
+    cfg = MemoriaConfig.from_settings(ctx.settings)
+    if not cfg.enabled:
+        return [Check("memoria", True, "desactivada ([memoria].enabled = false)")]
+    faltan = [m for m in ("mem0", "chromadb", "fastembed") if _import_error(m)]
+    if cfg.llm_provider == "groq" and _import_error("groq"):
+        faltan.append("groq")
+    if faltan:
+        return [Check("memoria", False, f"faltan módulos: {', '.join(faltan)}",
+                      "pip install -e '.[memoria]'  (versiones fijadas en pyproject)")]
+    try:
+        cfg.ruta.mkdir(parents=True, exist_ok=True)
+        prueba = cfg.ruta / ".doctor_escribe"
+        prueba.write_text("ok", encoding="utf-8")
+        prueba.unlink()
+    except OSError as error:
+        return [Check("memoria", False, f"la ruta {cfg.ruta} no es escribible: {error}",
+                      "Ajusta [memoria].ruta o los permisos de la carpeta.")]
+    # core/memoria.py fija MEM0_TELEMETRY=False al importarse (antes de mem0).
+    if os.environ.get("MEM0_TELEMETRY") != "False":
+        return [Check("memoria", False, "la telemetría de mem0 NO está apagada",
+                      "No exportes MEM0_TELEMETRY en el entorno; core/memoria.py la apaga.")]
+    return [Check("memoria", True,
+                  f"mem0/chromadb/fastembed OK, ruta {cfg.ruta} escribible, telemetría apagada "
+                  f"(umbral {cfg.umbral:g}, top_k {cfg.top_k}, LLM {cfg.llm_provider})")]
+
+
 def _check_ydotool(ctx: _Ctx) -> list[Check]:
     has = shutil.which("ydotool") is not None
     return [Check("ydotool", has, "ydotool presente" if has else "sin ydotool (opcional)",
@@ -754,6 +784,7 @@ _CHECKS: tuple[_Spec, ...] = (
     _Spec("portaudio", _check_portaudio, _nunca),
     _Spec("voz-oww", _check_oww, _nunca),
     _Spec("voz-silero", _check_silero, _nunca),
+    _Spec("memoria", _check_memoria, _nunca),
     _Spec("ydotool", _check_ydotool, _nunca),
     _Spec("navegador", _check_navegador, _nunca),
 )
