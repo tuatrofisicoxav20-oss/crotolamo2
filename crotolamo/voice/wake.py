@@ -120,8 +120,35 @@ def strip_wake_word(text: str, variants: Iterable[str] | None = None) -> str:
 
 
 def contains_any(text: str, variants: Iterable[str]) -> bool:
-    lower = normalize_for_wake(text)
-    return any(normalize_for_wake(v) in lower for v in variants)
+    """True si alguna variante aparece como PALABRA(S) COMPLETA(S) en el texto.
+
+    Antes comparaba por subcadena y eso confirmaba acciones delicadas por
+    accidente: "necesito pensarlo" contenía el "si" de nece-SI-to, "nueva"
+    contenía "va" y "bueno" cancelaba por el "no". Ahora la variante debe
+    coincidir token a token (las de varias palabras, como secuencia contigua),
+    sobre el texto normalizado (minúsculas, sin acentos ni puntuación).
+    """
+    words = normalize_for_wake(text).split()
+    for variant in variants:
+        needle = normalize_for_wake(variant).split()
+        n = len(needle)
+        if n == 0 or n > len(words):
+            continue
+        if any(words[i:i + n] == needle for i in range(len(words) - n + 1)):
+            return True
+    return False
+
+
+def confirmation_from_answer(answer: str) -> bool:
+    """Decide una confirmación por voz. Cancelar GANA si aparece junto a un sí.
+
+    Es la única regla de decisión para tools delicadas dichas por voz; vive
+    aquí (pura) para poder probarla sin micrófono. Cualquier respuesta que no
+    contenga una confirmación clara se trata como "no" (lo seguro).
+    """
+    if contains_any(answer, CANCEL_VARIANTS):
+        return False
+    return contains_any(answer, CONFIRM_VARIANTS)
 
 
 def split_wake_command(

@@ -381,9 +381,7 @@ def run_listen(argv: list[str] | None = None) -> int:
             answer = wake_stt.listen_once(silence_ms=cfg.wake_silence_ms, max_seconds=5)
         except VoiceUnavailable:
             return False
-        if wake.contains_any(answer, wake.CANCEL_VARIANTS):
-            return False
-        return wake.contains_any(answer, wake.CONFIRM_VARIANTS)
+        return wake.confirmation_from_answer(answer)
 
     # M3: por defecto, loop concurrente. --simple = modo secuencial viejo (fallback).
     # Barge-in conservador: half-duplex por defecto; --barge-in lo activa (auriculares).
