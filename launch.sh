@@ -12,8 +12,13 @@ cd "$ROOT"
 # interactivo: ~/.zshrc no se carga y la key no existiría. Sin esto, un doble clic
 # haría que Crotolamo cayera a Ollama en silencio. El archivo tiene permisos 600.
 if [[ -f "$HOME/.config/crotolamo/env" ]]; then
+    # set -a: las asignaciones del archivo se exportan aunque no lleven `export`.
+    # Así el MISMO archivo sirve aquí y como EnvironmentFile= del servicio
+    # systemd (que no entiende `export`).
+    set -a
     # shellcheck source=/dev/null
     source "$HOME/.config/crotolamo/env"
+    set +a
 fi
 
 # --- elegir intérprete: venv si existe, si no python3 del sistema ---

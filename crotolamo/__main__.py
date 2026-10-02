@@ -4,7 +4,8 @@ Comandos:
   --version        imprime la versión
   shell            REPL de texto (Fase 1+)
   doctor           auditor de salud (Fase 0)
-  listen           bucle de voz wake-word (Fase 5, stub por ahora)
+  listen           bucle de voz wake-word (Fase 5)
+  memoria          memoria semántica: migrar|listar|buscar|olvidar|calibrar
 """
 
 from __future__ import annotations
@@ -38,8 +39,12 @@ def main(argv: list[str] | None = None) -> int:
         from interfaces.listener import run_listen
         return run_listen(rest)
 
+    if command == "memoria":
+        from crotolamo.core.memoria import run_cli
+        return run_cli(rest)
+
     print(f"Comando desconocido: {command!r}", file=sys.stderr)
-    print("Usa: python -m crotolamo [--version|shell|doctor|listen]", file=sys.stderr)
+    print("Usa: python -m crotolamo [--version|shell|doctor|listen|memoria]", file=sys.stderr)
     return 2
 
 

@@ -126,6 +126,14 @@ def make_facts_prehook():
     return hook
 
 
+# Memoria semántica (mem0): los hooks viven junto a la Memoria, en core/memoria.py
+# (make_memoria_prehook por turno y make_memoria_posthook tras responder).
+from crotolamo.core.memoria import (  # noqa: E402,F401 - re-export
+    make_memoria_posthook,
+    make_memoria_prehook,
+)
+
+
 def datetime_prehook(text: str) -> str:
     """Pre-hook trivial de demostración: antepone la fecha/hora actual al contexto."""
     return f"[ahora: {datetime.now():%Y-%m-%d %H:%M}]\n{text}"

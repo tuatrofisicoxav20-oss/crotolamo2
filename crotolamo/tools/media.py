@@ -51,7 +51,11 @@ def music_now() -> str:
     if status.returncode != 0:
         return "No hay nada sonando, patrón. El silencio también es música."
     estado = (status.stdout or "").strip().lower()
-    cancion = (meta.stdout or "").strip(" —")
+    # Primero el strip() a secas: playerctl termina la línea con "\n" y
+    # strip(" —") no lo quitaba, así que la frase salía con un salto de línea
+    # pegado ("...: Artista — Canción\n"). Luego se limpia el separador huérfano
+    # cuando falta el artista o el título.
+    cancion = (meta.stdout or "").strip().strip("— ")
     if not cancion:
         return f"Reproductor en estado «{estado}», patrón, pero sin metadatos."
     etiqueta = {"playing": "Sonando", "paused": "En pausa"}.get(estado, estado.capitalize())

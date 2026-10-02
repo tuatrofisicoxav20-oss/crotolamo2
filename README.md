@@ -36,21 +36,28 @@ se construyó para sobrevivir al CPU; con GLM sigue ayudando, pero deja de ser v
 Para usar GLM necesitas una API key (gratis en <https://z.ai>). **Nunca se guarda en
 el TOML** (que va a git): va en el entorno.
 
-La forma recomendada es un archivo con permisos `600`, que `launch.sh` carga solo:
+La forma recomendada es un archivo con permisos `600`, que cargan solos tanto
+`launch.sh` como el servicio systemd (`desktop/crotolamo.service`, el que enciende
+el panel):
 
 ```bash
 mkdir -p ~/.config/crotolamo
-echo 'export CROTOLAMO_GLM_API_KEY="tu-key"' > ~/.config/crotolamo/env
+echo 'CROTOLAMO_GLM_API_KEY="tu-key"' > ~/.config/crotolamo/env
 chmod 600 ~/.config/crotolamo/env
 ```
 
-`launch.sh` lo lee al arrancar, así que funciona también con el `.desktop` (doble
-clic), donde `~/.zshrc` **no** se carga: `Exec=kitty -e launch.sh` no es un shell
-interactivo. Si además quieres la key en tus terminales, añade a `~/.zshrc`:
+**Sin `export`**: systemd (`EnvironmentFile=`) no lo entiende y el servicio caería a
+Ollama en silencio. `launch.sh` exporta lo que lee, así que funciona también con el
+`.desktop` (doble clic), donde `~/.zshrc` **no** se carga: `Exec=kitty -e launch.sh`
+no es un shell interactivo. Si además quieres la key en tus terminales, añade a
+`~/.zshrc`:
 
 ```bash
-[ -f ~/.config/crotolamo/env ] && source ~/.config/crotolamo/env
+[ -f ~/.config/crotolamo/env ] && set -a && source ~/.config/crotolamo/env && set +a
 ```
+
+Si ya tenías el archivo con `export`, quítalo (o reinicia el servicio tras
+cambiarlo: `systemctl --user restart crotolamo`).
 
 O expórtala a mano para una sesión suelta:
 
@@ -98,13 +105,42 @@ O a mano:
 
 ```bash
 python -m crotolamo --version
-python -m crotolamo doctor      # auditor de salud
+python -m crotolamo doctor      # auditor de salud: REQUERIDOS (key, nube, stt, tts, aec) y opcionales; se ajusta en [doctor]
 python -m crotolamo shell       # REPL de texto
 python -m crotolamo listen      # bucle de voz wake-word (requiere extra [voice])
 ```
 
 Para la voz: `pip install -e ".[voice]"` (faster-whisper, sounddevice, piper-tts) y
 un modelo Piper `.onnx` en `[paths].voces`.
+
+### Memoria semántica (mem0): que te conozca con el tiempo
+
+Aparte del historial de la sesión y de los hechos literales en SQLite, Crotolamo
+puede recordar lo que le cuentas de ti y traerlo cuando viene al caso, sesión tras
+sesión (mem0 + Chroma + fastembed, todo local salvo el LLM que extrae los hechos).
+
+```bash
+pip install -e ".[memoria]"          # versiones fijadas (validadas con ruedas cp314)
+# config/crotolamo.local.toml:  [memoria]  enabled = true
+python -m crotolamo memoria migrar   # copia los hechos SQLite existentes (una vez)
+python -m crotolamo memoria listar   # qué recuerda; también buscar <q> | olvidar <q>
+python -m crotolamo memoria calibrar # mide los scores reales y sugiere el umbral
+```
+
+Cómo funciona: antes de cada respuesta se buscan los `top_k` recuerdos relevantes
+(con presupuesto de tiempo: si la memoria tarda o falla, se responde sin ella y se
+loguea) y se anteponen al mensaje; después de responder, mem0 extrae hechos nuevos
+**en segundo plano**, sin retrasar la voz. Por voz: «acuérdate de que...»,
+«¿qué sabes de mí?», «olvida lo de...». Con `enabled = true` las tools de hechos
+SQLite se retiran de la vista del modelo (una sola familia de "recordar").
+
+Reglas de contenido (en las tools y en el prompt de extracción): **solo hechos sobre
+ti** (gustos, personas, costumbres, preferencias); nada de proyectos ni pendientes
+(eso irá a Notion); **nunca secretos**: un turno con pinta de API key, contraseña o
+token se rechaza antes de llegar a la memoria. Telemetría de mem0 apagada siempre.
+Los scores de mem0 no son coseno (`1/(1+distancia L2)`): el umbral 0.03 viene de
+medir; si cambias el embedder, recalibra. Almacenamiento en `[memoria].ruta`
+(`~/.local/share/crotolamo/memoria`), fuera del repo.
 
 ## Configuración
 

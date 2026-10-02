@@ -112,3 +112,17 @@ def test_etc_blocked_with_default_confirm_roots(guard):
     # /etc no está bajo ~: sigue bloqueado con el default de confirm_roots.
     decision = guard.check(_tool(), {"path": "/etc/fstab"})
     assert not decision.allowed
+
+
+# --- path_inside_roots: lo que no se puede resolver se NIEGA, sin excepción ---
+
+def test_ruta_con_byte_nulo_queda_fuera_del_corral(tmp_path):
+    """Path.resolve() lanza ValueError("embedded null byte") con un '\\0' en la
+    ruta; solo se capturaban OSError/RuntimeError y la excepción subía hasta el
+    agente. La ruta la elige el LLM: debe negar (False), no reventar."""
+    from pathlib import Path
+
+    from crotolamo.safety.paths import path_inside_roots
+
+    assert path_inside_roots(Path("a\0b"), [tmp_path]) is False
+    assert path_inside_roots(str(tmp_path / "ok\0malo.txt"), [tmp_path]) is False

@@ -22,6 +22,7 @@ import threading
 from pathlib import Path
 
 from crotolamo.logging_setup import get_logger
+from crotolamo.voice.clean import limpiar_para_voz
 
 log = get_logger("voice.tts")
 
@@ -32,11 +33,17 @@ log = get_logger("voice.tts")
 # frases truncadas en el TTS. No se busca un segmentador perfecto: solo no
 # romper los casos frecuentes del español MX.
 
-_CANDIDATO = re.compile(r"(?<=[.!?¿¡\n])\s+")
+# El fin de frase puede venir seguido de un cierre de énfasis markdown
+# ("**Listo.** Ahora..."): esos cierres se tragan con el espacio para que la
+# frase se corte donde termina de verdad y no se arrastre hasta la siguiente.
+_CANDIDATO = re.compile(r"(?<=[.!?¿¡\n])[*_~]*\s+")
 # Abreviaturas cortas comunes en las respuestas ("no" se trata aparte: como
 # adverbio SÍ cierra frase; solo bloquea el corte si sigue un número: "No. 5").
 _ABREVIATURAS = {"sr", "sra", "srta", "dr", "dra", "etc", "ej", "p.ej", "vs", "av"}
 _PALABRA_ANTES = re.compile(r"([a-záéíóúüñ]+(?:\.[a-záéíóúüñ]+)*)\.$", re.IGNORECASE)
+# "1. Abre Spotify": el punto de un marcador de lista numerada al inicio de
+# línea no cierra frase (si no, "uno." se hablaría como frase suelta).
+_MARCADOR_LISTA = re.compile(r"(?:^|\n)[ \t]*\d{1,2}\.$")
 
 
 def _cierra_frase(text: str, start: int, end: int) -> bool:
@@ -47,6 +54,8 @@ def _cierra_frase(text: str, start: int, end: int) -> bool:
     antes = text[:start]
     if len(antes) >= 2 and antes[-2].isdigit() and despues.isdigit():
         return False  # decimal partido: "40. 5"
+    if _MARCADOR_LISTA.search(antes):
+        return False  # marcador de lista numerada, no fin de frase
     m = _PALABRA_ANTES.search(antes)
     if m:
         palabra = m.group(1).lower()
@@ -124,7 +133,11 @@ class TTS:
         return audio, sample_rate
 
     def speak(self, text: str) -> None:
-        text = text.strip()
+        # ÚNICO punto de limpieza para voz: por aquí pasa todo lo que se habla
+        # (StreamSpeaker, speak_sentences, MouthThread, say), sea cual sea el
+        # motor. Markdown, emojis y URLs se quitan ANTES de sintetizar; el corte
+        # (stop/barge-in) no se toca: es solo trabajo de texto previo al audio.
+        text = limpiar_para_voz(text)
         if not text:
             return
         if not self.voice_model.exists():

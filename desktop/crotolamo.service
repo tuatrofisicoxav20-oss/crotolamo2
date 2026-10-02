@@ -12,6 +12,11 @@ WorkingDirectory=%h/Documentos/crotolamo2
 # control en este archivo como CROTOLAMO_LISTEN_ARGS. El guion inicial lo hace
 # opcional: si no existe, arranca en el modo por defecto del código.
 EnvironmentFile=-%h/.config/crotolamo/listener.env
+# Credenciales (API key de GLM): el mismo archivo que carga launch.sh. Sin esta
+# línea el servicio arrancaba SIEMPRE con Ollama local en silencio, porque la
+# key solo existía en el shell. Formato: CROTOLAMO_GLM_API_KEY="..." (sin
+# `export`: systemd no lo entiende). Opcional: sin archivo, cae a Ollama.
+EnvironmentFile=-%h/.config/crotolamo/env
 Environment=PYTHONUNBUFFERED=1
 ExecStart=%h/Documentos/crotolamo2/.venv/bin/python -m crotolamo listen $CROTOLAMO_LISTEN_ARGS
 # El listener captura SIGTERM (el stop por defecto de systemd) y sale al instante

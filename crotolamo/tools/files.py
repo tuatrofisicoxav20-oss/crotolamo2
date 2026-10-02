@@ -20,7 +20,20 @@ from crotolamo.tools.base import tool, truncate_for_context
 
 
 def _resolve(path: str) -> Path:
-    return Path(path).expanduser()
+    """Ruta canónica: ~ expandido y symlinks/`..` resueltos.
+
+    Se resuelve UNA vez, antes de validar, y las tools operan sobre ESA misma
+    ruta. Validar la ruta resuelta y luego leer/escribir/mover la ruta cruda
+    dejaba una ventana (TOCTOU): un enlace simbólico cambiado entre la
+    validación y la operación apuntaría fuera del corral. Si no se puede
+    resolver (bucle de enlaces, '\\0' en la ruta...), se devuelve tal cual y
+    _outside_corral la rechaza, porque path_inside_roots tampoco podrá.
+    """
+    p = Path(path).expanduser()
+    try:
+        return p.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return p
 
 
 def _outside_corral(p: Path) -> str | None:
@@ -92,10 +105,15 @@ def list_dir(path: str) -> str:
         return f"No existe la carpeta, patrón: {p}"
     if not p.is_dir():
         return f"Eso no es una carpeta, patrón: {p}"
-    entries = sorted(p.iterdir(), key=lambda e: (e.is_file(), e.name.lower()))
+    # iterdir()/is_dir() lanzan PermissionError (u otro OSError) sobre carpetas
+    # sin permisos; sin esto la tool "reventaba" en vez de responder en personaje.
+    try:
+        entries = sorted(p.iterdir(), key=lambda e: (e.is_file(), e.name.lower()))
+        lines = [f"{'📁' if e.is_dir() else '📄'} {e.name}" for e in entries[:100]]
+    except OSError as error:
+        return f"No pude listar {p}, patrón: {error}"
     if not entries:
         return f"{p} está vacía, patrón."
-    lines = [f"{'📁' if e.is_dir() else '📄'} {e.name}" for e in entries[:100]]
     extra = f"\n...y {len(entries) - 100} más." if len(entries) > 100 else ""
     return f"Contenido de {p}, patrón:\n" + "\n".join(lines) + extra
 

@@ -18,10 +18,13 @@ from __future__ import annotations
 import glob
 import os
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from crotolamo.logging_setup import get_logger
 from crotolamo.voice.stt import VoiceUnavailable, _require
+
+if TYPE_CHECKING:
+    from crotolamo.voice.media_aware import MediaMonitor
 
 log = get_logger("voice.wakeword")
 
@@ -32,9 +35,14 @@ _SAMPLE_RATE = 16000
 
 class WakeWordDetector:
     def __init__(self, model_name: str = "hey_jarvis", threshold: float = 0.5,
-                 debug: bool = False) -> None:
+                 debug: bool = False, threshold_media: float | None = None,
+                 media: MediaMonitor | None = None) -> None:
         self.model_name = model_name
         self.threshold = threshold
+        # Umbral con MÚSICA sonando (ver voice/media_aware.py): la música mete
+        # falsos disparos, así que se exige más. None = un solo umbral, siempre.
+        self.threshold_media = threshold_media
+        self._media = media
         # Modo debug (validación de mic): imprime CADA score en tiempo real por
         # stdout para calibrar el umbral viendo qué da la voz real vs el ruido.
         self.debug = debug
@@ -43,12 +51,36 @@ class WakeWordDetector:
 
     @classmethod
     def from_settings(cls, settings) -> "WakeWordDetector":
+        from crotolamo.voice.media_aware import sane_media_threshold
+
         wake = settings.wake
+        threshold = wake.get("oww_threshold", 0.5)
         return cls(
             model_name=wake.get("oww_model", "hey_jarvis"),
-            threshold=wake.get("oww_threshold", 0.5),
+            threshold=threshold,
+            threshold_media=sane_media_threshold(
+                threshold, wake.get("oww_threshold_media", 0.7), "[wake].oww_threshold_media",
+            ),
             debug=os.environ.get("CROTOLAMO_WAKE_DEBUG", "") not in ("", "0"),
         )
+
+    def attach_media(self, monitor: MediaMonitor | None) -> None:
+        """Engancha el MediaMonitor: con música en Playing rige threshold_media."""
+        self._media = monitor
+
+    def effective_threshold(self) -> float:
+        """Umbral vigente para ESTE chunk: el de música si el monitor dice que
+        suena algo (lee su caché: no bloquea), el normal en cualquier otro caso.
+        Sin monitor o sin threshold_media, idéntico al umbral fijo de siempre.
+        """
+        if self.threshold_media is None or self._media is None:
+            return self.threshold
+        try:
+            playing = self._media.is_playing()
+        except Exception as error:  # noqa: BLE001 - un monitor roto no cambia el wake
+            log.debug("media monitor falló (%s); uso el umbral normal", error)
+            return self.threshold
+        return self.threshold_media if playing else self.threshold
 
     def _resolve_model_path(self) -> str:
         """Resuelve el nombre del modelo (p.ej. 'hey_jarvis') a la ruta de su .onnx.
@@ -142,7 +174,10 @@ class WakeWordDetector:
             import sounddevice  # noqa: F401
 
             return True
-        except ImportError:
+        except (ImportError, OSError):
+            # OSError: sounddevice importa pero no encuentra libportaudio
+            # ("PortAudio library not found"). Sin esto el listener reventaba
+            # con traceback en vez de caer al modo simple.
             return False
 
     def feed(self, chunk) -> bool:
@@ -162,15 +197,18 @@ class WakeWordDetector:
         openWakeWord espera int16; convertimos si llega en float.
         """
         mx = self.score(chunk)
-        fired = mx >= self.threshold
+        # Umbral EFECTIVO (sube con música sonando): es el que se loguea, para
+        # que el log explique por qué un score que ayer disparaba hoy no.
+        threshold = self.effective_threshold()
+        fired = mx >= threshold
         if self.debug:
-            print(f"[wake] score={mx:.3f} umbral={self.threshold:.2f}"
+            print(f"[wake] score={mx:.3f} umbral={threshold:.2f}"
                   f"{'  <<< DISPARA' if fired else ''}", flush=True)
         # Log de diagnóstico: solo cuando hay señal (>0.05), para ver qué score da
         # la voz REAL del patrón y afinar el umbral sin inundar el log con silencio.
         if mx > 0.05:
             log.info("wake score=%.3f (umbral=%.2f) -> %s",
-                     mx, self.threshold, "DISPARA" if fired else "no")
+                     mx, threshold, "DISPARA" if fired else "no")
         return fired
 
     def score(self, chunk) -> float:
@@ -214,6 +252,8 @@ class WakeWordDetector:
                 block, _ = stream.read(_FRAME)
                 audio = np.squeeze(np.asarray(block, dtype=np.int16))
                 scores = model.predict(audio)
-                if scores and max(scores.values()) >= self.threshold:
+                # Umbral efectivo por frame: la música puede arrancar o parar
+                # mientras esperamos el wake (el monitor lo refleja en su caché).
+                if scores and max(scores.values()) >= self.effective_threshold():
                     return True
         return False

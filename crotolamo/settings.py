@@ -69,6 +69,18 @@ class Settings:
     def persona(self) -> dict[str, Any]:
         return self.raw.get("persona", {})
 
+    @property
+    def memoria(self) -> dict[str, Any]:
+        """[memoria]: memoria semántica con mem0 (ver core/memoria.py)."""
+        return self.raw.get("memoria", {})
+
+    @property
+    def mcp(self) -> dict[str, Any]:
+        """Sección [mcp] (M4). Los servers van como tablas nombradas
+        [mcp.servers.<nombre>] para que _deep_merge los fusione con el local.toml
+        (un array de tablas se pisaría entero)."""
+        return self.raw.get("mcp", {})
+
     def validate_critical(self) -> list[str]:
         """Devuelve lista de problemas con rutas críticas (no lanza)."""
         problems = []
@@ -76,6 +88,22 @@ class Settings:
         if home and not home.exists():
             problems.append(f"home no existe: {home}")
         return problems
+
+
+def _path_list(paths_raw: dict, key: str, default: list[str]) -> list[Path]:
+    """Lista de rutas de [paths].<key>, validada.
+
+    Un typo como `allowed_roots = "~/Documentos"` (string en vez de lista) se
+    iteraba carácter a carácter y metía "/" como raíz permitida: TODO el disco
+    quedaba en zona libre sin confirmación. Mejor no arrancar que arrancar así.
+    """
+    raw = paths_raw.get(key, default)
+    if not isinstance(raw, list) or not all(isinstance(p, str) for p in raw):
+        raise ValueError(
+            f"[paths].{key} debe ser una lista de rutas (strings), "
+            f"no {type(raw).__name__}: {raw!r}"
+        )
+    return [_expand(p) for p in raw]
 
 
 def load_settings(config_path: Path | None = None) -> Settings:
@@ -98,9 +126,9 @@ def load_settings(config_path: Path | None = None) -> Settings:
         if key not in {"allowed_roots"} and isinstance(value, str)
     }
 
-    allowed_roots = [_expand(p) for p in paths_raw.get("allowed_roots", [])]
+    allowed_roots = _path_list(paths_raw, "allowed_roots", [])
     # [paths].confirm_roots puede no existir aún en el toml: default ["~"].
-    confirm_roots = [_expand(p) for p in paths_raw.get("confirm_roots", ["~"])]
+    confirm_roots = _path_list(paths_raw, "confirm_roots", ["~"])
     projects = {name: _expand(p) for name, p in data.get("projects", {}).items()}
 
     return Settings(

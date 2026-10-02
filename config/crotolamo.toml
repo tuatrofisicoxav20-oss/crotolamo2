@@ -50,6 +50,51 @@ crotolamo1 = "~/Documentos/crotolamo2/reference/c1_checkpoint/chapi_assistant"
 # Nivel de log de diagnóstico (DEBUG/INFO/WARNING/ERROR). La env CROTOLAMO_LOG manda.
 level = "INFO"
 
+# Doctor (`python -m crotolamo doctor`): qué pila debe auditar. Los defaults
+# describen lo que trae ESTE repo: nube OpenAI-compatible vía [llm.glm] (con su
+# key en la env), STT faster-whisper, TTS Piper ([paths].voces + [voice].piper_voice),
+# AEC de PipeWire (desktop/aec.sh) y un servicio de música. El doctor no adivina:
+# si tu stack es otro, apúntalo aquí (mejor en crotolamo.local.toml). Ejemplo
+# para la pila Groq + Parakeet + Kokoro + Soloist:
+#   [llm.glm]  base_url = "https://api.groq.com/openai/v1"   (y model = el de Groq)
+#   [doctor]   stt_module = "onnx_asr"
+#              tts_model  = "~/Documentos/crotolamo2/voices/kokoro-v1.0.onnx"
+#              tts_voices = "~/Documentos/crotolamo2/voices/voices-v1.0.bin"
+#              tts_voice  = "em_alex"
+# Un REQUERIDO en rojo (key, nube, stt, tts, aec) hace salir con 1; los
+# opcionales (Ollama de respaldo, música, Spotify, listeners...) solo se reportan.
+[doctor]
+# STT principal: módulo Python que debe importar ("faster_whisper"; "onnx_asr" para
+# Parakeet). stt_model: ruta (con ~) de un modelo en disco que debe existir; vacío
+# = no hay archivo que comprobar (faster-whisper descarga y cachea el suyo).
+stt_module = "faster_whisper"
+stt_model  = ""
+# TTS principal. tts_model vacío = Piper: se comprueba [paths].voces/[voice].piper_voice
+# (y su .onnx.json al lado). Con tts_model (p.ej. Kokoro) se comprueba ese archivo;
+# tts_voices = archivo de voces (.bin/.npz de numpy o .json) y tts_voice = la voz
+# que debe contener. Vacíos = no se comprueban.
+tts_model  = ""
+tts_voices = ""
+tts_voice  = ""
+# Nodos PipeWire de la cancelación de eco (los crea desktop/aec.sh). Deben existir,
+# ser el source y el sink por DEFECTO (sin el sink como default, el AEC no tiene
+# referencia y Crotolamo se activa con su propia voz) y el source sin mute. Si
+# [voice].input_device apunta al source, que no sea el default solo avisa.
+# aec_source = "" y aec_sink = "" desactivan el check (máquina sin AEC).
+aec_source = "crotolamo_aec_source"
+aec_sink   = "crotolamo_aec_sink"
+# Servicio de música: unidad de `systemctl --user` y su WebSocket local.
+# musica_service = "" desactiva el check del servicio (el del WebSocket sigue).
+musica_service = "soloist.service"
+musica_host    = "127.0.0.1"
+musica_port    = 9090
+# Fecha (TOML, sin comillas) en que caduca la credencial del servicio de música y
+# con cuántos días de antelación avisar (⚠️). Ponla a "" para no vigilarla.
+musica_caduca     = 2026-11-29
+musica_aviso_dias = 14
+# Env con el client id de Spotify. Solo se comprueba que exista; nunca se imprime.
+spotify_client_id_env = "SPOTIFY_CLIENT_ID"
+
 [llm]
 # Motor de inferencia: "ollama" (local, CPU) o "glm" (nube, Z.ai).
 #
@@ -134,6 +179,47 @@ max_turns = 20
 # M5: al exceder max_turns, resumir los turnos viejos en vez de descartarlos.
 # Cuesta una llamada corta al LLM por compactación; default false para no gastar.
 compaction = false
+
+# Memoria SEMÁNTICA de largo plazo (mem0 + Chroma + fastembed): Crotolamo recuerda
+# lo que le cuentas de ti y lo trae cuando viene al caso, sesión tras sesión.
+# Requiere la extra: pip install -e ".[memoria]" (versiones fijadas en pyproject).
+# Almacenamiento FUERA del repo (ruta). Con enabled = true, las tools de hechos
+# SQLite (remember_fact/...) se retiran de la vista del modelo y sus hechos se
+# copian con `python -m crotolamo memoria migrar`. Contenido: SOLO hechos sobre
+# ti (gustos, personas, costumbres, preferencias); nada de proyectos/pendientes
+# (eso irá a Notion) y NUNCA secretos (se rechazan antes de guardar).
+[memoria]
+enabled = false
+# Umbral de score de mem0.search. OJO: NO es coseno. mem0 calcula 1/(1+distancia
+# L2 de Chroma): un par con coseno 0.63 sale como 0.047. MEDIDO (scripts/
+# memoria_calibrar.py, 10 preguntas parafraseadas): el default 0.1 de mem0 pierde
+# 10/10 aciertos, 0.04 pierde 3/10, 0.02-0.03 conserva 10/10. El umbral es solo un
+# suelo de ruido; la calidad la da el ranking con top_k chico. Si cambias el
+# embedder, recalibra: python -m crotolamo memoria calibrar
+umbral = 0.03
+# Recuerdos que se inyectan por turno al contexto del LLM (pocos: son tokens y ruido).
+top_k = 3
+ruta = "~/.local/share/crotolamo/memoria"
+# Tope de espera de la recuperación por turno: si la memoria tarda más, la
+# respuesta sale sin recuerdos (WARNING). La voz nunca espera a la memoria.
+timeout_busqueda_s = 1.5
+# Extracción automática de hechos tras cada turno (en segundo plano, con el LLM
+# de abajo). false = solo se guarda lo que pidas con "acuérdate de que...".
+extraer = true
+# Embeddings locales (fastembed, ONNX, sin GPU). Multilingüe: entiende español.
+modelo_embeddings = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+dims_embeddings = 384
+# LLM que EXTRAE los hechos (no es el cerebro de Crotolamo). "auto" sigue al
+# cerebro en la nube: si [llm.glm].base_url es Groq usa Groq; si es otro endpoint
+# (Z.ai de fábrica) usa el proveedor OpenAI-compatible con ese base_url. En ambos
+# casos con la MISMA key (CROTOLAMO_GLM_API_KEY), que así siempre va al proveedor
+# que la emitió. "groq" explícito con otra nube lee GROQ_API_KEY; "ollama" = modelo
+# local de [llm] (sin key, más lento).
+llm_provider = "auto"
+# Vacío = el mismo modelo que [llm.glm].model.
+llm_model = ""
+# Id del usuario dentro de mem0 (por si algún día hay más de un patrón).
+usuario = "patron"
 
 # Apps que el patrón puede abrir por nombre (open_app). Edítalas para tu entorno
 # (Hyprland): clave = lista de argumentos del comando. El 'terminal' se AUTODETECTA
@@ -224,6 +310,18 @@ stream_speak = true
 # escucha). El tope no estorba al caso corto: el silencio corta antes.
 wake_silence_ms  = 400
 wake_max_seconds = 8.0
+# --- Wake con música sonando ---
+# Con Spotify/YouTube sonando, Whisper transcribe letras y de vez en cuando algo
+# suena a "crotolamo" (falsos despertares); y ya despierto, la música tapa la
+# orden. Un hilo sondea playerctl (MPRIS) en segundo plano y cachea si hay algún
+# reproductor en Playing: con música el wake exige un umbral más alto y, al
+# activarse, la música se atenúa hasta que Crotolamo termina de responder (se
+# restaura al volumen EXACTO que tenía). La voz propia (Piper) nunca cuenta como
+# música. Sin playerctl instalado, todo esto es un no-op.
+wake_threshold_media = 0.85   # umbral del wake difuso mientras algo suena (playerctl en Playing); sin música se usa [wake].threshold
+media_poll_s = 1.5            # cada cuánto se sondea en segundo plano si hay música (caché; el oído nunca espera)
+wake_duck = true              # atenuar la música al activarse y restaurarla al terminar
+wake_duck_volume = 0.2        # fracción del volumen actual mientras Crotolamo escucha y responde
 
 # Domótica vía Home Assistant (tools light_control / home_state).
 [home]
@@ -250,10 +348,20 @@ target    = "crotolamo"
 # Subido de 0.67 a 0.72: el wake difuso (Whisper) daba falsos positivos ("romano"
 # disparaba). Más estricto = menos fantasmas, a costa de exigir mejor pronunciación.
 threshold = 0.72
+# QUÉ WAKE (y qué loop) corre. true = openWakeWord + loop CONCURRENTE (Ear/Stt/
+# Brain/Mouth, barge-in); false = wake DIFUSO con Whisper + loop SIMPLE
+# (secuencial). Si openwakeword no está instalado se cae solo al difuso. OJO:
+# varias claves de [voice] solo aplican al modo simple: ack, stream_speak,
+# smart_endpoint/endpoint_*, followup_s, wake_silence_ms/wake_max_seconds.
+use_oww = true
 # M1: wake word dedicado con openWakeWord. 'crotolamo' no tiene modelo pre-entrenado,
 # así que se usa un modelo PUENTE soportado hasta entrenar uno propio.
 oww_model     = "hey_jarvis"
 oww_threshold = 0.5
+# Umbral de openWakeWord mientras suena música (mismo sondeo que
+# [voice].wake_threshold_media). Escala DISTINTA a la del wake difuso: aquí 0.5
+# es lo normal y 0.7 ya es estricto; por eso son dos knobs y no uno.
+oww_threshold_media = 0.7
 # Variantes CERCANAS a "crotolamo" (cómo lo transcribe mal Whisper). Se podaron
 # las muy lejanas ("corto la mano", "control amo", "cuatro lamo", "proto/troto
 # lamo") que provocaban falsos positivos. Se añadieron mishears reales del log
@@ -263,3 +371,50 @@ variants  = [
     "crotolamo", "croto lamo", "gotolamo", "grotolamo", "crotoamo",
     "coto lamo", "coto y amo", "cottoy amo", "croto el amo", "crotolo amo",
 ]
+
+# ---------------------------------------------------------------------------
+# MCP (Model Context Protocol), M4: servers EXTERNOS que le prestan tools a
+# Crotolamo. Cada server es un proceso que Crotolamo lanza y con el que habla por
+# stdio (JSON-RPC); sus tools aparecen al LLM como `mcp_<prefix>_<tool>` y pasan
+# por el MISMO guard (rutas) y la MISMA confirmación del patrón que las nativas.
+# Solo transporte stdio (nada de HTTP/SSE) y solo tools (sin resources/prompts).
+# Detalles en README_M4.md.
+# ---------------------------------------------------------------------------
+[mcp]
+# Apagado por defecto: activarlo lanza procesos externos al arrancar.
+enabled = false
+# Timeout por LLAMADA a una tool (segundos). Si expira, el LLM recibe un aviso en
+# personaje y cuenta un strike; al 2º timeout SEGUIDO el server se desconecta y
+# sus tools desaparecen (un server colgado no debe costar 20s por cada intento).
+timeout_s = 20
+# Presupuesto para arrancar cada server (lanzar + handshake + lista de tools).
+# Si no llega, se avisa en el log y se salta: un server caído NUNCA impide que
+# Crotolamo arranque. Súbelo si un server tarda (p.ej. npx descargando).
+startup_timeout_s = 15
+# Cuándo pedir confirmación antes de ejecutar una tool MCP:
+#   "destructive" = pregunta salvo que el server declare la tool como de solo
+#                   lectura (readOnlyHint) o no destructiva (destructiveHint=false).
+#                   OJO: esos hints los declara EL SERVER y son de buena fe; un
+#                   server mentiroso se salta la confirmación. Para servers en
+#                   los que no confíes, usa "always".
+#   "always"      = pregunta siempre.
+#   "never"       = nunca pregunta (solo para servers de solo lectura y de fiar).
+confirm = "destructive"
+
+# Cada server es una TABLA NOMBRADA [mcp.servers.<nombre>] (no un array): así
+# crotolamo.local.toml puede añadir o retocar un server sin pisar los demás.
+# Claves: command (argv completo; ~ y $VARS se expanden en cada elemento), env
+# (tabla opcional que se SUMA al entorno), cwd, timeout_s, startup_timeout_s,
+# confirm (mismos valores que arriba; pisa el global), keywords (lista para el
+# routing local; default: nombre del server + palabras de sus tools) y prefix
+# (default: el nombre del server).
+#
+# Ejemplo: el server de filesystem oficial, limitado a ~/Documentos.
+# [mcp.servers.archivos]
+# command  = ["npx", "-y", "@modelcontextprotocol/server-filesystem", "~/Documentos"]
+# keywords = ["archivo", "archivos", "documento", "carpeta", "busca en documentos"]
+# confirm  = "destructive"
+# timeout_s = 20
+# [mcp.servers.archivos.env]
+# # Las claves y tokens van en el entorno del patrón, NUNCA aquí:
+# # MI_TOKEN = "$MI_TOKEN"

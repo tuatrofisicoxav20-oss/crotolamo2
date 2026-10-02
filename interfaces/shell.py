@@ -8,11 +8,16 @@ Comandos del shell:
 
 from __future__ import annotations
 
+from typing import Any, Callable
+
 from crotolamo.core.agent import Agent
 from crotolamo.core.engine import build_llm
 from crotolamo.core.memory import Conversation
 from crotolamo.core.persona import system_prompt
+from crotolamo.logging_setup import get_logger
 from crotolamo.settings import get_settings
+
+log = get_logger("shell")
 
 
 def build_agent(confirm_fn=None) -> tuple[Agent, Conversation]:
@@ -48,7 +53,13 @@ def build_agent(confirm_fn=None) -> tuple[Agent, Conversation]:
     # La Fase 2 cablea el registry de tools; si está disponible, lo usamos.
     try:
         from crotolamo.core.agent import ToolAgent  # type: ignore
-        from crotolamo.core.hooks import datetime_prehook, make_facts_prehook
+        from crotolamo.core.hooks import (
+            datetime_prehook,
+            make_facts_prehook,
+            make_memoria_posthook,
+            make_memoria_prehook,
+        )
+        from crotolamo.core.memoria import get_memoria, mem0_instalado
         from crotolamo.core.router import route_schemas
         from crotolamo.tools import default_registry
         from crotolamo.safety.guard import Guard
@@ -70,18 +81,35 @@ def build_agent(confirm_fn=None) -> tuple[Agent, Conversation]:
         use_routing = settings.llm.get("tool_routing", True)
         max_tools = settings.llm.get("max_tools", 8)
 
+        route_fn: Callable[[str], list[dict[str, Any]]] | None
         if glm_brain:
             # GLM ve TODO el arsenal; si el breaker degradó a Ollama local
             # (sin internet), se vuelve al routing chico para no pagar ~130s.
-            def route_fn(text: str):
+            def _route_glm(text: str) -> list[dict[str, Any]]:
                 if llm.degraded and use_routing:
                     return route_schemas(registry, text, max_tools)
                 return registry.schemas()
+
+            route_fn = _route_glm
         else:
             route_fn = (
                 (lambda t: route_schemas(registry, t, max_tools))
                 if use_routing else None
             )
+
+        # Memoria semántica (mem0): con [memoria].enabled, los recuerdos
+        # relevantes entran en CADA turno (pre-hook, con presupuesto de tiempo)
+        # y la extracción de hechos va en segundo plano tras responder
+        # (after-turn hook). Sustituye a la inyección única de hechos SQLite:
+        # tras `crotolamo memoria migrar` ya viven aquí. Sin ella, todo como antes.
+        memoria = get_memoria()
+        if memoria.enabled and mem0_instalado():
+            memoria.precalentar()
+            pre_hooks = [make_memoria_prehook(memoria), datetime_prehook]
+            after_turn_hooks = [make_memoria_posthook(memoria)]
+        else:
+            pre_hooks = [make_facts_prehook(), datetime_prehook]
+            after_turn_hooks = []
 
         agent: Agent = ToolAgent(
             llm,
@@ -90,13 +118,20 @@ def build_agent(confirm_fn=None) -> tuple[Agent, Conversation]:
             guard=Guard.from_settings(settings),
             max_iterations=settings.llm.get("max_iterations", 6),
             confirm_fn=confirm_fn or _text_confirm,
-            pre_hooks=[make_facts_prehook(), datetime_prehook],
+            pre_hooks=pre_hooks,
+            after_turn_hooks=after_turn_hooks,
             route_fn=route_fn,
             # Con GLM no hay comandos prehechos: todo lo razona y redacta él.
             fastpath=False if glm_brain else settings.llm.get("fastpath", True),
             direct_tools=set() if glm_brain else None,
         )
     except Exception:
+        # Degradar a un agente SIN tools mantiene a Crotolamo hablando, pero no
+        # puede ser silencioso: un ImportError en un módulo de tools dejaba al
+        # asistente sordo a "abre X" sin ninguna pista en el log.
+        log.exception(
+            "no pude armar las tools; Crotolamo arranca SIN herramientas (solo charla)"
+        )
         agent = Agent(llm, conversation)
 
     return agent, conversation

@@ -126,6 +126,46 @@ def test_app_status_not_running(clients, monkeypatch):
     assert "no está corriendo" in out
 
 
+# --- _pgrep -------------------------------------------------------------------
+
+
+def _grabar_run_cmd(monkeypatch, returncode=0):
+    """Sustituye windows.run_cmd por un fake que guarda los argv."""
+    seen: list[list[str]] = []
+
+    def fake(args, timeout=10):
+        seen.append(list(args))
+        return subprocess.CompletedProcess(args=args, returncode=returncode)
+
+    monkeypatch.setattr(windows, "run_cmd", fake)
+    return seen
+
+
+def test_pgrep_nombre_vacio_no_invoca_pgrep(monkeypatch):
+    """`pgrep -fi ""` matchea CUALQUIER proceso (patrón vacío = todo): con un
+    nombre vacío se afirmaba que había 'un proceso suyo corriendo'."""
+    seen = _grabar_run_cmd(monkeypatch)
+    assert windows._pgrep("") is False
+    assert windows._pgrep("   ") is False
+    assert seen == []
+
+
+def test_pgrep_pasa_el_nombre_tras_doble_guion(monkeypatch):
+    """Un nombre que empiece por guion no debe leerse como opción de pgrep."""
+    seen = _grabar_run_cmd(monkeypatch)
+    assert windows._pgrep("-spotify") is True
+    assert seen == [["pgrep", "-fi", "--", "-spotify"]]
+
+
+def test_app_status_nombre_vacio_responde_que_no(clients, monkeypatch):
+    monkeypatch.setattr(windows.shutil, "which", lambda _cmd: "/usr/bin/pgrep")
+    seen = _grabar_run_cmd(monkeypatch)  # exit 0 = "hay proceso", si llegara a llamarse
+    out = windows.app_status("")
+    assert seen == []
+    assert "no está corriendo" in out
+    assert "proceso suyo" not in out
+
+
 # --- matching ---------------------------------------------------------------
 
 

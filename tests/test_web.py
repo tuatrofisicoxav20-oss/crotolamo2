@@ -145,6 +145,38 @@ def test_fetch_network_error(monkeypatch):
     assert "Traceback" not in out
 
 
+DDG_HTML_CON_VOID_TAGS = """
+<div class="result">
+  <h2><a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fa.com">Uno</a></h2>
+  <a class="result__snippet" href="#">línea uno<br>línea dos</a>
+</div>
+<div class="result">
+  <h2><a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fb.com">Dos<img src="x.png"></a></h2>
+  <a class="result__snippet" href="#">con <b>imagen</b><br/> y <wbr>wbr</a>
+</div>
+<div class="result">
+  <h2><a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fc.com">Tres</a></h2>
+  <a class="result__snippet" href="#">Tres limpio.</a>
+</div>
+"""
+
+
+def test_parser_ddg_no_pierde_resultados_tras_un_br(monkeypatch):
+    """<br>, <img>, <wbr>... no tienen cierre. Contarlos como anidamiento dejaba
+    al parser "dentro" del primer snippet para siempre y se perdían TODOS los
+    resultados siguientes. <br/> (startendtag) tampoco debe abrir ni cerrar."""
+    parser = _web._DDGResultsParser()
+    parser.feed(DDG_HTML_CON_VOID_TAGS)
+    assert [r["title"] for r in parser.results] == ["Uno", "Dos", "Tres"]
+    assert [r["snippet"] for r in parser.results] == [
+        "línea uno línea dos", "con imagen y wbr", "Tres limpio.",
+    ]
+
+    _patch_get(monkeypatch, "text/html", DDG_HTML_CON_VOID_TAGS)
+    out = search.fetch_web_results("void tags")
+    assert "3. Tres" in out
+
+
 def test_fetch_limits_to_five_results(monkeypatch):
     block = (
         '<a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fe.com%2F{i}">'

@@ -13,10 +13,15 @@ para que las acciones básicas nunca se rompan. Cero dependencias (stdlib).
 Bonus: con menos tools a la vista, el modelo 3B elige mejor (menos distractores),
 lo que mitiga errores de selección (p.ej. pedir "siguiente canción" y que llame
 a 'music_now' en vez de 'music_control').
+
+M4: además de los grupos estáticos de abajo, los servers MCP se registran como
+grupos DINÁMICOS (`register_group` / `unregister_group`) y, cuando varios de
+ellos matchean, rotan en round-robin para que el tope no mate siempre al mismo.
 """
 
 from __future__ import annotations
 
+import threading
 import unicodedata
 from typing import Any, Iterable
 
@@ -87,6 +92,17 @@ GROUPS: dict[str, dict[str, Any]] = {
             "contenido de", "ensename los", "ver los archivos",
         ],
     },
+    # Memoria semántica (mem0). Mismos disparadores que "facts": solo una de las
+    # dos familias está registrada a la vez (route_schemas ignora las ausentes).
+    "memoria": {
+        "tools": ["recordar_de_mi", "buscar_recuerdos", "olvidar_recuerdo"],
+        "keywords": [
+            "recuerda", "acuerdate", "acuerda", "recordar", "recuerdas", "te acuerdas",
+            "olvida", "olvidate", "olvidalo", "que sabes de mi", "que sabes sobre mi",
+            "anota que", "memoriza", "ten en cuenta", "hecho sobre", "mi memoria",
+            "que te conte", "te dije que", "te he dicho", "sabes como", "sabes que",
+        ],
+    },
     "facts": {
         "tools": ["remember_fact", "recall_facts", "search_facts", "forget_fact"],
         "keywords": [
@@ -151,6 +167,73 @@ GROUPS: dict[str, dict[str, Any]] = {
 MAX_TOOLS_DEFAULT = 8
 
 
+# ---------------------------------------------------------------------------
+# Grupos DINÁMICOS (M4): los servers MCP se registran al arrancar (y se retiran
+# en caliente si se caen), así que no pueden vivir en el dict estático GROUPS.
+# Van con el mismo formato {tools, keywords}. Hoy todo grupo dinámico es un
+# server MCP; eso es lo que decide el round-robin de abajo.
+# ---------------------------------------------------------------------------
+_DYNAMIC_GROUPS: dict[str, dict[str, Any]] = {}
+_DYNAMIC_LOCK = threading.Lock()
+
+# Contador del round-robin entre grupos MCP matcheados. Solo avanza cuando en
+# la consulta matcheó al menos un grupo MCP: sin ellos, el routing es EXACTAMENTE
+# el de siempre (determinista, mismo orden de especificidad).
+_RR_COUNTER = 0
+
+
+def register_group(name: str, tools: list[str], keywords: list[str]) -> None:
+    """Registra (o reemplaza) un grupo dinámico de routing.
+
+    Las keywords se normalizan aquí (minúsculas, sin acentos) para que el bridge
+    MCP o la config del patrón puedan escribirlas "con acentos y todo". El nombre
+    no puede chocar con un grupo estático: el bridge usa el espacio "mcp:<server>".
+    """
+    if name in GROUPS:
+        raise ValueError(f"'{name}' ya es un grupo estático del router")
+    norm_keywords: list[str] = []
+    for kw in keywords:
+        k = _norm(str(kw)).strip()
+        if k and k not in norm_keywords:
+            norm_keywords.append(k)
+    with _DYNAMIC_LOCK:
+        _DYNAMIC_GROUPS[name] = {"tools": list(tools), "keywords": norm_keywords}
+
+
+def unregister_group(name: str) -> bool:
+    """Quita un grupo dinámico. True si existía."""
+    with _DYNAMIC_LOCK:
+        return _DYNAMIC_GROUPS.pop(name, None) is not None
+
+
+def dynamic_groups() -> dict[str, dict[str, Any]]:
+    """Copia de los grupos dinámicos registrados (inspección/tests)."""
+    with _DYNAMIC_LOCK:
+        return {name: dict(group) for name, group in _DYNAMIC_GROUPS.items()}
+
+
+def _rotate_mcp_groups(ordered: list[tuple[int, int, int, dict[str, Any], bool]]) -> None:
+    """Rota IN PLACE, en round-robin, los grupos MCP dentro de la lista ordenada.
+
+    POR QUÉ: con el tope de max_tools, dos servers MCP que matchean la misma
+    consulta competirían siempre en el mismo orden y el segundo jamás vería
+    la luz. Rotar solo el orden RELATIVO de los grupos MCP (ocupan las mismas
+    posiciones que les dio el score) reparte las oportunidades entre llamadas
+    sin tocar el lugar de los grupos estáticos.
+    """
+    global _RR_COUNTER
+    positions = [i for i, entry in enumerate(ordered) if entry[4]]
+    if not positions:
+        return
+    with _DYNAMIC_LOCK:
+        shift = _RR_COUNTER % len(positions)
+        _RR_COUNTER += 1
+    mcp_entries = [ordered[i] for i in positions]
+    rotated = mcp_entries[shift:] + mcp_entries[:shift]
+    for pos, entry in zip(positions, rotated):
+        ordered[pos] = entry
+
+
 def select_tool_names(text: str, max_tools: int = MAX_TOOLS_DEFAULT) -> list[str]:
     """Nombres de tools relevantes a la consulta (con tope).
 
@@ -169,15 +252,23 @@ def select_tool_names(text: str, max_tools: int = MAX_TOOLS_DEFAULT) -> list[str
     # genérico ("pagina" -> desktop, "lee" -> files) desplace al grupo que
     # matcheó la frase completa ("leeme la pagina" -> search). Score = suma de
     # longitudes de los matches (evidencia total), desempate por número de
-    # matches y luego por orden de declaración, como antes.
-    scored: list[tuple[int, int, int, dict[str, Any]]] = []
-    for idx, group in enumerate(GROUPS.values()):
+    # matches y luego por orden de declaración, como antes. Los grupos
+    # dinámicos (MCP) van DESPUÉS de los estáticos en el orden de declaración.
+    scored: list[tuple[int, int, int, dict[str, Any], bool]] = []
+    with _DYNAMIC_LOCK:
+        dynamic = list(_DYNAMIC_GROUPS.values())
+    static_groups = [(g, False) for g in GROUPS.values()]
+    all_groups = static_groups + [(g, True) for g in dynamic]
+    for idx, (group, is_mcp) in enumerate(all_groups):
         matched = [kw for kw in group["keywords"] if kw in norm]
         if matched:
             score = sum(len(kw) for kw in matched)
-            scored.append((score, len(matched), idx, group))
+            scored.append((score, len(matched), idx, group, is_mcp))
 
-    for _, _, _, group in sorted(scored, key=lambda t: (-t[0], -t[1], t[2])):
+    ordered = sorted(scored, key=lambda t: (-t[0], -t[1], t[2]))
+    _rotate_mcp_groups(ordered)
+
+    for _, _, _, group, _ in ordered:
         for name in group["tools"]:
             if name not in seen:
                 seen.add(name)
