@@ -40,6 +40,14 @@ def _register_memoria_if_enabled(registry: Registry) -> None:
 
         if get_settings().memoria.get("enabled") is not True:
             return
+        from crotolamo.core.memoria import mem0_instalado
+
+        if not mem0_instalado():
+            # Sin la extra instalada, retirar las tools SQLite dejaría al
+            # asistente sin NINGUNA forma de recordar: se quedan las de siempre.
+            log.warning("[memoria].enabled = true pero mem0 no está instalado "
+                        "(pip install -e '.[memoria]'); sigo con los hechos SQLite")
+            return
         from crotolamo.tools.memoria import TOOLS_SQLITE_SUSTITUIDAS, memoria_tools
 
         for t in memoria_tools():

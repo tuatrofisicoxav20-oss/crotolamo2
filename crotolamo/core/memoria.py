@@ -61,8 +61,11 @@ DEFAULT_UMBRAL = 0.03
 DEFAULT_TOP_K = 3
 DEFAULT_EMBEDDER = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 DEFAULT_EMBEDDER_DIMS = 384
-DEFAULT_LLM_PROVIDER = "groq"
-DEFAULT_LLM_MODEL = "openai/gpt-oss-120b"
+DEFAULT_LLM_PROVIDER = "auto"
+# Vacío = el mismo modelo que [llm.glm].model (el cerebro en la nube).
+DEFAULT_LLM_MODEL = ""
+_GROQ_HOST = "api.groq.com"
+_GROQ_MODEL_FALLBACK = "openai/gpt-oss-120b"
 DEFAULT_TIMEOUT_BUSQUEDA_S = 1.5
 DEFAULT_USUARIO = "patron"
 
@@ -201,36 +204,69 @@ class Backend(Protocol):
 # Backend real: mem0 + Chroma + fastembed
 # ---------------------------------------------------------------------------
 
+def _glm_section(settings: Any) -> dict[str, Any]:
+    llm_raw = getattr(settings, "llm", None) if settings is not None else None
+    llm_raw = llm_raw if isinstance(llm_raw, dict) else {}
+    glm_raw = llm_raw.get("glm")
+    return glm_raw if isinstance(glm_raw, dict) else {}
+
+
+def resolver_provider(cfg: MemoriaConfig, settings: Any) -> str:
+    """Proveedor efectivo del LLM de extracción.
+
+    "auto" (default) sigue al cerebro en la nube: si [llm.glm].base_url es Groq,
+    usa el SDK de Groq; si es cualquier otro endpoint (Z.ai de fábrica), el
+    proveedor OpenAI-compatible con ESE base_url. Así la key de
+    CROTOLAMO_GLM_API_KEY siempre va al proveedor que la emitió: mandar la key de
+    Z.ai a Groq hacía fallar TODAS las extracciones en silencio.
+    """
+    if cfg.llm_provider != "auto":
+        return cfg.llm_provider
+    base_url = str(_glm_section(settings).get("base_url") or "")
+    return "groq" if _GROQ_HOST in base_url else "openai"
+
+
 def _llm_config(cfg: MemoriaConfig, settings: Any) -> dict[str, Any]:
     """Config del LLM que mem0 usa para EXTRAER hechos (no es el cerebro de Crotolamo).
 
-    La key es la misma de la nube (CROTOLAMO_GLM_API_KEY, ver core/glm.py): el
-    patrón la tiene en ~/.config/crotolamo/env. "groq" habla con el SDK de Groq;
-    "openai" con cualquier endpoint OpenAI-compatible ([llm.glm].base_url, p.ej.
-    Z.ai); "ollama" con el modelo local de [llm] (sin key, más lento).
+    La key de la nube (CROTOLAMO_GLM_API_KEY, ver core/glm.py) solo se reutiliza
+    con el proveedor que corresponde a [llm.glm].base_url. "groq" explícito con
+    otro base_url usa GROQ_API_KEY (no la de la nube); "ollama" usa el modelo
+    local de [llm] (sin key, más lento).
     """
-    from crotolamo.core.glm import _find_api_key
+    from crotolamo.core.glm import DEFAULT_BASE_URL, DEFAULT_MODEL, _find_api_key
 
-    key = _find_api_key()
     llm_raw = getattr(settings, "llm", None) if settings is not None else None
     llm_raw = llm_raw if isinstance(llm_raw, dict) else {}
-    if cfg.llm_provider == "ollama":
+    glm = _glm_section(settings)
+    base_url = str(glm.get("base_url") or DEFAULT_BASE_URL)
+    cloud_model = str(glm.get("model") or DEFAULT_MODEL)
+    provider = resolver_provider(cfg, settings)
+
+    if provider == "ollama":
         return {"provider": "ollama", "config": {
             "model": cfg.llm_model or llm_raw.get("model", "qwen2.5-coder:7b"),
             "ollama_base_url": llm_raw.get("host", "http://localhost:11434"),
             "temperature": 0.0,
         }}
-    if cfg.llm_provider == "openai":
-        glm_raw = llm_raw.get("glm")
-        glm: dict[str, Any] = glm_raw if isinstance(glm_raw, dict) else {}
-        config: dict[str, Any] = {"model": cfg.llm_model, "temperature": 0.0,
-                                  "openai_base_url": glm.get("base_url")}
+    if provider == "openai":
+        config: dict[str, Any] = {"model": cfg.llm_model or cloud_model, "temperature": 0.0,
+                                  "openai_base_url": base_url}
+        key = _find_api_key()
         if key:
             config["api_key"] = key
         return {"provider": "openai", "config": config}
-    config = {"model": cfg.llm_model, "temperature": 0.0}
+
+    # Groq. La key de la nube solo si la nube ES Groq; si no, GROQ_API_KEY.
+    groq_es_la_nube = _GROQ_HOST in base_url
+    modelo = cfg.llm_model or (cloud_model if groq_es_la_nube else _GROQ_MODEL_FALLBACK)
+    config = {"model": modelo, "temperature": 0.0}
+    key = _find_api_key() if groq_es_la_nube else os.environ.get("GROQ_API_KEY", "").strip()
     if key:
-        config["api_key"] = key  # si falta, mem0 lee GROQ_API_KEY del entorno
+        config["api_key"] = key
+    elif not groq_es_la_nube:
+        log.warning("memoria: llm_provider='groq' pero [llm.glm].base_url no es Groq y no hay "
+                    "GROQ_API_KEY; la extracción va a fallar (usa llm_provider='auto')")
     return {"provider": "groq", "config": config}
 
 
@@ -506,6 +542,16 @@ class Memoria:
             self._cola.put(None)
             self._worker.join(timeout=timeout_s)
         self._pool.shutdown(wait=False)
+
+
+def mem0_instalado() -> bool:
+    """True si mem0 se puede importar (sin importarlo: cuesta segundos)."""
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec("mem0") is not None
+    except (ImportError, ValueError):
+        return False
 
 
 # ---------------------------------------------------------------------------

@@ -14,8 +14,38 @@ from crotolamo.core.memoria import (
     MemoriaNoDisponible,
     SecretoRechazado,
     get_memoria,
+    parece_secreto,
 )
+from crotolamo.persistence import facts as facts_sqlite
 from crotolamo.tools.base import Tool, _build_parameters, _split_doc
+
+
+# Si la memoria semántica cae en caliente (mem0 roto, Chroma ilegible), estas
+# tools usan los hechos SQLite de siempre: retirar las tools SQLite no puede
+# dejar al asistente sin ninguna forma de recordar.
+_AVISO_RESPALDO = " (memoria semántica caída: uso la libreta de hechos)"
+
+
+def _recordar_sqlite(hecho: str) -> str:
+    if parece_secreto(hecho):
+        return "Eso tiene pinta de contraseña o clave, patrón; eso no lo guardo ni a la mala."
+    facts_sqlite.remember(hecho)
+    return f"Ya quedó, patrón. Me acordaré: «{hecho}».{_AVISO_RESPALDO}"
+
+
+def _buscar_sqlite(pregunta: str) -> str:
+    rows = facts_sqlite.search(pregunta)
+    if not rows:
+        return f"No recuerdo nada sobre «{pregunta}», patrón.{_AVISO_RESPALDO}"
+    return ("Esto recuerdo, patrón:\n" + "\n".join(f"- {r['texto']}" for r in rows)
+            + _AVISO_RESPALDO)
+
+
+def _olvidar_sqlite(descripcion: str) -> str:
+    rows = facts_sqlite.search(descripcion, top=1)
+    if not rows or not facts_sqlite.forget(int(rows[0]["id"])):
+        return f"No encontré ningún recuerdo sobre «{descripcion}», patrón.{_AVISO_RESPALDO}"
+    return f"Olvidado, patrón: «{rows[0]['texto']}».{_AVISO_RESPALDO}"
 
 
 def recordar_de_mi(hecho: str) -> str:
@@ -28,12 +58,15 @@ def recordar_de_mi(hecho: str) -> str:
     hecho = hecho.strip()
     if not hecho:
         return "¿Qué quieres que recuerde, patrón? No me diste nada."
+    memoria = get_memoria()
+    if not memoria.enabled:
+        return _recordar_sqlite(hecho)
     try:
-        ids = get_memoria().recordar(hecho)
+        ids = memoria.recordar(hecho)
     except SecretoRechazado:
         return "Eso tiene pinta de contraseña o clave, patrón; eso no lo guardo ni a la mala."
-    except MemoriaNoDisponible as error:
-        return f"Ahorita no tengo memoria de largo plazo, patrón ({error})."
+    except MemoriaNoDisponible:
+        return _recordar_sqlite(hecho)
     if not ids:
         return "No pude guardarlo, patrón."
     return f"Ya quedó, patrón. Me acordaré: «{hecho}»."
@@ -50,10 +83,12 @@ def buscar_recuerdos(pregunta: str) -> str:
     if not pregunta:
         return "¿Qué quieres que busque, patrón?"
     memoria = get_memoria()
+    if not memoria.enabled:
+        return _buscar_sqlite(pregunta)
     recuerdos = memoria.buscar(pregunta, top_k=5, timeout_s=10.0)
     if not recuerdos:
-        if not memoria.enabled:
-            return "Ahorita no tengo memoria de largo plazo, patrón."
+        if not memoria.enabled:  # se cayó durante esta búsqueda
+            return _buscar_sqlite(pregunta)
         return f"No recuerdo nada sobre «{pregunta}», patrón."
     return "Esto recuerdo, patrón:\n" + "\n".join(f"- {r.texto}" for r in recuerdos)
 
@@ -68,11 +103,16 @@ def olvidar_recuerdo(descripcion: str) -> str:
     descripcion = descripcion.strip()
     if not descripcion:
         return "¿Qué quieres que olvide, patrón?"
+    memoria = get_memoria()
+    if not memoria.enabled:
+        return _olvidar_sqlite(descripcion)
     try:
-        borrado = get_memoria().olvidar(descripcion)
-    except MemoriaNoDisponible as error:
-        return f"Ahorita no tengo memoria de largo plazo, patrón ({error})."
+        borrado = memoria.olvidar(descripcion)
+    except MemoriaNoDisponible:
+        return _olvidar_sqlite(descripcion)
     if borrado is None:
+        if not memoria.enabled:  # se cayó durante la búsqueda
+            return _olvidar_sqlite(descripcion)
         return f"No encontré ningún recuerdo sobre «{descripcion}», patrón."
     return f"Olvidado, patrón: «{borrado.texto}»."
 

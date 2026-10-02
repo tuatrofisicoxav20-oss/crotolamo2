@@ -698,13 +698,14 @@ def _check_silero(ctx: _Ctx) -> list[Check]:
 
 def _check_memoria(ctx: _Ctx) -> list[Check]:
     """Memoria semántica (mem0): deps importables, ruta escribible, telemetría off."""
-    from crotolamo.core.memoria import MemoriaConfig
+    from crotolamo.core.memoria import MemoriaConfig, resolver_provider
 
     cfg = MemoriaConfig.from_settings(ctx.settings)
+    provider = resolver_provider(cfg, ctx.settings)
     if not cfg.enabled:
         return [Check("memoria", True, "desactivada ([memoria].enabled = false)")]
     faltan = [m for m in ("mem0", "chromadb", "fastembed") if _import_error(m)]
-    if cfg.llm_provider == "groq" and _import_error("groq"):
+    if provider == "groq" and _import_error("groq"):
         faltan.append("groq")
     if faltan:
         return [Check("memoria", False, f"faltan módulos: {', '.join(faltan)}",
@@ -723,7 +724,7 @@ def _check_memoria(ctx: _Ctx) -> list[Check]:
                       "No exportes MEM0_TELEMETRY en el entorno; core/memoria.py la apaga.")]
     return [Check("memoria", True,
                   f"mem0/chromadb/fastembed OK, ruta {cfg.ruta} escribible, telemetría apagada "
-                  f"(umbral {cfg.umbral:g}, top_k {cfg.top_k}, LLM {cfg.llm_provider})")]
+                  f"(umbral {cfg.umbral:g}, top_k {cfg.top_k}, LLM {provider})")]
 
 
 def _check_ydotool(ctx: _Ctx) -> list[Check]:

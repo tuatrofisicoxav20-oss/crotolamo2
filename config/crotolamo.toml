@@ -209,12 +209,15 @@ extraer = true
 # Embeddings locales (fastembed, ONNX, sin GPU). Multilingüe: entiende español.
 modelo_embeddings = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 dims_embeddings = 384
-# LLM que EXTRAE los hechos (no es el cerebro de Crotolamo). "groq" usa el SDK de
-# Groq con la MISMA key de la nube (CROTOLAMO_GLM_API_KEY); "openai" = cualquier
-# endpoint OpenAI-compatible ([llm.glm].base_url, p.ej. Z.ai); "ollama" = modelo
+# LLM que EXTRAE los hechos (no es el cerebro de Crotolamo). "auto" sigue al
+# cerebro en la nube: si [llm.glm].base_url es Groq usa Groq; si es otro endpoint
+# (Z.ai de fábrica) usa el proveedor OpenAI-compatible con ese base_url. En ambos
+# casos con la MISMA key (CROTOLAMO_GLM_API_KEY), que así siempre va al proveedor
+# que la emitió. "groq" explícito con otra nube lee GROQ_API_KEY; "ollama" = modelo
 # local de [llm] (sin key, más lento).
-llm_provider = "groq"
-llm_model = "openai/gpt-oss-120b"
+llm_provider = "auto"
+# Vacío = el mismo modelo que [llm.glm].model.
+llm_model = ""
 # Id del usuario dentro de mem0 (por si algún día hay más de un patrón).
 usuario = "patron"
 

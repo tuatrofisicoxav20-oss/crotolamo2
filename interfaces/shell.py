@@ -59,7 +59,7 @@ def build_agent(confirm_fn=None) -> tuple[Agent, Conversation]:
             make_memoria_posthook,
             make_memoria_prehook,
         )
-        from crotolamo.core.memoria import get_memoria
+        from crotolamo.core.memoria import get_memoria, mem0_instalado
         from crotolamo.core.router import route_schemas
         from crotolamo.tools import default_registry
         from crotolamo.safety.guard import Guard
@@ -103,7 +103,7 @@ def build_agent(confirm_fn=None) -> tuple[Agent, Conversation]:
         # (after-turn hook). Sustituye a la inyección única de hechos SQLite:
         # tras `crotolamo memoria migrar` ya viven aquí. Sin ella, todo como antes.
         memoria = get_memoria()
-        if memoria.enabled:
+        if memoria.enabled and mem0_instalado():
             memoria.precalentar()
             pre_hooks = [make_memoria_prehook(memoria), datetime_prehook]
             after_turn_hooks = [make_memoria_posthook(memoria)]

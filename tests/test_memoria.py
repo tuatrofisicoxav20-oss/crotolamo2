@@ -355,7 +355,8 @@ def test_config_mem0_lleva_instrucciones_y_telemetria_apagada(tmp_path):
     assert conf["custom_instructions"] == INSTRUCCIONES_EXTRACCION
     assert conf["vector_store"]["config"]["path"] == str(tmp_path / "chroma")
     assert conf["history_db_path"] == str(tmp_path / "history.db")
-    assert conf["llm"]["provider"] == "groq"
+    # Sin [llm.glm] (settings=None) la nube es Z.ai por defecto: OpenAI-compatible.
+    assert conf["llm"]["provider"] == "openai"
     assert conf["embedder"]["config"]["model"].endswith("MiniLM-L12-v2")
     assert os.environ["MEM0_TELEMETRY"] == "False"
 
@@ -384,6 +385,7 @@ def test_registro_de_tools_solo_con_enabled(monkeypatch):
     real = settings_mod.get_settings()
     monkeypatch.setattr(real, "raw", {**real.raw, "memoria": {"enabled": True}})
     monkeypatch.setattr(settings_mod, "_SETTINGS", real)
+    monkeypatch.setattr(memoria_mod, "mem0_instalado", lambda: True)
     reg = base.copy()
     _register_memoria_if_enabled(reg)
     assert reg.get("recordar_de_mi") is not None and reg.get("olvidar_recuerdo") is not None
@@ -435,3 +437,95 @@ def test_cli_apagada_avisa(monkeypatch, capsys):
     monkeypatch.setattr(settings_mod, "_SETTINGS", real)
     assert memoria_mod.run_cli(["listar"]) == 1
     assert "apagada" in capsys.readouterr().out
+
+
+# --- revisión del PR: proveedor del LLM de extracción y respaldo SQLite --------
+
+def _settings_nube(base_url: str, model: str = "glm-4.7-flash", **memoria) -> Settings:
+    return Settings(raw={"llm": {"glm": {"base_url": base_url, "model": model}},
+                         "memoria": {"enabled": True, **memoria}},
+                    user="t", home=Path("/tmp"))
+
+
+def test_auto_con_nube_zai_usa_openai_compatible_con_su_base_url(monkeypatch, tmp_path):
+    """La key de Z.ai NO puede acabar en Groq: con la nube de fábrica, la
+    extracción va al endpoint OpenAI-compatible de Z.ai con su modelo."""
+    from crotolamo.core.memoria import Mem0Backend
+
+    monkeypatch.setenv("CROTOLAMO_GLM_API_KEY", "clave-de-zai")
+    s = _settings_nube("https://api.z.ai/api/paas/v4")
+    cfg = MemoriaConfig.from_settings(s)
+    cfg.ruta = tmp_path
+    llm = Mem0Backend(cfg, s).config_mem0()["llm"]
+    assert llm["provider"] == "openai"
+    assert llm["config"]["openai_base_url"] == "https://api.z.ai/api/paas/v4"
+    assert llm["config"]["model"] == "glm-4.7-flash"
+    assert llm["config"]["api_key"] == "clave-de-zai"
+
+
+def test_auto_con_nube_groq_usa_groq_con_la_misma_key(monkeypatch, tmp_path):
+    from crotolamo.core.memoria import Mem0Backend
+
+    monkeypatch.setenv("CROTOLAMO_GLM_API_KEY", "clave-de-groq")
+    s = _settings_nube("https://api.groq.com/openai/v1", model="openai/gpt-oss-120b")
+    cfg = MemoriaConfig.from_settings(s)
+    cfg.ruta = tmp_path
+    llm = Mem0Backend(cfg, s).config_mem0()["llm"]
+    assert llm["provider"] == "groq"
+    assert llm["config"]["model"] == "openai/gpt-oss-120b"
+    assert llm["config"]["api_key"] == "clave-de-groq"
+
+
+def test_groq_explicito_con_otra_nube_no_reusa_la_key_de_la_nube(monkeypatch, tmp_path, caplog):
+    from crotolamo.core.memoria import Mem0Backend
+
+    monkeypatch.setenv("CROTOLAMO_GLM_API_KEY", "clave-de-zai")
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    s = _settings_nube("https://api.z.ai/api/paas/v4", llm_provider="groq")
+    cfg = MemoriaConfig.from_settings(s)
+    cfg.ruta = tmp_path
+    with caplog.at_level(logging.WARNING, logger="crotolamo.core.memoria"):
+        llm = Mem0Backend(cfg, s).config_mem0()["llm"]
+    assert llm["provider"] == "groq"
+    assert "api_key" not in llm["config"]
+    assert "GROQ_API_KEY" in caplog.text
+    monkeypatch.setenv("GROQ_API_KEY", "clave-propia-de-groq")
+    llm = Mem0Backend(cfg, s).config_mem0()["llm"]
+    assert llm["config"]["api_key"] == "clave-propia-de-groq"
+
+
+def test_sin_mem0_instalado_se_quedan_las_tools_sqlite(monkeypatch, caplog):
+    from crotolamo import settings as settings_mod
+    from crotolamo.tools import _register_memoria_if_enabled, default_registry
+
+    real = settings_mod.get_settings()
+    monkeypatch.setattr(real, "raw", {**real.raw, "memoria": {"enabled": True}})
+    monkeypatch.setattr(settings_mod, "_SETTINGS", real)
+    monkeypatch.setattr(memoria_mod, "mem0_instalado", lambda: False)
+    reg = default_registry().copy()
+    with caplog.at_level(logging.WARNING, logger="crotolamo.tools"):
+        _register_memoria_if_enabled(reg)
+    assert reg.get("remember_fact") is not None
+    assert reg.get("recordar_de_mi") is None
+    assert "no está instalado" in caplog.text
+
+
+def test_tools_recurren_a_sqlite_si_la_memoria_cae(monkeypatch, tmp_path):
+    from crotolamo.persistence import facts
+    from crotolamo.tools import memoria as tools_mod
+
+    monkeypatch.setattr(facts.db, "_default_db_path", lambda: tmp_path / "f.sqlite")
+
+    m, backend = _memoria()
+    backend.fallar = MemoriaNoDisponible("chroma ilegible")
+    backend.guardar = lambda texto: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        MemoriaNoDisponible("chroma ilegible"))
+    memoria_mod.set_memoria(m)
+
+    out = tools_mod.recordar_de_mi("mi perro se llama Tletl")
+    assert out.startswith("Ya quedó") and "libreta" in out
+    assert "Tletl" in tools_mod.buscar_recuerdos("mi perro")
+    assert tools_mod.recordar_de_mi("mi password: Tr0ub4dor&3xx").startswith("Eso tiene pinta")
+    out = tools_mod.olvidar_recuerdo("mi perro")
+    assert out.startswith("Olvidado") and "Tletl" in out
+    assert facts.recall() == []
