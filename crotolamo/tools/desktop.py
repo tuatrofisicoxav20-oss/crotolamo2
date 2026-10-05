@@ -14,7 +14,7 @@ import subprocess
 from pathlib import Path
 
 from crotolamo.logging_setup import get_logger
-from crotolamo.tools.base import normalize_key, tool
+from crotolamo.tools.base import normalize_key, run_cmd, tool
 
 log = get_logger("desktop")
 
@@ -47,9 +47,12 @@ COMMON_SITES: dict[str, str] = {
     "arxiv": "https://arxiv.org",
 }
 
+# Id de flatpak del navegador preferido del patrón (también abre las URLs).
+_OPERA_GX_FLATPAK = "com.opera.opera-gx"
+
 APP_COMMANDS: dict[str, list[list[str]]] = {
-    "opera": [["flatpak", "run", "com.opera.opera-gx"]],
-    "opera gx": [["flatpak", "run", "com.opera.opera-gx"]],
+    "opera": [["flatpak", "run", _OPERA_GX_FLATPAK]],
+    "opera gx": [["flatpak", "run", _OPERA_GX_FLATPAK]],
     "archivos": [["nautilus"]],
     "nautilus": [["nautilus"]],
     "blender": [["blender"]],
@@ -158,10 +161,28 @@ def _config_apps() -> dict[str, list[str]]:
     return apps
 
 
+def _opera_gx_flatpak_available() -> bool:
+    """True solo si hay `flatpak` Y Opera GX está instalada como flatpak.
+
+    Popen NO falla cuando `flatpak run` no encuentra la app: el proceso arranca,
+    escribe el error a DEVNULL y sale con 1, así que un fallback a xdg-open
+    "por excepción" era código muerto y la URL no se abría en ninguna parte.
+    Hay que preguntar ANTES con `flatpak info` (timeout corto: es local).
+    """
+    if not shutil.which("flatpak"):
+        return False
+    try:
+        result = run_cmd(["flatpak", "info", _OPERA_GX_FLATPAK], timeout=3)
+    except (OSError, subprocess.SubprocessError) as error:
+        log.debug("no pude consultar flatpak info: %s", error)
+        return False
+    return result.returncode == 0
+
+
 def _open_local_browser(url: str) -> str:
-    if shutil.which("flatpak"):
+    if _opera_gx_flatpak_available():
         try:
-            run_detached(["flatpak", "run", "com.opera.opera-gx", url])
+            run_detached(["flatpak", "run", _OPERA_GX_FLATPAK, url])
             return f"{funny_line()}\nAbrí esta pestaña, patrón: {url}"
         except (OSError, subprocess.SubprocessError) as error:
             log.debug("flatpak/opera falló, caigo a xdg-open: %s", error)

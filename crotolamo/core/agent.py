@@ -85,6 +85,7 @@ class ToolAgent(Agent):
         route_fn: Callable[[str], list[dict[str, Any]]] | None = None,
         direct_tools: set[str] | None = None,
         fastpath: bool = True,
+        after_turn_hooks: list[Callable[[str, str], None]] | None = None,
     ) -> None:
         super().__init__(llm, conversation)
         self.registry = registry
@@ -124,6 +125,10 @@ class ToolAgent(Agent):
             self.post_hooks = [meta_preamble_cleaner, strip_leaked_tool_json]
         else:
             self.post_hooks = post_hooks
+        # Hooks DESPUÉS del turno: reciben (texto del patrón, respuesta) ya con
+        # la respuesta devuelta al caller. Hoy: la memoria semántica encola la
+        # extracción de hechos. Nunca bloquean ni alteran la respuesta.
+        self.after_turn_hooks: list[Callable[[str, str], None]] = list(after_turn_hooks or [])
 
     def _execute_call(self, name: str, arguments: dict) -> str:
         tool = self.registry.get(name)
@@ -136,8 +141,12 @@ class ToolAgent(Agent):
         # que rompería el short-circuit (lo trataría como fallo duro). Filtramos
         # los kwargs no declarados por ESTA tool antes de ejecutar. No oculta
         # errores de args REQUERIDOS ausentes: esos siguen reventando como antes.
-        declared = set(tool.parameters.get("properties", {}).keys())
-        arguments = {k: v for k, v in arguments.items() if k in declared}
+        # Las tools con strict_args=False (MCP, M4) se saltan el filtro: su
+        # esquema lo dicta el server y puede ser anidado o abierto
+        # (additionalProperties); mutilarlo rompería llamadas legítimas.
+        if getattr(tool, "strict_args", True):
+            declared = set(tool.parameters.get("properties", {}).keys())
+            arguments = {k: v for k, v in arguments.items() if k in declared}
 
         decision = self.guard.check(tool, arguments)
         if not decision.allowed:
@@ -146,6 +155,23 @@ class ToolAgent(Agent):
             return "Cancelado por el patrón."
 
         return self.registry.run(name, arguments)
+
+    def _safe_execute(self, name: str, arguments: dict) -> str:
+        """_execute_call que NUNCA propaga: siempre hay un resultado que anotar.
+
+        Registry.run ya atrapa lo que revienta DENTRO de la tool, pero el guard
+        (p.ej. un '\\0' en la ruta) o el confirm_fn (STT/sounddevice) pueden
+        lanzar antes. Si eso escapaba tras add_assistant(tool_calls=...), el
+        historial quedaba con un assistant pidiendo tools sin su resultado y
+        las APIs OpenAI-compatibles (GLM) rechazaban TODOS los turnos siguientes
+        hasta /reset. El prefijo "La tool '" lo marca como fallo duro (sin
+        short-circuit), igual que un reventón dentro de la tool.
+        """
+        try:
+            return self._execute_call(name, arguments)
+        except Exception as error:  # noqa: BLE001 - un fallo del guard/confirm no rompe el turno
+            log.exception("la tool '%s' reventó fuera del registry", name)
+            return f"La tool '{name}' reventó, patrón: {error}"
 
     def _is_direct(self, name: str) -> bool:
         """True si la tool es de retorno directo: o bien está en el set inyectado
@@ -165,6 +191,17 @@ class ToolAgent(Agent):
         return value
 
     def handle_turn(self, text: str, on_token=None) -> str:
+        reply = self._handle_turn(text, on_token)
+        # El texto CRUDO del patrón (sin pre-hooks) y la respuesta final. Un hook
+        # roto no toca la respuesta: ya está calculada y ya se habló.
+        for hook in self.after_turn_hooks:
+            try:
+                hook(text, reply)
+            except Exception as error:  # noqa: BLE001
+                log.warning("after-turn hook falló: %s", error)
+        return reply
+
+    def _handle_turn(self, text: str, on_token=None) -> str:
         # Enrutamos sobre el texto LIMPIO del patrón (antes de que los pre-hooks le
         # antepongan fecha/hechos), que es la señal real de intención. El set de
         # tools se fija UNA vez por turno y se mantiene en todas las iteraciones,
@@ -183,7 +220,7 @@ class ToolAgent(Agent):
             hit = fastpath_mod.match(routing_text)
             if hit is not None:
                 fast_name, fast_args = hit
-                result = self._execute_call(fast_name, fast_args)
+                result = self._safe_execute(fast_name, fast_args)
                 if not _is_hard_error(result):
                     reply = self._apply(self.post_hooks, result)
                     self.conversation.add_user(text)
@@ -199,6 +236,14 @@ class ToolAgent(Agent):
         known = set(self.registry.names())
 
         for _ in range(self.max_iterations):
+            # Una tool retirada a mitad de turno (un server MCP desconectado por
+            # timeouts, M4) no debe seguir a la vista del modelo en la siguiente
+            # iteración: filtramos por presencia en el registry (barato).
+            if schemas:
+                schemas = [
+                    s for s in schemas
+                    if self.registry.get(s.get("function", {}).get("name", "")) is not None
+                ]
             # Con tools a la vista, el modelo puede anunciar lo que va a hacer antes
             # de pedirla; retenemos hasta saber si hubo tool_call. Sin tools (charla),
             # se habla en vivo.
@@ -243,7 +288,7 @@ class ToolAgent(Agent):
 
             results: list[tuple[str, str]] = []
             for call in calls:
-                result = self._execute_call(call["name"], call.get("arguments", {}))
+                result = self._safe_execute(call["name"], call.get("arguments", {}))
                 self.conversation.add_tool_result(call["name"], result)
                 results.append((call["name"], result))
 

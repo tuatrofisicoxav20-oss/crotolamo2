@@ -154,15 +154,20 @@ class SharedState:
             return self._turn_id
 
     def new_turn(self) -> int:
-        """Arranca un turno nuevo (wake o barge-in). Devuelve el id nuevo."""
+        """Arranca un turno nuevo (wake o barge-in). Devuelve el id nuevo.
+
+        El texto visible se limpia: es de la interacción anterior (la última
+        respuesta hablada) y el HUD lo pintaba bajo "ESCUCHANDO" hasta que el
+        STT publicaba la frase nueva.
+        """
         with self._lock:
             self._turn_id += 1
+            self._text = ""
             _turn = self._turn_id
             _mode = self._mode
-            _text = self._text
             _enabled = self._enabled
         # Publicar FUERA del lock
-        self._publish(_mode, _turn, _text, _enabled)
+        self._publish(_mode, _turn, "", _enabled)
         return _turn
 
     def is_current(self, turn: int) -> bool:
@@ -191,6 +196,21 @@ class SharedState:
             _text = self._text
         # Publicar FUERA del lock (para que el panel vea el estado real).
         self._publish(_mode, _turn, _text, enabled)
+
+    def publish_now(self) -> None:
+        """Publica el estado actual aunque nada haya cambiado.
+
+        Se llama al ARRANCAR el loop: si el proceso anterior murió sin pasar
+        por el apagado limpio (kill -9, OOM, segfault de audio), hud_state.json
+        se quedó en "thinking"/"listening" y el HUD lo mostraba para siempre,
+        porque set_mode/set_enabled solo publican al cambiar.
+        """
+        with self._lock:
+            _mode = self._mode
+            _turn = self._turn_id
+            _text = self._text
+            _enabled = self._enabled
+        self._publish(_mode, _turn, _text, _enabled)
 
     def current_snapshot(self) -> dict:
         """Devuelve un snapshot del estado actual (para publicar el idle final)."""

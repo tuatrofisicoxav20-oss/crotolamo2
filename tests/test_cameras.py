@@ -7,6 +7,7 @@ singleton de settings para no depender del Frigate real.
 
 import time
 import urllib.error
+import urllib.request
 
 import pytest
 
@@ -187,6 +188,29 @@ def test_snapshot_frigate_caido(cams_cfg, monkeypatch):
     out = cameras.camera_snapshot("entrada")
     assert "patrón" in out
     assert "Traceback" not in out
+
+
+# ---------------------------------------------------------------------------
+# _frigate: la request NO sale por el proxy del entorno (http_proxy/https_proxy)
+# ---------------------------------------------------------------------------
+
+def test_frigate_opener_sin_proxy(monkeypatch):
+    """urlopen usaba el opener global con el ProxyHandler por defecto: con
+    http_proxy en el entorno la request iba al proxy y no a Frigate (LAN).
+    En el opener propio no queda ningún ProxyHandler con proxies, tampoco
+    reconstruido con proxies en el entorno. (ProxyHandler({}) no define
+    ningún *_open, así que OpenerDirector ni lo registra en .handlers.)"""
+    monkeypatch.setenv("http_proxy", "http://proxy.test:3128")
+    monkeypatch.setenv("https_proxy", "http://proxy.test:3128")
+
+    def con_proxies(opener):
+        return [h for h in opener.handlers
+                if isinstance(h, urllib.request.ProxyHandler) and h.proxies]
+
+    # Sanidad del test: un opener "normal" bajo este entorno SÍ llevaría el proxy.
+    assert con_proxies(urllib.request.build_opener())
+    for opener in (_frigate._OPENER, _frigate._build_opener()):
+        assert con_proxies(opener) == []
 
 
 # ---------------------------------------------------------------------------

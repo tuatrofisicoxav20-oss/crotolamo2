@@ -44,7 +44,19 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         raise urllib.error.HTTPError(req.full_url, code, "redirect no permitido", headers, fp)
 
 
-_OPENER = urllib.request.build_opener(_NoRedirectHandler)
+def _build_opener() -> urllib.request.OpenerDirector:
+    """Opener sin redirects y SIN proxy.
+
+    build_opener añade el ProxyHandler por defecto, que lee http_proxy/
+    https_proxy del entorno: con un proxy configurado, la request a HA (con el
+    bearer token en el header) salía hacia el proxy en vez de a la LAN.
+    ProxyHandler({}) lo sustituye por uno vacío. Es una factoría (y no solo la
+    constante) para que los tests lo reconstruyan bajo un entorno con proxy.
+    """
+    return urllib.request.build_opener(_NoRedirectHandler, urllib.request.ProxyHandler({}))
+
+
+_OPENER = _build_opener()
 
 
 def _find_token() -> str | None:

@@ -7,6 +7,7 @@ entity_id reales de la casa de Emiliano.
 """
 
 import urllib.error
+import urllib.request
 
 import pytest
 
@@ -274,6 +275,79 @@ def test_hass_no_sigue_redirects(home_cfg, monkeypatch):
         ok, error = _hass._hass_call("GET", "/api/states/light.xbox_led")
         assert ok is False
         assert "http_302" in error
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# _hass: la request NO sale por el proxy del entorno (http_proxy/https_proxy)
+# ---------------------------------------------------------------------------
+
+def _proxy_handlers_con_proxies(opener):
+    """ProxyHandlers del opener que SÍ enrutarían algo. OJO: ProxyHandler({})
+    no define ningún *_open, así que OpenerDirector ni lo registra en
+    .handlers; lo que importa es que no quede ninguno con proxies."""
+    return [
+        h for h in opener.handlers
+        if isinstance(h, urllib.request.ProxyHandler) and h.proxies
+    ]
+
+
+def test_hass_opener_sin_proxy(monkeypatch):
+    """build_opener mete el ProxyHandler por defecto (lee http_proxy del
+    entorno): con proxy configurado, la request a HA, con el bearer token en
+    el header, salía hacia el proxy. Ningún ProxyHandler con proxies, tampoco
+    reconstruyendo el opener con proxies en el entorno."""
+    monkeypatch.setenv("http_proxy", "http://proxy.test:3128")
+    monkeypatch.setenv("https_proxy", "http://proxy.test:3128")
+    # Sanidad del test: un opener "normal" bajo este entorno SÍ llevaría el proxy.
+    ingenuo = urllib.request.build_opener(_hass._NoRedirectHandler)
+    assert _proxy_handlers_con_proxies(ingenuo)
+    for opener in (_hass._OPENER, _hass._build_opener()):
+        assert _proxy_handlers_con_proxies(opener) == []
+
+
+def test_hass_llega_a_la_lan_aunque_haya_proxy_en_el_entorno(home_cfg, monkeypatch):
+    """De punta a punta: con http_proxy apuntando a un puerto muerto, la
+    request debe llegar igual al servidor local (la LAN), no al proxy."""
+    import http.server
+    import threading
+
+    hits = []
+
+    class _Estado(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 — nombre que exige BaseHTTPRequestHandler
+            hits.append(self.path)
+            body = b'{"state": "on", "attributes": {}}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), _Estado)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        # Puerto 9 (discard): nadie escucha. Sin no_proxy, para que el proxy
+        # también "aplicara" a 127.0.0.1 si el opener lo respetase.
+        monkeypatch.setenv("http_proxy", "http://127.0.0.1:9")
+        for var in ("no_proxy", "NO_PROXY"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setattr(_hass, "_OPENER", _hass._build_opener())
+        real = settings_mod.get_settings()
+        monkeypatch.setitem(real.raw, "home", {
+            "base_url": f"http://127.0.0.1:{server.server_port}",
+            "lights": {"xbox": "light.xbox_led"},
+        })
+        ok, data = _hass._hass_call("GET", "/api/states/light.xbox_led")
+        assert ok is True, data
+        assert data["state"] == "on"
+        assert hits == ["/api/states/light.xbox_led"]
     finally:
         server.shutdown()
         thread.join(timeout=5)

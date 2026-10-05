@@ -95,17 +95,36 @@ def list_project_tree(name: str) -> str:
     if not project.exists():
         return f"No encontré el proyecto {name}: {project}"
 
+    # iterdir()/is_dir() lanzan PermissionError (u otro OSError) sobre carpetas
+    # sin permisos; sin red de seguridad la tool "reventaba" en vez de
+    # responder en personaje.
+    try:
+        lines = _tree_lines(project)
+    except OSError as error:
+        return f"No pude leer el árbol de {name}, patrón: {error}"
+    return "\n".join(lines)
+
+
+def _tree_lines(project: Path) -> list[str]:
+    """Líneas del árbol (primer y segundo nivel). Puede lanzar OSError."""
     lines: list[str] = [f"{project.name}/"]
     for top in sorted(project.iterdir(), key=lambda e: (e.is_file(), e.name.lower())):
         if top.name in _SKIP_DIRS or top.name.startswith("."):
             continue
         lines.append(f"  {'📁' if top.is_dir() else '📄'} {top.name}")
-        if top.is_dir():
-            for child in sorted(top.iterdir())[:12]:
-                if child.name in _SKIP_DIRS or child.name.startswith("."):
-                    continue
-                lines.append(f"    {'📁' if child.is_dir() else '📄'} {child.name}")
-    return "\n".join(lines)
+        if not top.is_dir():
+            continue
+        try:
+            children = sorted(top.iterdir())[:12]
+        except OSError:
+            # Una subcarpeta sin permisos no debe tirar el árbol entero.
+            lines.append("    (no pude leer esta carpeta, patrón)")
+            continue
+        for child in children:
+            if child.name in _SKIP_DIRS or child.name.startswith("."):
+                continue
+            lines.append(f"    {'📁' if child.is_dir() else '📄'} {child.name}")
+    return lines
 
 
 @tool
@@ -155,9 +174,13 @@ def find_in_project(project: str, pattern: str) -> str:
     if not pattern.strip():
         return "Dame algo que buscar, patrón."
 
+    # `-e` y `--`: el patrón lo elige el LLM. Sin ellos, un patrón que empieza
+    # por guion se interpreta como opción de grep; con "-r" la ruta del
+    # proyecto pasaba a ser "el patrón" y grep buscaba en el CWD del proceso,
+    # fuera del proyecto (y del corral).
     cmd = ["grep", "-rniI", "--max-count=3",
            "--exclude-dir=.git", "--exclude-dir=.venv", "--exclude-dir=__pycache__",
-           pattern, str(base)]
+           "-e", pattern, "--", str(base)]
     try:
         result = subprocess.run(cmd, text=True, capture_output=True, timeout=20)
     except (OSError, subprocess.TimeoutExpired):

@@ -105,6 +105,12 @@ class Tool:
     # (short-circuit). Ver ToolAgent.direct_tools. Default False (comportamiento
     # normal: el modelo redacta la respuesta tras ver el resultado de la tool).
     direct: bool = False
+    # strict_args=True (default): el agente FILTRA los kwargs que no estén en
+    # parameters["properties"] antes de ejecutar, porque el 3B alucina argumentos
+    # ajenos. False: se pasan todos tal cual. Lo usan las tools MCP (M4): su
+    # esquema es JSON arbitrario del server (anidado, additionalProperties...) y
+    # filtrar por el primer nivel de `properties` mutilaría llamadas válidas.
+    strict_args: bool = True
 
     def schema(self) -> dict[str, Any]:
         """Formato que espera Ollama en el campo `tools`."""
@@ -156,6 +162,11 @@ class Registry:
 
     def register(self, tool: Tool) -> None:
         self._tools[tool.name] = tool
+
+    def unregister(self, name: str) -> bool:
+        """Quita una tool por nombre. True si existía (M4: los servers MCP que se
+        caen o se cuelgan retiran sus tools en caliente, sin reiniciar)."""
+        return self._tools.pop(name, None) is not None
 
     def get(self, name: str) -> Tool | None:
         return self._tools.get(name)
