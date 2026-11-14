@@ -176,14 +176,16 @@ def test_log_info_solo_al_cambiar_de_modo(caplog):
             mon.refresh_now()
         infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
         assert len(infos) == 1, infos
-        assert "modo música" in infos[0] and "0.85" in infos[0] and "spotify" in infos[0]
+        # Sin umbral: el del monitor es el del wake difuso y con openWakeWord
+        # rige otro (ver tests/test_revision_final_u32v.py).
+        assert "modo música" in infos[0] and "0.85" not in infos[0] and "spotify" in infos[0]
 
         backend.playing = []
         for _ in range(3):
             mon.refresh_now()
         infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
         assert len(infos) == 2, infos
-        assert "modo normal" in infos[1] and "0.72" in infos[1]
+        assert "modo normal" in infos[1] and "0.72" not in infos[1]
 
 
 def test_el_hilo_de_sondeo_sobrevive_a_un_backend_que_lanza():
@@ -229,7 +231,8 @@ def test_playerctl_parsea_los_reproductores_en_playing(playerctl):
     playerctl.state["result"] = _completed("spotify\tPlaying\nfirefox\tPaused\nvlc\tStopped\n")
     assert PlayerctlBackend().playing_players() == ["spotify"]
     args, timeout = playerctl.calls[0]
-    assert args == ["playerctl", "-a", "metadata", "--format", "{{playerName}}\t{{status}}"]
+    # Por instancia, no por playerName (ver tests/test_revision_final_u32v.py).
+    assert args == ["playerctl", "-a", "metadata", "--format", "{{playerInstance}}\t{{status}}"]
     assert timeout == 2.0
 
 

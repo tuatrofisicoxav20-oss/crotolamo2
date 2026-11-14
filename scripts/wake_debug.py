@@ -114,10 +114,12 @@ def run(threshold: float | None, verbose: bool, como_produccion: bool = False) -
     if _device:
         print(f"(micrófono: {_device})")
 
+    abierto = False  # ¿se llegó a abrir el micrófono? (ver el except ValueError)
     try:
         with sd.InputStream(samplerate=_SAMPLE_RATE, channels=1,
                             dtype="float32" if como_produccion else "int16",
                             device=_device) as stream:
+            abierto = True
             while True:
                 if como_produccion:
                     block, _ = stream.read(_CHUNK_PRODUCCION)
@@ -166,8 +168,17 @@ def run(threshold: float | None, verbose: bool, como_produccion: bool = False) -
     except KeyboardInterrupt:
         pass
     except sd.PortAudioError as error:
-        # Sin micrófono o con [voice].input_device inválido. No hereda de OSError
-        # y salía como traceback en vez del "FALLO: ..." de los demás errores.
+        # Sin micrófono o con un índice de [voice].input_device inválido. No hereda
+        # de OSError y salía como traceback en vez del "FALLO: ..." de los demás.
+        print("FALLO: el micrófono no respondió:", error)
+        return 1
+    except ValueError as error:
+        # [voice].input_device con un NOMBRE que no está ("crotolamo_aec_source"
+        # con el AEC apagado o tras reiniciar): sounddevice lanza ValueError ('No
+        # input device matching ...'), no PortAudioError, y salía traceback. Solo
+        # al ABRIR: un ValueError ya midiendo es un bug del detector y se ve tal cual.
+        if abierto:
+            raise
         print("FALLO: el micrófono no respondió:", error)
         return 1
 

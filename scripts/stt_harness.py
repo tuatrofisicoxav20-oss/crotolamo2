@@ -4,8 +4,9 @@ Porqué: elegir entre tiny/base/small "a oído" es adivinar. Este harness graba
 una tanda de comandos reales UNA sola vez con el MISMO pipeline de producción
 (STT.record_until_silence, mismo VAD, misma normalización) y luego transcribe
 ESOS MISMOS wavs con cada modelo candidato, midiendo latencia y si el routing
-de tools (strip_wake_word + select_tool_names) da con la tool esperada. Así la
-comparación es justa: mismo audio, mismas condiciones, solo cambia el modelo.
+de tools (strip_wake_word + route_schemas, con el registry y [llm].max_tools de
+producción) da con la tool esperada. Así la comparación es justa: mismo audio,
+mismas condiciones, solo cambia el modelo.
 
   python scripts/stt_harness.py record --n 10 --dir stt_bench
   python scripts/stt_harness.py bench --dir stt_bench --models tiny,base,small
@@ -20,6 +21,7 @@ import argparse
 import json
 import sys
 import wave
+from collections.abc import Iterable
 from pathlib import Path
 
 try:
@@ -34,15 +36,23 @@ _SIZE_ORDER = ["tiny", "base", "small", "medium", "large-v3"]
 _MIN_INTENT_RATE = 0.9
 _MAX_MEAN_LATENCY_S = 3.0
 
+# Whisper recibe el ndarray tal cual, sin resamplear: tiene que venir a 16 kHz.
+_WHISPER_RATE = 16000
 
-def _all_tool_names() -> list[str]:
-    """Todas las tools de todos los grupos del router (para referencia/aviso)."""
+
+def _all_tool_names(available: Iterable[str]) -> list[str]:
+    """Las tools de los grupos del router que producción puede ofrecer (referencia).
+
+    Solo las registradas: sin mem0, las de la memoria semántica no lo están y el
+    router nunca las manda; listarlas como válidas daba un OK que producción no da.
+    """
     from crotolamo.core.router import GROUPS
 
+    registered = set(available)
     names: list[str] = []
     for group in GROUPS.values():
         for name in group["tools"]:
-            if name not in names:
+            if name in registered and name not in names:
                 names.append(name)
     return names
 
@@ -54,6 +64,28 @@ def _wav_duration_s(path: Path) -> float:
     return frames / rate if rate else 0.0
 
 
+def _read_wav_audio(path: Path):
+    """Lee un wav de `record` (mono, int16, 16 kHz) a float32 EN MEMORIA.
+
+    Porqué: producción transcribe el float32 en memoria (SttThread), nunca un
+    archivo. Con la ruta, faster-whisper decodificaba con PyAV: con av 19
+    (Python >= 3.12) eso revienta en el warmup del primer modelo (TypeError por
+    metadata_errors) y no se medía ninguno; con av 18 la latencia medida sumaba
+    un decode + resampleo que producción no paga.
+    """
+    import numpy as np
+
+    with wave.open(str(path), "rb") as wav:
+        if wav.getnchannels() != 1 or wav.getsampwidth() != 2:
+            raise ValueError("no es mono int16, lo que graba 'record'")
+        if wav.getframerate() != _WHISPER_RATE:
+            raise ValueError(f"está a {wav.getframerate()} Hz y Whisper espera "
+                             f"{_WHISPER_RATE} (en memoria no se resamplea)")
+        data = wav.readframes(wav.getnframes())
+    # Potencia de dos: la conversión es exacta, igual que el /32768 de smoke_voz.
+    return np.frombuffer(data, dtype="<i2").astype(np.float32) / np.float32(32768.0)
+
+
 # --- record ---------------------------------------------------------------
 
 def cmd_record(args: argparse.Namespace) -> int:
@@ -61,6 +93,7 @@ def cmd_record(args: argparse.Namespace) -> int:
     import shutil
 
     from crotolamo.settings import get_settings
+    from crotolamo.tools import default_registry
     from crotolamo.voice.stt import STT, VoiceUnavailable
 
     out_dir = Path(args.dir)
@@ -69,9 +102,17 @@ def cmd_record(args: argparse.Namespace) -> int:
         print(f"FALLO: '{out_dir}' ya tiene {len(existing)} wav(s), patrón.")
         print("No sobrescribo grabaciones. Usa otro --dir o pasa --force.")
         return 1
+    # sounddevice se importa aquí para poder NOMBRAR PortAudioError (sin
+    # micrófono), que no hereda de OSError; igual que smoke_voz --mic. Sin
+    # libportaudio el import mismo es OSError. Antes salía traceback.
+    try:
+        import sounddevice as sd
+    except (ImportError, OSError) as error:
+        print("FALLO: no puedo usar el micrófono:", error)
+        return 1
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    tools = _all_tool_names()
+    tools = _all_tool_names(default_registry().names())
     print("Tools válidas (para el campo 'esperada'):")
     print("  " + ", ".join(tools))
     print()
@@ -86,6 +127,12 @@ def cmd_record(args: argparse.Namespace) -> int:
             tmp_wav = stt.record_until_silence(max_seconds=args.max_seconds)
         except VoiceUnavailable as error:
             print("FALLO:", error)
+            return 1
+        except (OSError, ValueError, sd.PortAudioError) as error:
+            # PortAudioError: sin micrófono o índice inválido; ValueError: un
+            # [voice].input_device con NOMBRE que no está ("crotolamo_aec_source"
+            # con el AEC apagado); OSError: el audio del sistema se cayó.
+            print("FALLO: el micrófono no respondió:", error)
             return 1
 
         name = f"cmd_{i:0{width}d}.wav"
@@ -109,12 +156,18 @@ def cmd_record(args: argparse.Namespace) -> int:
 
 # --- bench ----------------------------------------------------------------
 
-def _bench_model(model_size: str, entries: list[dict], base_dir: Path) -> dict:
-    """Transcribe todos los wavs con un modelo y devuelve las métricas."""
+def _bench_model(model_size: str, entries: list[dict], base_dir: Path, *,
+                 audios: dict | None = None, registry=None) -> dict:
+    """Transcribe todos los wavs con un modelo y devuelve las métricas.
+
+    audios/registry: los que cmd_bench prepara UNA vez para todos los modelos;
+    None (quien llama suelto) = se leen/arman aquí.
+    """
     import time
 
-    from crotolamo.core.router import select_tool_names
+    from crotolamo.core.router import route_schemas
     from crotolamo.settings import get_settings
+    from crotolamo.tools import default_registry
     from crotolamo.voice.stt import STT
     from crotolamo.voice.wake import strip_wake_word
 
@@ -128,19 +181,29 @@ def _bench_model(model_size: str, entries: list[dict], base_dir: Path) -> dict:
     stt = STT.from_settings(settings)
     stt.model_size = model_size
     hotwords = settings.voice.get("hotwords") or None
+    # El audio entra en memoria, como en producción (ver _read_wav_audio).
+    if audios is None:
+        audios = {e["wav"]: _read_wav_audio(base_dir / e["wav"]) for e in entries}
+    # Routing idéntico al de producción (shell.build_agent): route_schemas con el
+    # registry real y [llm].max_tools. Sin el registry, las tools de la memoria
+    # semántica (sin mem0 no están registradas) se comían huecos del tope y
+    # dejaban fuera tools reales: FALLO de intent que producción no tiene.
+    if registry is None:
+        registry = default_registry()
+    max_tools = settings.llm.get("max_tools", 8)
 
     # Warmup: carga el modelo y calienta int8 sin contaminar las mediciones.
-    stt.transcribe(base_dir / entries[0]["wav"], hotwords=hotwords)
+    stt.transcribe(audios[entries[0]["wav"]], hotwords=hotwords)
 
     rows: list[dict] = []
     for entry in entries:
-        wav_path = base_dir / entry["wav"]
+        audio = audios[entry["wav"]]
         t0 = time.perf_counter()
-        texto = stt.transcribe(wav_path, hotwords=hotwords)
+        texto = stt.transcribe(audio, hotwords=hotwords)
         latency = time.perf_counter() - t0
 
         cmd = strip_wake_word(texto)
-        tools = select_tool_names(cmd)
+        tools = [s["function"]["name"] for s in route_schemas(registry, cmd, max_tools)]
         expected = entry.get("expected_tool")
         if expected:
             status = "OK" if expected in tools else "FALLO"
@@ -183,6 +246,7 @@ def _passes_rule(result: dict) -> bool:
 
 def cmd_bench(args: argparse.Namespace) -> int:
     """Transcribe los wavs del dir con cada modelo y saca veredicto."""
+    from crotolamo.tools import default_registry
     from crotolamo.voice.stt import VoiceUnavailable
 
     base_dir = Path(args.dir)
@@ -190,7 +254,18 @@ def cmd_bench(args: argparse.Namespace) -> int:
     if not manifest_path.is_file():
         print(f"FALLO: no encuentro {manifest_path}. ¿Ya corriste 'record', patrón?")
         return 1
-    entries = json.loads(manifest_path.read_text(encoding="utf-8"))
+    # Un manifest editado a mano (JSON roto, otra forma) era traceback.
+    # JSONDecodeError y UnicodeDecodeError son ValueError.
+    try:
+        entries = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        print(f"FALLO: no puedo leer {manifest_path} ({error}). ¿Lo editaste a mano, patrón?")
+        return 1
+    if not isinstance(entries, list) or not all(
+            isinstance(e, dict) and isinstance(e.get("wav"), str) for e in entries):
+        print(f"FALLO: {manifest_path} debe ser una lista de entradas con 'wav', "
+              "como la deja 'record', patrón.")
+        return 1
     if not entries:
         print("FALLO: el manifest está vacío.")
         return 1
@@ -204,16 +279,41 @@ def cmd_bench(args: argparse.Namespace) -> int:
         print("FALLO: lista de modelos vacía.")
         return 1
 
+    # Los wavs se leen UNA vez, antes de cargar ningún modelo: un wav ilegible se
+    # dice ya, no tras minutos de CPU, y la lectura no entra en la latencia.
+    audios: dict = {}
+    for entry in entries:
+        try:
+            audios[entry["wav"]] = _read_wav_audio(base_dir / entry["wav"])
+        except (wave.Error, EOFError, OSError, ValueError) as error:
+            print(f"FALLO: no puedo leer {entry['wav']}: {error}")
+            return 1
+    registry = default_registry()
+
     results: list[dict] = []
+    failed = False
     for model in models:
         print(f"\nCargando y midiendo '{model}' (warmup incluido, paciencia)...")
         try:
-            result = _bench_model(model, entries, base_dir)
+            result = _bench_model(model, entries, base_dir, audios=audios, registry=registry)
         except VoiceUnavailable as error:
+            # Falta la voz (faster-whisper): los demás modelos fallarían igual.
             print("FALLO:", error)
-            return 1
+            failed = True
+            break
+        except Exception as error:  # noqa: BLE001
+            # Un typo en --models, un modelo sin caché y sin red (error del Hub)...
+            # Se dice con su tipo y se sigue: antes un traceback tiraba el
+            # veredicto de los modelos ya medidos.
+            print(f"FALLO: modelo '{model}': {type(error).__name__}: {error}")
+            failed = True
+            continue
         _print_model_report(result)
         results.append(result)
+
+    if not results:
+        print("FALLO: no pude medir ningún modelo, patrón.")
+        return 1
 
     # Veredicto: el MÁS chico (tiny < base < small) que cumpla la regla.
     def size_key(res: dict) -> int:
@@ -248,7 +348,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
         "\nNota: esto mide transcripción + routing de tools (pre-selección); la "
         "elección final de tool la hace el LLM y se valida en el end-to-end (§5)."
     )
-    return 0
+    return 1 if failed else 0
 
 
 # --- CLI ------------------------------------------------------------------

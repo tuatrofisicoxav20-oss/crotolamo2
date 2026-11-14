@@ -63,7 +63,8 @@ class MediaBackend(Protocol):
     fallo devuelve [] / None / False."""
 
     def playing_players(self) -> list[str]:
-        """Nombres de los reproductores en estado Playing."""
+        """Los reproductores en estado Playing, con un nombre que los distinga
+        (get_volume/set_volume lo reciben tal cual)."""
         ...
 
     def get_volume(self, player: str) -> str | None:
@@ -73,6 +74,17 @@ class MediaBackend(Protocol):
     def set_volume(self, player: str, value: str) -> bool:
         """Fija el volumen; True si el backend lo aceptó."""
         ...
+
+
+# Cómo se lista lo que suena (la foto y el seguidor): por INSTANCIA, no por
+# playerName. playerctl 2.4.1 casa `-p X` con la instancia X y con toda
+# "X.<algo>", y sin -a la orden se queda en la primera que la acepta. Dos VLC o
+# mpv registran "vlc" y "vlc.instance<pid>": con el nombre, el duck escribía en
+# el PRIMERO (el que estaba en pausa) y la música que sonaba seguía a todo
+# volumen; con los dos sonando, solo bajaba uno. "vlc.instance<pid>" solo casa
+# consigo misma; "vlc" a secas va primero en el orden de playerctl (sin
+# playerctld). Lo mismo que tools/media.py (_LISTADO).
+_LISTADO = "{{playerInstance}}\t{{status}}"
 
 
 class PlayerctlBackend:
@@ -106,7 +118,7 @@ class PlayerctlBackend:
         return None
 
     def playing_players(self) -> list[str]:
-        result = self._run(["-a", "metadata", "--format", "{{playerName}}\t{{status}}"])
+        result = self._run(["-a", "metadata", "--format", _LISTADO])
         self._local.answered = result is not None
         if result is None:
             return []
@@ -143,15 +155,15 @@ class PlayerctlBackend:
         return bool(getattr(self._local, "answered", True))
 
     # Mismo formato que la foto (playing_players): cada línea del seguidor se
-    # puede comparar con el caché. Solo es un DISPARADOR: la verdad sigue siendo
-    # la foto, con el parser de siempre.
-    FOLLOW_ARGS = ("-a", "metadata", "--format", "{{playerName}}\t{{status}}", "--follow")
+    # puede comparar con el caché (la misma clase de nombre: la instancia). Solo
+    # es un DISPARADOR: la verdad sigue siendo la foto, con el parser de siempre.
+    FOLLOW_ARGS = ("-a", "metadata", "--format", _LISTADO, "--follow")
 
     def available(self) -> bool:
         return shutil.which("playerctl") is not None
 
     def follow(self) -> subprocess.Popen[bytes] | None:
-        """UN `playerctl --follow` vivo: escribe una línea "nombre<TAB>estado" por
+        """UN `playerctl --follow` vivo: escribe una línea "instancia<TAB>estado" por
         cada cambio de cualquier reproductor (el estado actual al arrancar; si uno
         desaparece, la del que queda arriba, o una vacía si no queda ninguno) y no
         repite una línea idéntica a la anterior. En reposo no lanza ni un proceso.
@@ -216,10 +228,9 @@ def _parse_playing(stdout: str) -> list[str]:
     """Parsea líneas "nombre<TAB>estado" y devuelve los reproductores en Playing.
 
     Tolerante: una línea sin tabulador o vacía se ignora (no invalida el
-    resto). Se deduplica conservando el orden: dos instancias del mismo
-    reproductor (p.ej. dos pestañas de Firefox) salen con el mismo playerName,
-    y `playerctl -p nombre` actúa sobre la primera; ducking dos veces el mismo
-    nombre pisaría el volumen original guardado con el ya atenuado.
+    resto). Se deduplica conservando el orden: con la instancia (_LISTADO) no
+    debería repetirse ninguna, pero ducking dos veces el mismo nombre pisaría
+    el volumen original guardado con el ya atenuado.
     """
     playing: list[str] = []
     for line in stdout.splitlines():
@@ -379,11 +390,15 @@ class MediaMonitor:
             self._playing = playing
         now_playing = bool(playing)
         if now_playing != was_playing:
+            # Sin número: threshold_normal/threshold_media son los del wake
+            # DIFUSO (lo único que el monitor conoce). Con openWakeWord (el de
+            # fábrica) rigen oww_threshold / oww_threshold_media y el journal
+            # anunciaba un umbral que nada usaba. Cada wake loguea el suyo al
+            # decidir ("wake score=... (umbral=...)", _log_heard).
             if now_playing:
-                log.info("wake en modo música (umbral %.2f): suena %s",
-                         self.threshold_media, ", ".join(playing))
+                log.info("wake en modo música: suena %s", ", ".join(playing))
             else:
-                log.info("wake en modo normal (umbral %.2f)", self.threshold_normal)
+                log.info("wake en modo normal: ya no suena nada")
         return now_playing, answered
 
     def _refresh_logged(self) -> None:
@@ -721,8 +736,9 @@ class Ducker:
         self._worker: threading.Thread | None = None
         self._worker_lock = threading.Lock()
         self._closed = False
-        # Se activa cuando close() ya esperó al worker: a partir de ahí ningún
-        # duck (tardío o encolado por error) puede pisar el restore final.
+        # Se activa cuando close() ya esperó al worker, o al empezar
+        # emergency_restore: a partir de ahí ningún duck (tardío o encolado por
+        # error) puede pisar el restore final.
         self._no_more_duck = False
         # Último "deseo" recibido por on_mode: el publisher dispara en CADA
         # cambio de estado (texto, turno, enabled) con el modo vigente; solo se
@@ -750,16 +766,20 @@ class Ducker:
     def duck(self) -> None:
         """Baja el volumen de TODO lo que suena (sondeo fresco) a volumen*factor.
 
-        Una vez que close() terminó de esperar al worker, es no-op: si el worker
-        seguía atascado (D-Bus colgado) con un duck en cola, ese duck se
-        aplicaría DESPUÉS del restore final del apagado y la música quedaría
-        atorada baja. Lo encolado ANTES de close sí se procesa, en orden.
+        Una vez que close() terminó de esperar al worker (o que empezó
+        emergency_restore), es no-op: si el worker seguía atascado (D-Bus
+        colgado) con un duck en cola, ese duck se aplicaría DESPUÉS del restore
+        final del apagado y la música quedaría atorada baja. Lo encolado ANTES
+        de close sí se procesa, en orden.
         """
         if not self.enabled or self._no_more_duck:
             return
         with self._lock:
-            if self._saved:
-                return  # ya en duck: no pisar el original guardado
+            # Otra vez CON el lock: un worker que pasó el chequeo de arriba justo
+            # antes de la señal espera aquí a que emergency_restore suelte el
+            # lock, y sin esto atenuaba después del restore de último recurso.
+            if self._no_more_duck or self._saved:
+                return  # cerrado, o ya en duck: no pisar el original guardado
             for backend in self._backends:
                 self._duck_backend(backend)
 
@@ -795,6 +815,12 @@ class Ducker:
             except (TypeError, ValueError):
                 log.warning("duck: volumen raro de %s (%r); lo dejo como está", name, raw)
                 continue
+            # D-Bus colgado: la lectura pudo tardar más que el lock_timeout_s de
+            # emergency_restore, que ya restauró sin el lock. Escribir ahora el
+            # volumen bajo lo dejaría así al os._exit: se para aquí.
+            if self._no_more_duck:
+                log.debug("duck: cerrado a medio duck; no bajo %s", name)
+                return
             # Guardar el original ANTES de escribir: si la escritura "falla"
             # (p.ej. timeout) pero playerctl sí la aplicó, restore() lo repone
             # igual. Restaurar de más es inocuo; de menos deja la música atorada.
@@ -837,7 +863,14 @@ class Ducker:
         propio hilo principal puede tener el lock tomado (a medio duck), así
         que se espera el lock un instante y, si no llega, se restaura SIN él:
         con el proceso muriendo, dejar Spotify bajito es peor que una carrera.
+
+        Cierra el ducking ANTES de restaurar (como close()): el manejador sigue
+        hasta segundos más (MCP, memoria, idle final) con el oído, la boca y el
+        worker vivos, y un duck encolado o una transición idle -> listening en
+        ese rato volvía a bajar la música justo antes del os._exit. Una
+        asignación simple: segura dentro de un manejador de señal.
         """
+        self._no_more_duck = True
         acquired = self._lock.acquire(timeout=lock_timeout_s)
         try:
             saved, self._saved = self._saved, {}

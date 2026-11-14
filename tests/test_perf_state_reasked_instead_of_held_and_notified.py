@@ -562,7 +562,7 @@ def test_playerctl_answered_distingue_no_suena_de_no_respondio(monkeypatch):
     el backend desde el suyo)."""
     from crotolamo.voice import media_aware
 
-    argv = ["playerctl", "-a", "metadata", "--format", "{{playerName}}\t{{status}}"]
+    argv = ["playerctl", "-a", "metadata", "--format", "{{playerInstance}}\t{{status}}"]
     estado: dict = {"which": "/usr/bin/playerctl", "raise": None, "result": None}
     llamadas: list[list[str]] = []
 

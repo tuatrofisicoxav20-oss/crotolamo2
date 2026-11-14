@@ -340,8 +340,9 @@ def test_bench_transcribe_con_hotwords_y_beam_de_la_config(monkeypatch, tmp_path
     voice: dict = {"whisper_model": "small", "beam_size": 2, "sample_rate": 16000}
     if hotwords is not None:
         voice["hotwords"] = hotwords
+    # llm/memoria/mcp: el bench enruta con el registry y [llm].max_tools reales.
     monkeypatch.setattr(settings_mod, "get_settings",
-                        lambda: types.SimpleNamespace(voice=voice))
+                        lambda: types.SimpleNamespace(voice=voice, llm={}, memoria={}, mcp={}))
     elegido, trampa = _WhisperQueApunta(), _WhisperQueApunta()
     # Solo cambia el modelo: el bench pide "tiny" aunque la config diga "small".
     monkeypatch.setitem(stt_mod._models, "tiny", elegido)

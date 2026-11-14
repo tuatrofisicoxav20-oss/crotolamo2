@@ -575,7 +575,12 @@ class WakeWordDetector:
         np = self._np  # cacheado por _get_model(): no re-resolver en el hot path
         arr = np.asarray(chunk)
         if arr.dtype != np.int16:
-            arr = (arr * 32767).astype(np.int16)
+            # Satura como _wake_de_fuente: el oído del loop concurrente y el
+            # pre-filtro traen float32 crudo de PortAudio y, con la fuente por
+            # encima del 100 %, pasa de [-1, 1]. Sin el clip el astype daba la
+            # vuelta (1.2 -> -26216) y el modelo puntuaba audio corrompido justo
+            # con la voz más fuerte. En rango no cambia ninguna muestra.
+            arr = np.clip(arr * 32767, -32768, 32767).astype(np.int16)
         return arr
 
     @staticmethod
