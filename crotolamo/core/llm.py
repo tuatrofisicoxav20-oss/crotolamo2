@@ -143,6 +143,12 @@ class LLMClient:
             connect_timeout=llm.get("connect_timeout"),
         )
 
+    def preconnect(self) -> bool:
+        """Nada que adelantar: Ollama corre en esta máquina y conectar por
+        loopback no cuesta un handshake que merezca pagarse antes (sin TLS ni red).
+        Mismo contrato que GLMClient.preconnect: False = no hay repuesto."""
+        return False
+
     def _options(self) -> dict[str, Any]:
         options: dict[str, Any] = {"temperature": self.temperature}
         if self.num_ctx:

@@ -158,6 +158,17 @@ class GLMClient:
             )
         return {"Authorization": f"Bearer {self.api_key}"}
 
+    def preconnect(self) -> bool:
+        """Abre por adelantado la conexión HTTPS con la nube (el aviso del wake).
+
+        Ver HTTPTransport.preconnect: nunca lanza y True = repuesto listo. Sin API
+        key la petición ni saldría (GLMAuthError antes de tocar la red): nada que
+        abrir.
+        """
+        if not self.api_key:
+            return False
+        return self._transport.preconnect()
+
     def _fit(
         self,
         messages: list[dict[str, Any]],

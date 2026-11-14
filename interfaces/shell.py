@@ -200,6 +200,11 @@ def build_agent(confirm_fn=None) -> tuple[Agent, Conversation]:
             answered_policy=answered_fn,
             # Apagada de fábrica: la decide el patrón (ver config/crotolamo.toml).
             stop_on_repeated_failure=settings.llm.get("stop_on_repeated_failure", False),
+            # Cuándo suelta el streaming con tools a la vista (con GLM, siempre):
+            # "final" de fábrica = retener como siempre; "sentence" habla antes a
+            # riesgo de decir un preámbulo (ver [voice] en config/crotolamo.toml).
+            # Un valor raro lo rechaza ToolAgent: "final" y un aviso en el log.
+            stream_release=str(settings.voice.get("stream_release", "final")),
         )
         if failover_policy is not None:
             # La nube cayó A MEDIA llamada: esa petición iba armada para GLM (todas

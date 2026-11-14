@@ -22,6 +22,16 @@ Pasos 4-6 (parte 2): la respuesta en vuelo tiene UN dueño (LiveStreamer).
 - FallbackLLM reinicia el streamer antes de pasar al local (lo retenido de la
   nube nunca se mezcla con la respuesta local); ver test_fallback.py.
 
+Pasos 7-8 (parte A, el núcleo; el cableado del wake y del barge-in va aparte):
+- `HTTPTransport.preconnect` abre UN repuesto desde otro hilo y se lo lleva la
+  primera petición (cero handshakes en el turno, y releva al keep-alive propio:
+  nunca quedan dos sockets ociosos); uno caducado o caído se tira sin escribir y el
+  reintento único sigue conectando de nuevo. La comprobación de vida entiende TLS 1.3 (los
+  tickets que llegan tras el handshake no son un cierre).
+- Un wake renueva el repuesto al que le quedan menos de 15 s (la orden llega después)
+  y el que nadie pide (un wake sin turno LLM) lo cierra su segador a los 30 s.
+- `build_agent` pasa [voice].stream_release al agente ("final" de fábrica).
+
 Aquí van las pruebas de punta a punta (contra sockets reales de loopback y con
 el agente real); las unitarias están en test_transport.py, test_glm.py,
 test_fase6.py y test_fallback.py.
@@ -31,7 +41,11 @@ from __future__ import annotations
 
 import json
 import logging
+import select
+import shutil
 import socket
+import ssl
+import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -96,7 +110,15 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self):  # noqa: N802 - nombre que exige BaseHTTPRequestHandler
         srv = self.server
         self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        srv.usadas.add(self.connection)
         glm = self.path.endswith("/chat/completions")
+        if srv.mode == "entero":         # sin stream (BrainThread): JSON entero de GLM
+            cuerpo = json.dumps({"choices": [{"message": {"content": "".join(TOKENS)}}]})
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(cuerpo.encode())))
+            self.end_headers()
+            self.wfile.write(cuerpo.encode())
+            return
         self.send_response(200)
         self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
@@ -140,10 +162,18 @@ class _Handler(BaseHTTPRequestHandler):
 class _Server(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, mode: str = "ok") -> None:
+    def __init__(self, mode: str = "ok", contexto: ssl.SSLContext | None = None) -> None:
         super().__init__(("127.0.0.1", 0), _Handler)
+        if contexto is not None:   # HTTPS: el handshake va en el accept
+            self.socket = contexto.wrap_socket(self.socket, server_side=True)
+        self._esquema = "https" if contexto is not None else "http"
+        self.aceptadas: list[socket.socket] = []
+        self.usadas: set[socket.socket] = set()   # conexiones que trajeron alguna petición
         self.mode = mode
         self.conexiones = 0
+        # Avisa de cada conexión anotada: el hilo del servidor la anota DESPUÉS del
+        # accept (y del handshake TLS), quizá cuando el cliente ya conectó.
+        self._cuenta = threading.Condition()
         self.enviados = 0
         self.colgado = threading.Event()
         self.soltar = threading.Event()
@@ -154,7 +184,10 @@ class _Server(ThreadingHTTPServer):
 
     def get_request(self):
         req = super().get_request()
-        self.conexiones += 1
+        with self._cuenta:
+            self.conexiones += 1
+            self.aceptadas.append(req[0])
+            self._cuenta.notify_all()
         return req
 
     def handle_error(self, request, client_address):  # cortes deliberados: sin traza
@@ -169,7 +202,7 @@ class _Server(ThreadingHTTPServer):
 
     @property
     def url(self) -> str:
-        return f"http://127.0.0.1:{self.server_address[1]}"
+        return f"{self._esquema}://127.0.0.1:{self.server_address[1]}"
 
 
 @pytest.fixture
@@ -195,6 +228,18 @@ def _cliente(motor: str, srv: _Server):
 def _conexiones_estables(srv: _Server) -> int:
     time.sleep(0.05)   # deja que el accept pendiente se cuente (no es una medida)
     return srv.conexiones
+
+
+def _espera_conexiones(srv: _Server, n: int, tope: float = 5.0) -> int:
+    """Espera (por evento, con tope) a que el servidor haya anotado `n` conexiones.
+
+    Para mirar la cuenta SIN una respuesta de por medio (tras un preconnect): el
+    cliente ya conectó, pero el hilo del servidor puede no haberlo anotado aún.
+    Tras una respuesta no hace falta: el servidor anotó antes de contestar.
+    """
+    with srv._cuenta:
+        assert srv._cuenta.wait_for(lambda: srv.conexiones >= n, tope)
+        return srv.conexiones
 
 
 @pytest.mark.parametrize("motor", ["glm", "ollama"])
@@ -790,3 +835,427 @@ def test_barge_in_mientras_la_nube_cae_no_arranca_el_local():
     assert corridas == []
     assert llm.degraded
     assert _historial(agent)[-1]["content"] == "(Turno interrumpido por el patrón.)"
+
+
+# --- Paso 7 (parte A): la conexión se abre mientras el patrón dice la orden ------
+# HTTPTransport.preconnect abre UN repuesto desde otro hilo (el del aviso del wake);
+# la primera petición, de cualquier hilo, se lo lleva. Con sockets de verdad: HTTP de
+# loopback y TLS 1.3 de loopback (el de la nube real), sin tocar el transporte.
+
+def _contando_conexiones(monkeypatch, transport) -> dict[str, int]:
+    """Cuántas conexiones pide cada hilo (lo que mide la sección F del bench)."""
+    por_hilo: dict[str, int] = {}
+    original = transport._connect
+
+    def contando():
+        nombre = threading.current_thread().name
+        por_hilo[nombre] = por_hilo.get(nombre, 0) + 1
+        return original()
+
+    monkeypatch.setattr(transport, "_connect", contando)
+    return por_hilo
+
+
+def _al_wake(client) -> None:
+    """Lo que hará el aviso del wake: pre-conectar en segundo plano (y aquí, para
+    medir, esperar a que termine)."""
+    from crotolamo.core.engine import preconnect_in_background
+
+    hilo = preconnect_in_background(client)
+    assert hilo is not None
+    hilo.join(timeout=5)
+    assert not hilo.is_alive()
+
+
+def test_preconnect_real_el_turno_no_conecta_nada(servidor, monkeypatch):
+    """F2 del bench con sockets de verdad: el repuesto lo abre el hilo del wake y
+    las dos llamadas del turno (la orden y la de después de la tool) van por él:
+    una conexión en total y ningún handshake en el hilo del turno."""
+    srv = servidor()
+    client = _cliente("glm", srv)
+    por_hilo = _contando_conexiones(monkeypatch, client._transport)
+
+    _al_wake(client)
+    assert _espera_conexiones(srv, 1) == 1         # conectado ANTES de la orden
+    for _ in range(2):
+        assert client.chat_stream(MSGS, on_token=lambda t: None).content == "Hola, patrón."
+
+    assert por_hilo == {"Preconnect": 1}
+    assert _conexiones_estables(srv) == 1
+
+
+def test_el_repuesto_va_por_el_mismo_camino_que_cualquier_conexion(servidor, monkeypatch):
+    """El repuesto se abre como cualquier conexión (`_connect`): el tope corto para
+    CONECTAR, el de leer de siempre después, y keepalive TCP contra la nube (el
+    que deja a `_dropped` ver una ruta caída mientras espera la orden)."""
+    from crotolamo.core import engine
+
+    srv = servidor()
+    reales, crear = socket.getaddrinfo, socket.create_connection
+    monkeypatch.setattr(socket, "getaddrinfo", lambda host, port, *a, **k: reales(
+        "127.0.0.1" if host == "nube.test" else host, port, *a, **k))
+    topes: list[float] = []
+
+    def creando(address, timeout, *args, **kwargs):
+        topes.append(timeout)
+        return crear(address, timeout, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "create_connection", creando)
+    client = GLMClient(api_key="k", timeout=60, connect_timeout=2,
+                       base_url=f"http://nube.test:{srv.server_address[1]}/api/paas/v4")
+    assert client._transport._keepalive                 # "de fuera", como api.z.ai
+
+    assert client.preconnect() is True
+    conn = client._transport._spare[0]
+    sock = conn.sock
+
+    assert isinstance(conn, engine._HTTPConnection)
+    assert topes == [2]                                 # conectar: el tope corto
+    assert sock.gettimeout() == 60                      # leer: lo de siempre
+    assert sock.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE)
+    tcp = {o: sock.getsockopt(socket.IPPROTO_TCP, getattr(socket, o))
+           for o in ("TCP_KEEPIDLE", "TCP_KEEPINTVL", "TCP_KEEPCNT")}
+    assert tcp == {"TCP_KEEPIDLE": 10, "TCP_KEEPINTVL": 5, "TCP_KEEPCNT": 3}
+    assert client.chat_stream(MSGS, on_token=lambda t: None).content == "Hola, patrón."
+    assert topes == [2] and client._transport._conn is conn   # y el turno va por él
+
+
+def test_en_el_loop_concurrente_cada_repuesto_se_usa(servidor, monkeypatch):
+    """Estado estable del loop concurrente con el wake cableado (parte B): el hilo
+    del turno contesta sin stream y su keep-alive no tiene tope de edad, así que
+    sigue vivo en cada orden. Antes, tras el primer turno ningún repuesto se usaba
+    (4 de 5 handshakes tirados y dos sockets ociosos con sondas de keepalive); ahora
+    el turno se lleva el repuesto y cierra su keep-alive, más viejo."""
+    from crotolamo.core import engine
+
+    reloj = {"t": 1000.0}
+    monkeypatch.setattr(engine, "_reloj", lambda: reloj["t"])
+    srv = servidor("entero")
+    client = _cliente("glm", srv)
+    por_hilo = _contando_conexiones(monkeypatch, client._transport)
+
+    turnos = 4
+    for _ in range(turnos):
+        _al_wake(client)
+        assert client.chat(MSGS).content == "Hola, patrón."
+        assert client._transport._spare is None          # ningún repuesto sin usar
+        reloj["t"] += 40.0                               # la orden siguiente
+
+    assert por_hilo == {"Preconnect": turnos}            # cero handshakes en el turno
+    assert _espera_conexiones(srv, turnos) == turnos
+    assert all(s in srv.usadas for s in srv.aceptadas)   # antes: 1 de 4 usada
+
+
+def test_sin_preconnect_el_turno_conecta_como_siempre(servidor, monkeypatch):
+    srv = servidor()
+    client = _cliente("glm", srv)
+    por_hilo = _contando_conexiones(monkeypatch, client._transport)
+
+    for _ in range(2):
+        client.chat_stream(MSGS, on_token=lambda t: None)
+
+    assert por_hilo == {"MainThread": 1}
+    assert _conexiones_estables(srv) == 1
+
+
+def test_preconnect_real_sin_servidor_no_lanza_ni_deja_repuesto(monkeypatch):
+    """Nube inalcanzable (puerto cerrado): False, sin repuesto, y el turno se
+    entera como hoy (el mismo error en personaje)."""
+    from crotolamo.core.llm import TransientLLMError
+
+    libre = socket.socket()
+    libre.bind(("127.0.0.1", 0))
+    puerto = libre.getsockname()[1]
+    libre.close()
+    client = GLMClient(api_key="k", base_url=f"http://127.0.0.1:{puerto}/v4", timeout=2)
+
+    assert client.preconnect() is False
+    assert client._transport._spare is None
+    with pytest.raises(TransientLLMError, match="¿Hay internet?"):
+        client.chat(MSGS)
+
+
+def test_un_wake_cerca_de_la_caducidad_del_repuesto_abre_otro(servidor, monkeypatch):
+    """Lo que midió la revisión, con cliente, transporte y servidor reales: wake 1 sin
+    turno LLM detrás, wake 2 a los 27 s y la orden al LLM 6 s después. Antes el wake 2
+    se conformaba con el repuesto de 27 s y el turno lo encontraba caducado:
+    {'Preconnect': 1, 'MainThread': 1}. Ahora el wake 2 lo renueva y cierra el viejo."""
+    from crotolamo.core import engine
+
+    reloj = {"t": 1000.0}
+    monkeypatch.setattr(engine, "_reloj", lambda: reloj["t"])
+    srv = servidor("entero")
+    client = _cliente("glm", srv)
+    por_hilo = _contando_conexiones(monkeypatch, client._transport)
+
+    _al_wake(client)                                 # wake 1 ("pausa": el fastpath)
+    viejo = client._transport._spare[0].sock
+    reloj["t"] += 27
+    _al_wake(client)                                 # wake 2
+    assert viejo.fileno() == -1                      # cerrado: nunca quedan dos
+    reloj["t"] += 6                                  # la orden y el STT
+    assert client.chat(MSGS).content == "Hola, patrón."
+
+    assert por_hilo == {"Preconnect": 2}             # cero handshakes en el turno
+    assert _espera_conexiones(srv, 2) == 2
+
+
+def test_el_repuesto_real_que_nadie_pide_se_cierra_al_caducar(servidor, monkeypatch):
+    """Wake sin turno LLM detrás: el socket del repuesto se cierra al caducar (antes
+    seguía abierto, con sondas de keepalive y luego en CLOSE_WAIT, hasta la siguiente
+    petición o el siguiente wake) y la orden siguiente conecta como siempre, sin
+    petición fallida. Con un tope de edad corto para la prueba."""
+    from crotolamo.core.engine import HTTPTransport
+
+    monkeypatch.setattr(HTTPTransport, "_SPARE_MAX_AGE_S", 0.3)
+    srv = servidor()
+    client = _cliente("glm", srv)
+    transporte = client._transport
+    por_hilo = _contando_conexiones(monkeypatch, transporte)
+    abiertas: list = []
+    contando = transporte._connect
+    monkeypatch.setattr(transporte, "_connect",
+                        lambda: abiertas.append(contando()) or abiertas[-1])
+    # El segador avisa al terminar (espera por evento, sin carreras con el reloj).
+    segado = threading.Event()
+    segar = transporte._expire_spare
+    monkeypatch.setattr(transporte, "_expire_spare",
+                        lambda conn: (segar(conn), segado.set()))
+
+    _al_wake(client)
+    assert segado.wait(timeout=5)
+
+    assert abiertas[0].sock is None and transporte._spare is None   # cerrado
+    assert client.chat_stream(MSGS, on_token=lambda t: None).content == "Hola, patrón."
+    assert por_hilo == {"Preconnect": 1, "MainThread": 1}
+    assert _espera_conexiones(srv, 2) == 2
+
+
+@pytest.fixture(scope="module")
+def certificado(tmp_path_factory):
+    """Certificado autofirmado para 127.0.0.1, hecho al vuelo: ninguna clave en el
+    repo. Sin openssl (no es el caso en Fedora ni en CI) se salta."""
+    openssl = shutil.which("openssl")
+    if openssl is None:
+        pytest.skip("sin openssl para generar el certificado de prueba")
+    carpeta = tmp_path_factory.mktemp("tls")
+    cert, key = carpeta / "cert.pem", carpeta / "key.pem"
+    try:
+        subprocess.run(
+            [openssl, "req", "-x509", "-newkey", "ec", "-pkeyopt",
+             "ec_paramgen_curve:prime256v1", "-nodes", "-keyout", str(key),
+             "-out", str(cert), "-days", "2", "-subj", "/CN=127.0.0.1",
+             "-addext", "subjectAltName=IP:127.0.0.1"],
+            check=True, capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as error:
+        pytest.skip(f"openssl no pudo generar el certificado: {error}")
+    return cert, key
+
+
+@pytest.fixture
+def servidor_tls(certificado, monkeypatch):
+    cert, key = certificado
+    # El cliente confía en él por el camino de siempre: el contexto TLS por defecto
+    # de http.client lee SSL_CERT_FILE. Del transporte no se toca nada.
+    monkeypatch.setenv("SSL_CERT_FILE", str(cert))
+    creados: list[_Server] = []
+
+    def crear(mode: str = "ok", tickets: int | None = None) -> _Server:
+        contexto = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        contexto.load_cert_chain(cert, key)
+        if tickets is not None:   # OpenSSL manda 2 de fábrica, en dos escrituras
+            contexto.num_tickets = tickets
+        srv = _Server(mode, contexto=contexto)
+        creados.append(srv)
+        return srv
+
+    yield crear
+    for srv in creados:
+        srv.parar()
+
+
+def _legible(sock, tope_s: float = 2.0) -> bool:
+    """¿select() da el socket por legible antes del tope? (espera por evento)."""
+    legible, _, _ = select.select([sock], [], [], tope_s)
+    return bool(legible)
+
+
+def test_tls13_el_repuesto_recien_abierto_no_se_tira(servidor_tls, monkeypatch):
+    """TLS 1.3 manda los tickets de sesión DESPUÉS del handshake: el repuesto, que
+    aún no leyó nada, los tiene pendientes y select() lo da por legible. Tomado
+    por un cierre, cada repuesto se tiraba al usarlo y el turno volvía a pagar el
+    handshake que el wake ya había pagado."""
+    srv = servidor_tls()
+    client = GLMClient(api_key="k", base_url=srv.url + "/api/paas/v4", timeout=5)
+    por_hilo = _contando_conexiones(monkeypatch, client._transport)
+
+    _al_wake(client)
+    sock = client._transport._spare[0].sock
+    assert isinstance(sock, ssl.SSLSocket) and sock.version() == "TLSv1.3"
+    assert _legible(sock)                          # los tickets: el caso de verdad
+
+    for _ in range(2):
+        assert client.chat_stream(MSGS, on_token=lambda t: None).content == "Hola, patrón."
+    assert por_hilo == {"Preconnect": 1}
+    assert _conexiones_estables(srv) == 1
+
+
+def test_tls_el_repuesto_que_el_servidor_cerro_se_tira_sin_escribir(servidor_tls,
+                                                                    monkeypatch):
+    """El servidor cierra el repuesto ocioso (su tope de inactividad): `_dropped`
+    lo ve antes de escribir y la orden sale por una conexión nueva, sin petición
+    fallida ni reintento."""
+    from crotolamo.core import engine
+
+    # Un solo ticket: así se sabe cuándo llegó todo lo de TLS y que lo legible
+    # de después es el cierre (con dos, el segundo puede llegar en medio).
+    srv = servidor_tls(tickets=1)
+    client = GLMClient(api_key="k", base_url=srv.url + "/api/paas/v4", timeout=5)
+    _al_wake(client)
+    repuesto = client._transport._spare[0]
+    assert _legible(repuesto.sock)                 # llegó el ticket...
+    assert engine._dropped(repuesto) is False      # ...y no es un cierre
+    assert not _legible(repuesto.sock, 0)          # (ya procesado)
+    escritas: list[str] = []
+    original = repuesto.request
+    repuesto.request = lambda *a, **k: escritas.append("x") or original(*a, **k)
+
+    _espera_conexiones(srv, 1)                     # el accept puede ir por detrás
+    srv.aceptadas[0].shutdown(socket.SHUT_RDWR)    # el servidor lo cuelga
+    assert _legible(repuesto.sock)                 # el EOF llegó
+
+    assert client.chat_stream(MSGS, on_token=lambda t: None).content == "Hola, patrón."
+    assert escritas == []                          # ni un byte al socket muerto
+    assert repuesto.sock is None                   # cerrado
+    assert _conexiones_estables(srv) == 2
+
+
+def test_tls_el_keepalive_tras_una_respuesta_se_sigue_reutilizando(servidor_tls,
+                                                                  monkeypatch):
+    """La comprobación de vida que entiende TLS no cambia la reutilización de
+    siempre: N streams sobre HTTPS = 1 conexión."""
+    srv = servidor_tls()
+    client = GLMClient(api_key="k", base_url=srv.url + "/api/paas/v4", timeout=5)
+    por_hilo = _contando_conexiones(monkeypatch, client._transport)
+
+    for _ in range(3):
+        client.chat_stream(MSGS, on_token=lambda t: None)
+
+    assert por_hilo == {"MainThread": 1}
+    assert _conexiones_estables(srv) == 1
+
+
+@pytest.mark.parametrize("nombre", [
+    "test_preconnect_real_el_turno_no_conecta_nada",
+    "test_tls13_el_repuesto_recien_abierto_no_se_tira",
+    "test_tls_el_repuesto_que_el_servidor_cerro_se_tira_sin_escribir",
+])
+def test_las_cuentas_del_servidor_no_dependen_del_reparto_de_cpu(nombre, request,
+                                                                  monkeypatch):
+    """El hilo del servidor anota la conexión DESPUÉS del accept (y del handshake
+    TLS, que va dentro): en una máquina cargada (CI) el cliente ya conectó y la
+    cuenta aún no consta. Lo que se mira sin una respuesta de por medio espera a esa
+    cuenta (`_espera_conexiones`), no a un sleep; aquí el retraso se fuerza."""
+    import inspect
+    import socketserver
+
+    original = socketserver.TCPServer.get_request
+
+    def lento(self):
+        req = original(self)
+        time.sleep(0.1)          # el hilo del servidor tarda en volver a tener CPU
+        return req
+
+    monkeypatch.setattr(socketserver.TCPServer, "get_request", lento)
+    prueba = globals()[nombre]
+    prueba(**{p: monkeypatch if p == "monkeypatch" else request.getfixturevalue(p)
+              for p in inspect.signature(prueba).parameters})
+
+
+# --- Paso 8 (parte A): [voice].stream_release llega al agente ----------------------
+# ToolAgent ya sabía soltar en "sentence"; nadie le pasaba la clave, así que con
+# GLM de cerebro stream_speak no adelantaba nada y no había forma de pedirlo.
+
+def _build_agent_con_voz(monkeypatch, tmp_path, voz: dict, backend: str = "glm"):
+    """build_agent REAL con la [voice] dada; el motor es de mentiras (no conversa)."""
+    from crotolamo import settings as settings_mod
+    from crotolamo.core import hooks
+    from crotolamo.core import memoria as memoria_mod
+    from crotolamo.core.fallback import FallbackLLM
+    from crotolamo.settings import Settings
+    from interfaces import shell
+
+    class _Mudo:
+        model = "x"
+
+        def chat(self, messages, tools=None):
+            raise AssertionError("este test no conversa")
+
+    monkeypatch.delenv("CROTOLAMO_LLM_BACKEND", raising=False)
+    monkeypatch.setattr(settings_mod, "_SETTINGS",
+                        Settings(raw={"llm": {"backend": backend}, "voice": voz},
+                                 user="test", home=tmp_path))
+    monkeypatch.setattr(memoria_mod, "get_memoria",
+                        lambda: type("M", (), {"enabled": False})())
+    monkeypatch.setattr(hooks, "make_facts_prehook", lambda: (lambda text: text))
+    monkeypatch.setattr(hooks, "make_pinned_facts_prehook", lambda conv: (lambda text: text))
+    llm = FallbackLLM(_Mudo(), _Mudo()) if backend == "glm" else _Mudo()
+    monkeypatch.setattr(shell, "build_llm", lambda s: llm)
+    agent, _ = shell.build_agent()
+    agent.close()
+    return agent
+
+
+@pytest.mark.parametrize("backend", ["glm", "ollama"])
+def test_build_agent_pasa_stream_release_de_la_voz(monkeypatch, tmp_path, backend):
+    from crotolamo.core.agent import ToolAgent
+
+    agent = _build_agent_con_voz(monkeypatch, tmp_path, {"stream_release": "sentence"},
+                                 backend)
+    assert isinstance(agent, ToolAgent)
+    assert agent.stream_release == "sentence"
+
+
+def test_build_agent_sin_la_clave_retiene_como_siempre(monkeypatch, tmp_path):
+    assert _build_agent_con_voz(monkeypatch, tmp_path, {}).stream_release == "final"
+
+
+@pytest.mark.parametrize("raro", ["sentense", 1, ""])
+def test_build_agent_stream_release_raro_cae_a_final_avisando(monkeypatch, tmp_path,
+                                                             caplog, raro):
+    """Un typo en el toml no deja al patrón sin voz ni habla preámbulos: "final" y
+    un WARNING que dice qué valores valen."""
+    with caplog.at_level(logging.WARNING, logger="crotolamo.core.agent"):
+        agent = _build_agent_con_voz(monkeypatch, tmp_path, {"stream_release": raro})
+    assert agent.stream_release == "final"
+    assert any("stream_release" in r.getMessage() for r in caplog.records)
+
+
+def test_config_de_fabrica_documenta_stream_release_y_retiene():
+    """La clave está documentada junto a stream_speak, comentada con su valor de
+    fábrica ("final" = lo de siempre), con lo que cuesta y lo que gana."""
+    import re
+    import tomllib
+
+    from crotolamo.settings import DEFAULT_CONFIG
+
+    texto = DEFAULT_CONFIG.read_text(encoding="utf-8")
+    assert "stream_release" not in tomllib.loads(texto)["voice"]   # de fábrica: "final"
+    voz = re.split(r"^\[voice\]$", texto, maxsplit=1, flags=re.M)[1]
+    voz = re.split(r"^\[", voz, maxsplit=1, flags=re.M)[0]
+    lineas = voz.splitlines()
+    i = next(n for n, linea in enumerate(lineas)
+             if re.match(r'^#\s*stream_release\s*=\s*"final"\s*$', linea))
+    # En el grupo de hablar: tras stream_speak (las claves de hablar del loop
+    # concurrente pueden ir en medio) y antes de las ventanas del wake.
+    hablar = next(n for n, linea in enumerate(lineas) if linea.startswith("stream_speak ="))
+    assert hablar < i
+    assert not [linea for linea in lineas[hablar:i] if linea.startswith("wake_")]
+    comentario = []
+    for linea in reversed(lineas[:i]):
+        if not linea.startswith("#"):
+            break
+        comentario.insert(0, linea.lstrip("#").strip())
+    explicacion = " ".join(comentario)
+    for dato in ('"sentence"', "preámbulo", "1.7", "0.6", "habría hablado", "INFO"):
+        assert dato in explicacion, dato

@@ -129,6 +129,7 @@ def _dropped(conn: Any) -> bool:
     vio la ruta caída). Mismo criterio que is_connection_dropped de urllib3.
     Sin socket que mirar (aún sin conectar, o los dobles de los tests) cuenta
     como vivo; con un descriptor que select() no admite, también (como antes).
+    Sobre TLS, lo legible puede ser solo TLS (ver `_tls_cerrado`).
     """
     sock: Any = getattr(conn, "sock", None)
     fileno = getattr(sock, "fileno", None)
@@ -142,7 +143,34 @@ def _dropped(conn: Any) -> bool:
         return False  # descriptor >= FD_SETSIZE (1024): no se puede mirar
     except OSError:
         return True
+    if legible and isinstance(sock, ssl.SSLSocket):
+        return _tls_cerrado(sock)
     return bool(legible)
+
+
+def _tls_cerrado(sock: ssl.SSLSocket) -> bool:
+    """¿Lo legible de un socket TLS quieto es un cierre, o solo mensajes de TLS?
+
+    TLS 1.3 manda los tickets de sesión DESPUÉS del handshake: una conexión recién
+    abierta que aún no leyó nada (el repuesto de `HTTPTransport.preconnect`) los
+    tiene pendientes y select() la da por legible sin que le pase nada (medido
+    contra un servidor TLS 1.3 de loopback; con TLS 1.2, no). Sin esto, cada
+    repuesto se tiraba al usarlo. Una lectura SIN bloquear los procesa: si no queda
+    nada para la aplicación, OpenSSL pide más y la conexión sigue viva; un EOF, un
+    RST o bytes que nadie pidió (un 408 antes de colgar) la dan por muerta.
+    """
+    try:
+        previo = sock.gettimeout()
+        sock.settimeout(0)
+        try:
+            sock.recv(1)  # b"" = EOF; un byte = algo que nadie pidió
+        finally:
+            sock.settimeout(previo)
+    except (ssl.SSLWantReadError, ssl.SSLWantWriteError):
+        return False  # solo eran mensajes de TLS: sigue viva
+    except (OSError, ValueError):
+        return True
+    return True
 
 
 class _HTTPConnection(http.client.HTTPConnection):
@@ -243,6 +271,14 @@ class HTTPTransport:
     conexión del hilo que lo llama (nadie necesita hoy un cierre global; los
     sockets de hilos muertos los recoge el GC).
 
+    Pre-conexión (`preconnect`): UNA conexión de repuesto, abierta desde otro
+    hilo (el aviso del wake) mientras el patrón dice la orden. No es de ningún
+    hilo: se la lleva entera la PRIMERA petición que llega, de cualquier hilo, y
+    releva al keep-alive de ese hilo si tenía uno (ver post_json), así que el
+    modelo por hilo no cambia. Uno que nadie pide lo cierra su segador (un Timer
+    daemon, cancelado si alguien se lo lleva) al cumplir _SPARE_MAX_AGE_S. Sin
+    repuesto, todo es exactamente como arriba.
+
     Stdlib puro, igual que el resto del proyecto: cero dependencias.
     """
 
@@ -268,6 +304,17 @@ class HTTPTransport:
         # consumidor avisó que .last llegó a su fin lógico) y .finished_at
         # (cuándo, con `_reloj`). Ver docstring.
         self._local = threading.local()
+        # El repuesto de `preconnect`: (conexión ya conectada, cuándo se abrió con
+        # `_reloj`) o None. Compartido entre hilos, por eso bajo su lock; el lock
+        # solo cubre tomarlo o dejarlo, nunca la red.
+        self._spare: tuple[http.client.HTTPConnection, float] | None = None
+        # Su segador (ver preconnect): cierra el repuesto que nadie pidió al caducar.
+        # Va y viene con `_spare`, bajo el mismo lock.
+        self._spare_reaper: threading.Timer | None = None
+        self._spare_lock = threading.Lock()
+        # Una sola pre-conexión en vuelo: wakes seguidos con el DNS colgado no
+        # apilan hilos ni sockets (el segundo vuelve al momento).
+        self._preconnecting = threading.Lock()
 
     @property
     def _conn(self) -> http.client.HTTPConnection | None:
@@ -376,6 +423,132 @@ class HTTPTransport:
         self._local.finishable = False
         self._local.keepalive_off = False
 
+    # Un repuesto de `preconnect` solo sirve a la petición que llega en estos
+    # segundos: la orden que el patrón dice tras el wake (unos segundos de voz
+    # más el STT). Más tarde se cierra sin usarlo y se conecta como siempre: un
+    # socket viejo puede haber muerto sin avisar (cambio de wifi, NAT). Más largo
+    # que _REUSE_MAX_IDLE_S porque el repuesto conserva el keepalive TCP, así que
+    # `_dropped` ve un corte de hace 15-25 s, como en el keep-alive ocioso tras
+    # una respuesta leída entera (que ni siquiera tiene tope de edad).
+    _SPARE_MAX_AGE_S = 30.0
+    # La vida que un wake necesita que le quede al repuesto que encuentra: se usa
+    # DESPUÉS, con la orden (hasta 4 s esperando la primera voz, la frase, el
+    # silencio de corte, las rondas del endpoint) y el STT. Con menos, `preconnect`
+    # abre otro: antes se conformaba con uno a punto de caducar, decía True y el
+    # turno pagaba el handshake igual (medido: repuesto de 27 s y 6 s de orden).
+    # Precio: wakes seguidos abren como mucho uno cada 15 s, no cada 30.
+    _SPARE_MIN_LIFE_S = 15.0
+
+    def _spare_usable(self, conn: Any, opened_at: float, life_left: float = 0.0) -> bool:
+        """El repuesto sigue en edad (con `life_left` s por delante) y el kernel no
+        lo dio por muerto."""
+        return (_reloj() - opened_at <= self._SPARE_MAX_AGE_S - life_left
+                and not _dropped(conn))
+
+    @staticmethod
+    def _discard(conn: Any) -> None:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001 - cerrar es best-effort
+            pass
+
+    def preconnect(self) -> bool:
+        """Abre por adelantado UNA conexión de repuesto (TCP y, en HTTPS, TLS).
+
+        Para pagar el handshake mientras el patrón dice la orden, no dentro del
+        turno. Mismo camino que cualquier conexión (`_connect`: tope de conectar,
+        keepalive TCP, contexto TLS); la primera petición que llega, de cualquier
+        hilo, se la lleva (`_take_spare`). Con un repuesto vivo y al que aún le
+        quedan _SPARE_MIN_LIFE_S, no hace nada. El que nadie pide lo cierra su
+        segador al cumplir _SPARE_MAX_AGE_S (`_expire_spare`).
+
+        Nunca lanza: es una optimización. Sin red, o con otra pre-conexión aún en
+        curso, devuelve False y el turno conecta como siempre. True = hay un
+        repuesto listo.
+        """
+        if not self._preconnecting.acquire(blocking=False):
+            return False
+        try:
+            with self._spare_lock:
+                if self._spare is not None and self._spare_usable(
+                        *self._spare, life_left=self._SPARE_MIN_LIFE_S):
+                    return True
+            conn = None
+            try:
+                conn = self._connect()
+                conn.connect()
+            except Exception as error:  # noqa: BLE001 - nunca tumba a quien avisa
+                log.debug("preconnect: no pude abrir la conexión de repuesto (%s)", error)
+                if conn is not None:
+                    self._discard(conn)
+                return False
+            # El segador: sin él, tras un wake sin turno LLM (falso wake, una orden
+            # del fastpath) el repuesto seguía abierto pasados sus 30 s, con sondas
+            # de keepalive cada 10 s y luego en CLOSE_WAIT, hasta la siguiente
+            # petición o el siguiente wake (horas, en el servicio 24/7). Un Timer
+            # daemon espera sin sondear; se cancela si una petición se lleva el
+            # repuesto o lo releva otro, así que hay uno vivo como mucho.
+            segador = threading.Timer(self._SPARE_MAX_AGE_S, self._expire_spare, (conn,))
+            segador.name = "PreconnectReaper"
+            segador.daemon = True
+            with self._spare_lock:
+                viejo, self._spare = self._spare, (conn, _reloj())
+                segador_viejo, self._spare_reaper = self._spare_reaper, segador
+            if segador_viejo is not None:
+                segador_viejo.cancel()
+            if viejo is not None:
+                self._discard(viejo[0])  # caducado, caído o con poca vida: nunca dos
+            try:
+                segador.start()
+            except RuntimeError as error:
+                # Sin hilos libres: el repuesto vale igual y caduca como antes, al
+                # pedirlo o en el wake siguiente (cancel() de uno sin arrancar, nada).
+                log.debug("preconnect: no pude arrancar el segador del repuesto (%s)", error)
+            log.debug("preconnect: conexión de repuesto lista")
+            return True
+        finally:
+            self._preconnecting.release()
+
+    def _expire_spare(self, conn: Any) -> None:
+        """El segador: el repuesto cumplió _SPARE_MAX_AGE_S sin que nadie lo pidiera.
+
+        Corre en el hilo del Timer de `preconnect`. Solo cierra si el repuesto
+        guardado sigue siendo `conn`: si ya se lo llevó una petición, o lo relevó
+        otro wake, no toca nada. Nada sale de aquí: queda en el log. El Timer cuenta
+        con monotonic, que no avanza con el portátil suspendido: tras despertar llega
+        tarde, pero `_take_spare` mide con `_reloj` y no usa uno caducado igual.
+        """
+        try:
+            with self._spare_lock:
+                if self._spare is None or self._spare[0] is not conn:
+                    return
+                self._spare, self._spare_reaper = None, None
+            log.debug("la conexión abierta por adelantado caducó sin usarse: la cierro")
+            self._discard(conn)
+        except Exception:  # noqa: BLE001 - el segador nunca tumba nada
+            log.debug("no pude cerrar la conexión de repuesto caducada", exc_info=True)
+
+    def _take_spare(self) -> http.client.HTTPConnection | None:
+        """El repuesto de `preconnect`, entero para el hilo que lo pide, o None.
+
+        Uno caducado o caído se cierra en silencio y la petición conecta como
+        siempre, sin escribir en un socket muerto.
+        """
+        with self._spare_lock:
+            spare, self._spare = self._spare, None
+            segador, self._spare_reaper = self._spare_reaper, None
+        if segador is not None:
+            segador.cancel()  # sale en el acto: el repuesto ya no espera a nadie
+        if spare is None:
+            return None
+        conn, opened_at = spare
+        if self._spare_usable(conn, opened_at):
+            log.debug("uso la conexión abierta por adelantado")
+            return conn
+        log.debug("la conexión abierta por adelantado caducó o se cayó: conecto otra")
+        self._discard(conn)
+        return None
+
     def _reuse_or_close(self) -> None:
         """La política de reutilización del keep-alive: UNA, para stream y no-stream.
 
@@ -431,7 +604,21 @@ class HTTPTransport:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8", errors="replace")
         hdrs = {"Content-Type": "application/json", **(headers or {})}
 
-        self._reuse_or_close()
+        # El repuesto de preconnect, si lo hay y sigue sano, releva incluso a un
+        # keep-alive propio vivo: es la conexión más nueva (comprobada, <= 30 s) y su
+        # handshake ya está pagado. En el loop concurrente BrainThread contesta sin
+        # stream y su keep-alive no caduca: si el repuesto fuera solo para un hilo
+        # sin conexión, no se usaría nunca tras el primer turno (un handshake tirado
+        # por wake y dos sockets ociosos con sondas de keepalive). Se mira UNA vez,
+        # antes del primer intento: el reintento de abajo conecta de nuevo, como
+        # siempre (tras un cambio de red el repuesto puede estar tan muerto como el
+        # propio). Sin repuesto, todo es como antes.
+        spare = self._take_spare()
+        if spare is not None:
+            self.close()  # el keep-alive propio, si lo había: no quedan dos
+            self._conn = spare
+        else:
+            self._reuse_or_close()
 
         url = f"{self.base_path}{path}"
         for intento in (1, 2):
@@ -459,6 +646,36 @@ class HTTPTransport:
             self._last = resp
             return resp
         raise AssertionError("inalcanzable")  # pragma: no cover
+
+
+def preconnect_in_background(llm: Any) -> threading.Thread | None:
+    """Pre-conecta el motor `llm` en un hilo daemon, si sabe hacerlo.
+
+    Para el aviso del wake: el handshake TCP+TLS con la nube se paga mientras el
+    patrón dice la orden, no dentro del turno (ver HTTPTransport.preconnect). Sin
+    un `preconnect` llamable (un motor de mentiras, un agente raro) no arranca
+    nada. El hilo vive lo que tarda en conectar (el DNS y luego el tope de
+    conectar por dirección, como cualquier petición; uno solo a la vez por
+    transporte) y ningún error sale de él: queda en el log. Devuelve el hilo,
+    para que su dueño lo espere con un tope al apagar, o None.
+    """
+    preconnect = getattr(llm, "preconnect", None)
+    if not callable(preconnect):
+        return None
+
+    def _run() -> None:
+        try:
+            preconnect()
+        except Exception:  # noqa: BLE001 - una optimización nunca tumba al wake
+            log.debug("preconnect en segundo plano falló", exc_info=True)
+
+    hilo = threading.Thread(target=_run, name="Preconnect", daemon=True)
+    try:
+        hilo.start()
+    except RuntimeError as error:  # sin hilos libres: el turno conecta como siempre
+        log.debug("preconnect: no pude arrancar el hilo (%s)", error)
+        return None
+    return hilo
 
 
 def resolve_backend(settings) -> str:

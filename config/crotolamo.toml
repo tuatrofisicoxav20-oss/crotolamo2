@@ -469,6 +469,22 @@ ack = "beep"
 # la música..."); el adelanto de la primera palabra solo aplica a la charla del motor
 # local (turnos sin tools).
 stream_speak = true
+# Cuándo se suelta al TTS (o a `shell --stream`) la respuesta de una llamada con
+# tools a la vista; con backend="glm", todas (el OJO de stream_speak). "final" (de
+# fábrica, lo de siempre) = retenerla hasta el final del stream: el preámbulo de un
+# tool-call nunca se oye. "sentence" = soltarla en cuanto cierra la 1ª frase y le
+# sigue más texto. MEDIDO (bench, GLM a 400 ms hasta el 1er token + 30 tok/s): la primera
+# palabra de una charla de 3 frases pasa de 1.7 s a 0.6 s; la de la respuesta tras
+# una tool, de 2.1 a 1.7 s; con el respaldo local, de 11.5 a 9.3 s. El precio: un
+# preámbulo de UNA frase antes del tool-call sigue sin oírse, pero uno de dos o más
+# SÍ ("¡Claro que sí, patrón! Voy a revisar la memoria." y luego la respuesta): nada
+# en el stream permite descartarlo antes de que acabe. Para decidir con tu GLM real:
+# con "final", cada vez que "sentence" habría hablado un preámbulo queda en el log en
+# INFO ("stream_release: 'sentence' habría hablado un preámbulo de N caracteres").
+# Solo cuenta donde se habla en streaming: stream_speak del loop simple,
+# stream_speak_concurrent del concurrente (de fábrica responde entero) y shell
+# --stream. Un valor desconocido cae a "final" con un aviso.
+# stream_release = "final"
 # Ventanas del WAKE: silencio de corte chico (400ms detecta "crotolamo" solo
 # casi al instante), pero tope AMPLIO para que "crotolamo pausa la música"
 # dicho DE CORRIDO quepa completo y se atienda directo (sin segundo turno de
