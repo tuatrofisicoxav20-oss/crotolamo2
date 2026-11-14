@@ -11,17 +11,20 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import signal
 import sys
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from time import monotonic as _monotonic
 from typing import Any, Callable
 
 from crotolamo.logging_setup import get_logger
 from crotolamo.settings import Settings, get_settings
 from crotolamo.voice import wake
+from crotolamo.voice.capture import MicFailed, MicSession
 from crotolamo.voice.media_aware import (
     Ducker,
     MediaBackend,
@@ -37,8 +40,9 @@ from crotolamo.voice.state import (
     make_file_publisher,
     read_control_enabled,
 )
-from crotolamo.voice.stt import STT, VoiceUnavailable
-from crotolamo.voice.tts import TTS, StreamSpeaker
+from crotolamo.voice.stt import STT, VoiceUnavailable, warm_vad
+from crotolamo.voice.tts import TTS, StreamSpeaker, _AvisoEnFraseAparte
+from crotolamo.voice.vad import DEFAULTS
 from crotolamo.voice.wakeword import WakeWordDetector
 
 from interfaces.shell import build_agent
@@ -63,13 +67,25 @@ _TMP_STALE_S = 60.0
 # el BrainThread del loop concurrente (crotolamo/voice/threads.py) en el mismo caso.
 _TURNO_ROTO = "Se me trabaron los cables, patrón. Vuelve a intentarlo."
 
+# Banda bajo el umbral del wake difuso que todavía se loguea a INFO (ver
+# _log_heard): los mishears reales de "crotolamo" medidos dan 0.57-0.67 y las
+# cabezas de la tele 0.13-0.50; con el umbral de fábrica (0.72) entran desde 0.55.
+_CASI_WAKE = 0.17
+
+# Espera máxima, al salir run_listen, a la carga de modelo que el calentador
+# (WarmVoice) tenga en curso. Lo que quede en cola ya no se carga; esto solo evita
+# que el intérprete se apague con una carga nativa a medias, sin colgar la salida.
+_WARM_STOP_S = 2.0
+
 
 @dataclass
 class ListenerConfig:
     """Ajustes del bucle de voz, leídos UNA vez de la config.
 
     Antes vivían como una maraña de variables locales al principio de
-    run_listen; agrupados aquí se pueden pasar enteros al loop simple.
+    run_listen; agrupados aquí se pueden pasar enteros al loop simple. Los
+    valores de fábrica que comparte con stt/threads/loop salen de la tabla
+    DEFAULTS (crotolamo/voice/vad.py).
     """
 
     # Wake word.
@@ -78,21 +94,37 @@ class ListenerConfig:
     wake_silence_ms: int = 400
     wake_max_s: float = 8.0
     # Grabación del comando (VAD / endpointing inteligente).
-    silence_ms: int = 800
+    silence_ms: int = DEFAULTS.silence_ms_listener
     smart_endpoint: bool = True
-    endpoint_rounds: int = 2
-    endpoint_continue_s: float = 2.5
+    endpoint_rounds: int = DEFAULTS.endpoint_rounds
+    endpoint_continue_s: float = DEFAULTS.endpoint_continue_s
     followup_s: float = 6.0
     hotwords: str | None = None
     # Velocidad percibida.
     ack: str = "beep"  # "beep" | "voz" | "off"
     stream_speak: bool = True
+    # El loop concurrente habla en streaming (BrainThread): clave propia, apagada.
+    stream_speak_concurrent: bool = False
     # Wake con música sonando (ver crotolamo/voice/media_aware.py).
     threshold_media: float = 0.85
     media_poll_s: float = 1.5
     media_watch: str = "follow"  # "follow" (eventos) | "poll" (el sondeo de antes)
     duck: bool = True
     duck_volume: float = 0.2
+    # Captura (ver crotolamo/voice/capture.py y _abrir_sesion_mic).
+    audio_session: bool = False
+    mic_give_up_s: float = 90.0
+    # Constantes de los loops: no son clave de la config (antes eran literales
+    # sueltos en cada loop); cambiar una es cambiar esta línea.
+    command_start_timeout_s: float = DEFAULTS.command_start_timeout_s  # espera de la orden
+    wake_window_s: float = 6  # ventana del wake difuso esperando voz
+    min_audio_s: float = 0.3  # una grabación más corta no pasa por Whisper (simple)
+    confirm_max_s: float = 5  # tope de la respuesta de voice_confirm
+    post_reply_guard_s: float = 0.5  # guarda tras responder, antes del followup (simple)
+    post_speak_grace_s: float = DEFAULTS.post_speak_grace_s  # oído concurrente tras un turno
+    # Tope de una orden: el oído concurrente lo recibe de aquí; el loop simple usa
+    # el de STT (el mismo de la tabla) para no cambiar sus llamadas.
+    max_command_s: float = DEFAULTS.max_command_s
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "ListenerConfig":
@@ -114,16 +146,18 @@ class ListenerConfig:
             duck_volume=voice.get("wake_duck_volume", 0.2),
             wake_silence_ms=voice.get("wake_silence_ms", 400),
             wake_max_s=voice.get("wake_max_seconds", 8.0),
-            silence_ms=voice.get("vad_silence_ms", 800),
+            silence_ms=voice.get("vad_silence_ms", DEFAULTS.silence_ms_listener),
             # Endpointing inteligente: si la frase parece a medias (pausa de
             # pensar), reabrir la escucha y concatenar.
             smart_endpoint=voice.get("smart_endpoint", True),
-            endpoint_rounds=voice.get("endpoint_max_rounds", 2),
-            endpoint_continue_s=voice.get("endpoint_continue_s", 2.5),
+            endpoint_rounds=voice.get("endpoint_max_rounds", DEFAULTS.endpoint_rounds),
+            endpoint_continue_s=voice.get("endpoint_continue_s", DEFAULTS.endpoint_continue_s),
             # followup_s > 0 = tras responder, seguir escuchando esa ventana
             # SIN exigir "crotolamo" de nuevo (conversación).
             followup_s=voice.get("followup_s", 6.0),
             # Hotwords solo para COMANDOS (post-wake), igual que el loop concurrente.
+            # Sin la clave, este loop no sesga y el concurrente sí (ver
+            # DEFAULTS.hotwords_concurrent): diferencia de hoy, decisión K.
             hotwords=voice.get("hotwords") or None,
             # ack = acuse tras el wake ("beep" instantáneo, "voz" habla "Te
             # escucho" ~1s, "off" nada). stream_speak habla cada frase conforme
@@ -132,6 +166,14 @@ class ListenerConfig:
             # de grabación chico.
             ack=voice.get("ack", "beep"),
             stream_speak=voice.get("stream_speak", True),
+            # stream_speak es solo del loop simple (de fábrica true); el
+            # concurrente habla en streaming solo con su propia clave.
+            stream_speak_concurrent=bool(voice.get("stream_speak_concurrent", False)),
+            # audio_session: el micrófono abierto toda la sesión de escucha (false
+            # = un stream por grabación, lo de siempre). mic_give_up_s: con la
+            # sesión y bajo systemd, cuánto fallo seguido aguanta antes de salir.
+            audio_session=bool(voice.get("audio_session", False)),
+            mic_give_up_s=voice.get("mic_give_up_s", 90.0),
         )
 
 
@@ -428,38 +470,72 @@ def _install_signal_handlers() -> None:
             pass  # p.ej. si no estamos en el hilo principal
 
 
-class _AvisoEnFraseAparte:
-    """on_token del loop simple: el aviso de un LLM que se cae a media respuesta
-    se habla como frase PROPIA, no pegado a la frase cortada.
+class _Reintentos:
+    """Cuánto espera el loop simple tras un error y si lo vuelve a imprimir.
 
-    El agente lo emite como su último token, on_token("\\n" + aviso), y devuelve
-    el aviso. StreamSpeaker no corta en un salto de línea suelto (cómo suenan
-    los saltos en general es decisión pendiente, voice-runtime#18), así que se
-    oía "La capital de Francia es GLM no respondió a tiempo...". Por eso un
-    token que empieza por salto se retiene hasta el siguiente, y entonces pasa
-    tal cual (la misma segmentación de siempre, un token más tarde), o hasta el
-    final del turno: si era "\\n" + la respuesta, va tras un salto doble, que sí
-    cierra frase.
+    Antes cada vuelta fallida era print + sleep(1): con el micrófono caído (el
+    stream no abre y revienta al instante) eran 119 líneas a stdout por minuto,
+    171.360 al día en el journal, y otras tantas aperturas del dispositivo. Ahora
+    la espera crece 1, 2, 4... hasta max_s y cada mensaje DISTINTO se imprime una
+    vez por racha. La racha acaba con el primer éxito (ok()) o si el reintento
+    anduvo bien más de max_s antes de fallar: eso es otro incidente, no el mismo
+    que sigue (openWakeWord por llamada solo vuelve con un wake, así que su
+    escucha buena no llega a llamar a ok()).
+
+    El reloj va aparte del `time` del módulo (monotonic importado tal cual): la
+    espera se mide aunque time.sleep esté sustituido.
     """
 
-    def __init__(self, feed: Callable[[str], None]) -> None:
-        self._feed = feed
-        self._retenido: str | None = None
+    def __init__(self, min_s: float = 1.0, max_s: float = 30.0,
+                 reloj: Callable[[], float] = _monotonic) -> None:
+        self.min_s = min_s
+        self.max_s = max_s
+        self._reloj = reloj
+        self._espera = min_s
+        self._vistos: set[str] = set()
+        self._reintento_en: float | None = None  # cuándo arrancó el último reintento
 
-    def __call__(self, token: str) -> None:
-        retenido, self._retenido = self._retenido, None
-        if retenido is not None:
-            self._feed(retenido)
-        if token.startswith("\n"):
-            self._retenido = token
-        else:
-            self._feed(token)
+    def ok(self) -> None:
+        self._espera = self.min_s
+        self._vistos.clear()
+        self._reintento_en = None
 
-    def cerrar(self, reply: str) -> None:
-        """Fin del turno: suelta lo retenido, como frase aparte si era el aviso."""
-        retenido, self._retenido = self._retenido, None
-        if retenido is not None:
-            self._feed("\n" + retenido if retenido == "\n" + reply else retenido)
+    def fallo(self, error: BaseException) -> tuple[bool, bool, float]:
+        """Anota un fallo: (primero de la racha, mensaje nuevo, segundos a esperar)."""
+        ahora = self._reloj()
+        if self._reintento_en is not None and ahora - self._reintento_en >= self.max_s:
+            self.ok()
+        primero = self._reintento_en is None
+        mensaje = str(error)
+        nuevo = mensaje not in self._vistos
+        self._vistos.add(mensaje)
+        espera = self._espera
+        self._espera = min(espera * 2, self.max_s)
+        self._reintento_en = ahora + espera
+        return primero, nuevo, espera
+
+
+def _log_heard(heard: str, threshold: float, variants: Any, activated: bool) -> None:
+    """Diagnóstico del wake difuso sin volcar al journal lo que se habla en casa.
+
+    Se logueaba a INFO la transcripción ENTERA de cada ventana con voz: con la
+    tele puesta, 12 líneas por minuto (720 por hora) citando lo que se dice en el
+    cuarto, aunque la escucha estuviera en pausa. Lo que sirve para afinar
+    [wake].variants es cómo transcribe Whisper el "crotolamo" del patrón: a INFO
+    van solo las activaciones y los casi-wakes (score de las 3 primeras palabras,
+    las que mira split_wake_command, >= umbral - _CASI_WAKE), con su score y solo
+    esas 3 palabras. La transcripción entera va a DEBUG, o a INFO como siempre
+    con CROTOLAMO_WAKE_DEBUG=1 (validación del micro: el journal de antes).
+    """
+    if os.environ.get("CROTOLAMO_WAKE_DEBUG", "") not in ("", "0"):
+        log.info("wake difuso oyó: %r", heard)
+        return
+    log.debug("wake difuso oyó: %r", heard)
+    head = " ".join(heard.split()[:3])
+    score, _ = wake.wake_score(head, variants)
+    if activated or score >= threshold - _CASI_WAKE:
+        log.info("wake difuso: score=%.2f (umbral=%.2f) cabeza=%r -> %s",
+                 score, threshold, head, "ACTIVA" if activated else "no")
 
 
 def _run_simple_loop(
@@ -474,6 +550,8 @@ def _run_simple_loop(
     say: Callable[[str], None],
     media: MediaMonitor | None = None,
     ducker: Ducker | None = None,
+    pregate: _PreFiltro | None = None,
+    mic: MicSession | None = None,
 ) -> int:
     """Bucle secuencial clásico (--simple o sin openWakeWord): espera el wake,
     graba la orden, la atiende y vuelve a esperar. Extraído de run_listen para
@@ -483,22 +561,41 @@ def _run_simple_loop(
     EXACTAMENTE como antes. Con monitor, el wake difuso usa su umbral dinámico
     (más alto con música sonando); con ducker, la música se atenúa durante toda
     la interacción y se restaura pase lo que pase.
-    """
 
-    def listen_command(start_timeout_s: float = 4.0) -> str:
+    pregate ([wake].pregate, ver _choose_pregate): compuerta de openWakeWord
+    delante del wake difuso. None (de fábrica) = la grabación de siempre.
+
+    mic ([voice].audio_session, ver _abrir_sesion_mic): la sesión que tiene el
+    micrófono abierto todo el loop; todas las grabaciones leen de ella. None (de
+    fábrica) = cada grabación abre y cierra su stream, lo de siempre. Con ella
+    se oye lo que antes caía en los huecos entre grabaciones (Whisper
+    decodificando el wake o la primera parte de una orden, el atenuado de la
+    música); lo que el stream cerrado tampoco oía a propósito (Crotolamo
+    hablando, la guarda tras responder, la pausa del panel) se tira o se cierra.
+    """
+    # Sin sesión, las grabaciones reciben exactamente los argumentos de siempre.
+    fuente: dict[str, Any] = {} if mic is None else {"source": mic}
+
+    def descartar_captura() -> None:
+        """Lo capturado hasta aquí no es del patrón (la voz de Crotolamo, la
+        guarda tras responder): fuera, como cuando el stream estaba cerrado."""
+        if mic is not None:
+            mic.flush()
+
+    def listen_command(start_timeout_s: float = cfg.command_start_timeout_s) -> str:
         # min_audio_s: si nadie habló, NO se transcribe el silencio (Whisper
         # paddea a 30s; eso costaba ~1s de mic sordo por ventana vacía).
         if cfg.smart_endpoint:
             return stt.listen_smart(
                 silence_ms=cfg.silence_ms, start_timeout_s=start_timeout_s,
                 rounds=cfg.endpoint_rounds, continue_timeout_s=cfg.endpoint_continue_s,
-                hotwords=cfg.hotwords, min_audio_s=0.3,
+                hotwords=cfg.hotwords, min_audio_s=cfg.min_audio_s, **fuente,
             )
         # hotwords también aquí: sin endpointing inteligente la orden sigue
         # siendo un COMANDO (post-wake) y lleva el mismo sesgo que en la rama
         # smart y en el loop concurrente.
         return stt.listen_once(silence_ms=cfg.silence_ms, start_timeout_s=start_timeout_s,
-                               hotwords=cfg.hotwords, min_audio_s=0.3)
+                               hotwords=cfg.hotwords, min_audio_s=cfg.min_audio_s, **fuente)
 
     def atender(command: str, on_token: Callable[[str], None] | None = None) -> tuple[str, bool]:
         """agent.handle_turn que no propaga: devuelve (respuesta, reventó).
@@ -516,12 +613,25 @@ def _run_simple_loop(
             log.exception("el turno reventó: %s", error)
             return _TURNO_ROTO, True
 
+    def escucha_activa() -> bool:
+        """transcribe_if del wake difuso: la pausa del panel que llega A MEDIA
+        ventana (hasta 6 s esperando voz + 8 s de grabación) ya no paga Whisper.
+        Ese texto se tiraba igual (tras el wake se vuelve a mirar el flag), así
+        que no cambia ninguna decisión. Publica la pausa como esa comprobación.
+        Con sesión también decide si se sigue esperando el wake en ella (on_idle
+        del difuso, should_stop de openWakeWord)."""
+        if read_control_enabled():
+            return True
+        hud_state.set_enabled(False)
+        return False
+
     # El aviso de espera sale UNA vez por periodo de espera (como con
     # openWakeWord, que bloquea hasta el wake). El difuso vuelve al tope del
     # bucle tras cada ventana de 6 s sin activación, y reimprimirlo ahí eran
     # dos líneas a stdout/journald cada 6 s de silencio. Se rearma con lo que
-    # cierra la espera: un wake, una pausa del panel o un error.
+    # cierra la espera: un wake, una pausa del panel o el primer error de una racha.
     espera_anunciada = False
+    reintentos = _Reintentos()
     while True:
         try:
             # Escucha pausada desde el panel: se consulta el flag en CADA vuelta,
@@ -533,16 +643,35 @@ def _run_simple_loop(
             hud_state.set_enabled(enabled)
             if not enabled:
                 espera_anunciada = False
+                # Con sesión, el micrófono se cierra mientras dure la pausa: sin
+                # ella, en pausa no se abría nada.
+                if mic is not None:
+                    mic.suspend()
                 time.sleep(_CONTROL_POLL_S)
                 continue
             if not espera_anunciada:
+                # Espera nueva: lo capturado antes (la respuesta, una pausa, un
+                # error) es lo que un stream recién abierto no habría oído.
+                if mic is not None:
+                    mic.resume()
+                    mic.flush()
                 print("\nEsperando palabra de activación...", flush=True)
                 espera_anunciada = True
+                # Espera nueva = hubo un hueco sin escuchar (arranque, turno,
+                # pausa, error): el pre-filtro olvida lo de antes en su próxima
+                # ventana. Entre ventanas de la misma espera no (ver _PreFiltro).
+                if pregate is not None:
+                    pregate.hueco()
             try:
                 if use_oww:
                     # Detector dedicado: bloquea hasta la activación; no transcribe,
-                    # así que el comando se graba SIEMPRE después.
-                    if not wake_detector.listen_for_wake(timeout_s=None):
+                    # así que el comando se graba SIEMPRE después. Con sesión mira
+                    # el panel cada segundo (la pausa cierra el micrófono arriba).
+                    espera_oww: dict[str, Any] = {} if mic is None else {
+                        "source": mic, "should_stop": lambda: not escucha_activa()}
+                    disparo = wake_detector.listen_for_wake(timeout_s=None, **espera_oww)
+                    reintentos.ok()
+                    if not disparo:
                         continue
                     inline_cmd = ""  # openWakeWord no transcribe: no hay orden pegada
                 else:
@@ -550,15 +679,24 @@ def _run_simple_loop(
                     # (una palabra no necesita 600ms) pero tope amplio: así
                     # "crotolamo pausa la música" DE CORRIDO cabe completo.
                     # min_audio_s: si nadie habló, NO se transcribe el silencio
-                    # (eso costaba ~1s de mic sordo por ciclo vacío).
+                    # (eso costaba ~1s de mic sordo por ciclo vacío); con la
+                    # escucha pausada mientras grababa, tampoco (escucha_activa).
+                    # Con pre-filtro, la ventana solo llega a Whisper si
+                    # openWakeWord disparó en ella (ver _choose_pregate); si se
+                    # rompió, se quita y el difuso sigue como sin él.
+                    # Con sesión, agotados los 6 s sin voz se sigue esperando en
+                    # la misma (on_idle, si el panel no pausó) sin perder la
+                    # pre-activación, en vez de volver aquí a abrir otra ventana.
+                    compuerta = {} if pregate is None or pregate.roto else {"gate": pregate}
+                    sesion: dict[str, Any] = {} if mic is None else {
+                        "source": mic, "on_idle": escucha_activa}
                     heard = wake_stt.listen_once(silence_ms=cfg.wake_silence_ms,
                                                  max_seconds=cfg.wake_max_s,
-                                                 start_timeout_s=6,
-                                                 min_audio_s=0.3)
-                    # Log de lo que oyó el wake difuso: sirve para AFINAR la lista
-                    # de variantes de "crotolamo" según cómo lo transcribe Whisper.
-                    if heard:
-                        log.info("wake difuso oyó: %r", heard)
+                                                 start_timeout_s=cfg.wake_window_s,
+                                                 min_audio_s=cfg.min_audio_s,
+                                                 transcribe_if=escucha_activa,
+                                                 **compuerta, **sesion)
+                    reintentos.ok()
                     # Activación: el wake debe venir AL INICIO de la frase (3
                     # primeras palabras) — protege de música/ruido igual que el
                     # viejo guard de "máximo 3 palabras", pero SIN rechazar
@@ -571,6 +709,8 @@ def _run_simple_loop(
                     activated, inline_cmd = wake.split_wake_command(
                         heard, threshold, cfg.variants
                     )
+                    if heard:
+                        _log_heard(heard, threshold, cfg.variants, activated)
                     if not activated:
                         continue
             except VoiceUnavailable as error:
@@ -612,6 +752,7 @@ def _run_simple_loop(
                 else:
                     if cfg.ack == "voz":
                         say("Te escucho, patrón.")
+                        descartar_captura()  # el acuse hablado no es la orden
                     elif cfg.ack != "off":
                         tts.beep()
                         print("Te escucho, patrón.", flush=True)
@@ -668,7 +809,9 @@ def _run_simple_loop(
                             tts.speak_sentences(reply)  # Fase 6: TTS por frases
                         except Exception as error:  # noqa: BLE001
                             log.warning("voz falló: %s", error)
-                    time.sleep(0.5)
+                    time.sleep(cfg.post_reply_guard_s)
+                    # Con sesión: la respuesta y esta guarda quedaron capturadas.
+                    descartar_captura()
 
                     if cfg.followup_s <= 0:
                         break
@@ -686,10 +829,23 @@ def _run_simple_loop(
         except KeyboardInterrupt:
             say("Crotolamo apagado, patrón.")
             return 0
-        except Exception as error:  # noqa: BLE001
+        except MicFailed as error:
+            # La sesión de captura se rindió (solo bajo systemd, ver
+            # _abrir_sesion_mic): código 1 y Restart=on-failure reinicia el servicio.
             print(f"Error en el listener: {error}", flush=True)
-            espera_anunciada = False
-            time.sleep(1)
+            return 1
+        except Exception as error:  # noqa: BLE001
+            primero, nuevo, espera = reintentos.fallo(error)
+            if nuevo:
+                print(f"Error en el listener: {error}", flush=True)
+            if primero:
+                espera_anunciada = False
+            # Cada error es un hueco sin escuchar para el pre-filtro (antes lo
+            # traía el reanuncio de la espera, que ahora es uno por racha).
+            if pregate is not None:
+                pregate.hueco()
+            time.sleep(espera)
+            descartar_captura()  # con sesión: lo capturado durante la espera
         finally:
             # idle en TODAS las salidas del cuerpo (continue, fin de turno,
             # excepción) para que el overlay no se quede abierto. El guard evita
@@ -728,7 +884,8 @@ def _make_notice_say(
     --barge-in, el oído juzgaba el eco con las reglas de THINKING (sin gracia
     ni margen de umbral), así que el eco del propio aviso lo cortaba y abría un
     turno fantasma. Aquí suena en SPEAKING, como una frase de la Boca, y al
-    terminar se vuelve a THINKING: el LLM sigue con el turno.
+    terminar se vuelve a THINKING: el LLM sigue con el turno (solo si el SPEAKING
+    lo puso el aviso; en streaming puede ser de la Boca, ver el finally).
 
     Si el modo ya no es THINKING, un barge-in abrió otro turno (el patrón está
     dictando la orden nueva) y lo del turno viejo se descarta, como su
@@ -742,7 +899,12 @@ def _make_notice_say(
             say(text)
             return
         turn = state.turn_id
-        if not state.compare_and_set_mode(Mode.THINKING, Mode.SPEAKING):
+        cambio = state.compare_and_set_mode(Mode.THINKING, Mode.SPEAKING)
+        if not cambio and not (
+                # [voice].stream_speak_concurrent: la Boca ya puede estar diciendo
+                # el principio de ESTE turno; el aviso suena detrás (turno de voz
+                # del TTS), no se tira.
+                state.get_mode() is Mode.SPEAKING and state.is_current(turn)):
             log.info("aviso de un turno ya interrumpido, no lo digo: %s", text)
             return
         print(text, flush=True)
@@ -753,11 +915,305 @@ def _make_notice_say(
         except Exception as error:  # noqa: BLE001
             log.warning("voz falló: %s", error)
         finally:
-            # Solo si nadie cambió el modo mientras sonaba: el LISTENING de un
-            # barge-in no se pisa.
-            state.compare_and_set_mode(Mode.SPEAKING, Mode.THINKING)
+            # Solo si el SPEAKING lo puso este aviso y nadie cambió el modo
+            # mientras sonaba: el LISTENING de un barge-in no se pisa. Si era de
+            # la Boca (streaming), es suyo: una frase de este turno que esperaba
+            # turno de voz detrás del aviso sonaba en THINKING (HUD "pensando",
+            # eco juzgado sin gracia) y, si era la última, el END ya no la
+            # dejaba en IDLE.
+            if cambio:
+                state.compare_and_set_mode(Mode.SPEAKING, Mode.THINKING)
 
     return _say
+
+
+class _Warmer:
+    """El hilo WarmVoice: carga, en orden y de una en una, lo que run_listen encola.
+
+    Antes era una lista fija (Whisper de la orden, Whisper del wake y Piper) que
+    arrancaba ANTES de saber el modo: el concurrente cargaba y guardaba todo el
+    día un 'tiny' que jamás usa (+64 MB), Piper iba al final aunque el saludo es
+    lo primero que suena (el hilo principal esperaba su carga), y Silero no se
+    calentaba: caía en el oído (o en la primera grabación) tras el primer wake.
+    Ahora run_listen encola Piper de entrada y, decidido el modo, lo que ese loop
+    usa en el orden en que lo usa (_warm_plan). Cada carga pasa por el cargador
+    thread-safe del componente (TTS._get_voice, STT._get_model, stt.warm_vad): si
+    quien lo usa llega antes, espera esa carga en vez de repetirla.
+
+    Un cargador que lanza se avisa con WARNING, como antes de este hilo: sin el
+    extra [voice], el journal (nivel INFO de fábrica) dice ya al arrancar qué falta
+    y cómo instalarlo, en vez de callarlo hasta el primer wake. Una misma causa (los
+    dos Whisper sin faster_whisper) se avisa una vez, como antes.
+
+    Dueño: run_listen. close() = ya no hay más que cargar (el hilo termina al
+    vaciar la cola); stop() = salir sin cargar lo que quede, con espera acotada.
+    """
+
+    def __init__(self) -> None:
+        self._cola: queue.SimpleQueue[tuple[str, Callable[[], object]] | None] = (
+            queue.SimpleQueue())
+        self._parar = threading.Event()
+        self._hilo = threading.Thread(target=self._run, name="WarmVoice", daemon=True)
+        self._hilo.start()
+
+    def add(self, nombre: str, cargar: Callable[[], object]) -> None:
+        self._cola.put((nombre, cargar))
+
+    def close(self) -> None:
+        self._cola.put(None)
+
+    def join(self, timeout_s: float | None = None) -> None:
+        if self._hilo is not threading.current_thread():
+            self._hilo.join(timeout_s)
+
+    def stop(self) -> None:
+        """Lo que quede en cola ya no se carga; la carga en curso se espera como
+        mucho _WARM_STOP_S (no se puede cortar una carga nativa a medias)."""
+        self._parar.set()
+        self._cola.put(None)
+        self.join(_WARM_STOP_S)
+
+    def _run(self) -> None:
+        cargados: list[str] = []
+        sin_cargar: list[str] = []
+        avisados: set[str] = set()
+        while True:
+            item = self._cola.get()
+            if item is None or self._parar.is_set():
+                break
+            nombre, cargar = item
+            try:
+                ok = cargar()
+            except Exception as error:  # noqa: BLE001 - un cargador roto no para a los demás
+                # El texto de antes ('no pude precalentar la voz: <error>') abre el aviso.
+                aviso = log.debug if str(error) in avisados else log.warning
+                aviso("no pude precalentar la voz: %s (%s)", error, nombre)
+                avisados.add(str(error))
+                ok = False
+            # False = no cargó sin error (sin .onnx de Piper, o warm_vad sin silero-vad)
+            # y lo decidirá su primer uso real.
+            (sin_cargar if ok is False else cargados).append(nombre)
+        if self._parar.is_set():
+            log.debug("calentamiento cortado al salir (cargado: %s)", ", ".join(cargados))
+            return
+        resumen = ", ".join(cargados) or "nada"
+        if sin_cargar:
+            log.info("voz caliente (%s); sin precalentar (lo decide su primer uso): %s",
+                     resumen, ", ".join(sin_cargar))
+        else:
+            log.info("voz caliente (%s)", resumen)
+
+
+def _choose_wake(settings: Any, detector: Any, simple: bool) -> tuple[bool, bool]:
+    """(use_oww, concurrente): qué wake y qué loop corren. Se decide UNA vez, al
+    arrancar y antes de calentar lo demás: de esto dependen el confirm_fn y lo
+    que carga _warm_plan.
+
+    M1: wake word dedicado con openWakeWord; si no está, fallback al difuso
+    (Whisper). [wake].use_oww = false fuerza el wake DIFUSO, que sí reconoce
+    "crotolamo" (vía variants), a costa de más latencia/CPU y sin barge-in; con
+    false no se mira nada más (ni se importa ni se carga openWakeWord).
+    openWakeWord (true, default) es rápido y fiable pero dispara con "hey jarvis"
+    (modelo puente) hasta entrenar un modelo propio de "crotolamo".
+
+    El modelo se carga AQUÍ (can_load), antes de elegir el loop: se cargaba en el
+    primer chunk, dentro del hilo del oído, y con un oww_model malo (ruta que no
+    existe, pesos que faltan) el asistente decía "Crotolamo escuchando" y el oído
+    se rendía al instante: sordo, o reiniciado por systemd sin fin. No es trabajo
+    extra: el primer chunk lo pagaba igual. Si no carga, el wake difuso (Whisper)
+    no lo necesita. Un detector sin can_load (solo la interfaz de wake) se usa
+    tal cual.
+    """
+    use_oww = bool(settings.wake.get("use_oww", True)) and detector.available()
+    can_load = getattr(detector, "can_load", None) if use_oww else None
+    if callable(can_load) and not can_load():
+        error = getattr(detector, "load_error", None)
+        log.warning("openWakeWord no carga (%s); uso el wake difuso", error)
+        print(str(error), flush=True)
+        use_oww = False
+    return use_oww, not simple and use_oww
+
+
+class _PreFiltro:
+    """Compuerta del wake difuso con [wake].pregate='oww': el WakeWordDetector
+    que oye cada chunk de la ventana (ver stt._GateRun). Si su rearm() o su
+    feed() revientan queda `roto` y el loop deja de pasarlo: el difuso sigue
+    como sin pre-filtro (el grabador ya avisó con WARNING, una vez, y esa
+    ventana fue entera a Whisper)."""
+
+    def __init__(self, detector: Any) -> None:
+        self._detector = detector
+        self.roto = False
+        # La primera ventana también va tras un hueco: lo que tenga el detector
+        # es de antes de este loop (recién cargado no hay nada y no cuesta nada).
+        self._hueco = True
+
+    def hueco(self) -> None:
+        """El loop dejó de escuchar (espera nueva: arranque, wake, pausa del
+        panel, error): la próxima ventana olvida lo de antes (ver rearm)."""
+        self._hueco = True
+
+    def rearm(self) -> None:
+        """Lo pide _GateRun al abrir CADA ventana; solo llega al detector tras
+        un hueco. Entre dos ventanas seguidas no lo hay: sin disparo no pasó
+        nada por Whisper y la siguiente abre en milisegundos, así que lo que oyó
+        el detector es lo último que sonó, como en el oído del loop concurrente.
+        Tras un disparo feed() ya reseteó. Vaciarlo en cada ventana costaba en
+        openwakeword 0.6 un reset de ~66 ms de CPU (recalcula 4 s de
+        embeddings) en 13 de 14 ventanas por minuto de tele, sin quitar nada
+        viejo."""
+        if not self._hueco:
+            return
+        self._hueco = False
+        try:
+            self._detector.rearm()
+        except Exception:
+            self.roto = True
+            raise
+
+    def feed(self, chunk: Any) -> bool:
+        try:
+            return bool(self._detector.feed(chunk))
+        except Exception:
+            self.roto = True
+            raise
+
+
+def _choose_pregate(settings: Any, detector: Any, use_oww: bool) -> _PreFiltro | None:
+    """[wake].pregate: un detector barato y continuo delante del wake difuso.
+
+    '' (de fábrica): nada, Whisper transcribe cada ventana con voz. 'oww': el
+    modelo de [wake].oww_model oye cada chunk de esa ventana; si no dispara, la
+    ventana no llega a Whisper, y si dispara se recorta a ~1.3 s antes del
+    disparo. Whisper y split_wake_command siguen siendo el verificador. Solo
+    sirve con un modelo que reconozca el "crotolamo" del patrón (decisión del
+    dueño, ver config); con use_oww=true no hay wake difuso que filtrar. Un
+    modelo que no carga se avisa y el difuso sigue sin pre-filtro.
+    """
+    modo = settings.wake.get("pregate", "") or ""
+    if not modo or use_oww:
+        return None
+    if modo != "oww":
+        log.warning("[wake].pregate=%r no existe ('' u 'oww'); sigo sin pre-filtro", modo)
+        return None
+    if not detector.available():
+        log.warning("[wake].pregate='oww' sin openwakeword importable; sigo sin pre-filtro")
+        return None
+    can_load = getattr(detector, "can_load", None)
+    if callable(can_load) and not can_load():
+        log.warning("[wake].pregate='oww': el modelo no carga (%s); sigo sin pre-filtro",
+                    getattr(detector, "load_error", None))
+        return None
+    log.info("pre-filtro openWakeWord delante del wake difuso (umbral %.2f)",
+             detector.threshold)
+    return _PreFiltro(detector)
+
+
+def _warm_plan(concurrente: bool, use_oww: bool, vad_silero: bool, stt: Any,
+               wake_stt: Any) -> list[tuple[str, Callable[[], object]]]:
+    """Lo que el loop YA elegido usa, en el orden en que lo usa por primera vez.
+
+    Piper no está: va antes, en todos los modos (el saludo es lo primero que
+    suena). El modelo de openWakeWord tampoco: lo carga el hilo principal al
+    decidir el modo (si no carga, se cae al difuso; ver run_listen).
+    - concurrente: el oído usa Silero tras el wake (SIEMPRE: _SileroVad no mira
+      vad_backend) y el hilo Stt, el Whisper de la orden.
+    - simple con openWakeWord: la grabación de la orden (Silero si vad_backend es
+      'silero') y el Whisper de la orden, que también transcribe la confirmación
+      por voz (C5). El 'tiny' del wake no lo usa nadie: no se carga.
+    - difuso: la grabación del wake (Silero si 'silero') y los dos Whisper (del
+      mismo tamaño, una sola carga, como siempre). El de la orden va ANTES que el
+      del wake, como antes: con 'tiny' primero el proceso queda con ~40-50 MB más
+      de RSS para siempre (medido: mismos modelos, otro orden), y los dos están
+      cargados mucho antes de que acabe el saludo, así que el orden no retrasa
+      el primer wake.
+    Whisper va por su cargador (_get_model), no por STT.warm(): su error (falta
+    faster_whisper, con la instrucción para instalarlo) llega así a la frontera de
+    _Warmer, que lo avisa con WARNING como antes; no se memoriza, así que el primer
+    uso real lo reintenta y da el mismo error. Silero sí va por warm_vad: su primer
+    uso decide caer a energía y lo avisa una vez (calentar no añade otro aviso).
+    Los cargadores se resuelven ya en el hilo del calentador: un STT sin ellos no
+    tumba el arranque, lo avisa la frontera de _Warmer.
+    """
+    plan: list[tuple[str, Callable[[], object]]] = []
+    if concurrente or vad_silero:
+        plan.append(("silero", warm_vad))
+    plan.append((f"whisper:{stt.model_size}", lambda: stt._get_model() is not None))
+    if not use_oww and wake_stt.model_size != stt.model_size:
+        plan.append((f"whisper:{wake_stt.model_size}",
+                     lambda: wake_stt._get_model() is not None))
+    return plan
+
+
+def _abrir_sesion_mic(settings: Any, cfg: ListenerConfig) -> MicSession | None:
+    """[voice].audio_session: UN dueño del micrófono para todo el loop (ver
+    crotolamo/voice/capture.py) en vez de un stream por grabación.
+
+    None = lo de siempre: la clave en false (de fábrica), o la sesión no abre el
+    micrófono; eso se avisa UNA vez y el loop sigue con un stream por grabación
+    (que dará su error de siempre si el micrófono de verdad no está).
+
+    La rendición tras mic_give_up_s de fallos seguidos (MicFailed: el loop sale
+    con código 1) solo corre como servicio (INVOCATION_ID, lo pone systemd): ahí
+    Restart=on-failure reinicia al listener. En una terminal no hay quien lo
+    reinicie, así que se reintenta siempre (cada 30 s como mucho), como hoy.
+    """
+    if not cfg.audio_session:
+        return None
+    rendirse_s = float(cfg.mic_give_up_s) if os.environ.get("INVOCATION_ID") else 0.0
+    voice = settings.voice
+    sesion = MicSession(voice.get("sample_rate", DEFAULTS.sample_rate), voice.get("input_device"),
+                        give_up_s=rendirse_s)
+    try:
+        sesion.start()
+    except Exception as error:  # noqa: BLE001 - sin sesión, el camino de siempre
+        log.warning("[voice].audio_session: no pude abrir el micrófono para toda la "
+                    "sesión (%s); grabo con un stream por grabación, como antes", error)
+        sesion.close()
+        return None
+    log.info("micrófono abierto para toda la sesión de escucha")
+    return sesion
+
+
+def _llm_necesita_calentarse(llm: Any) -> bool:
+    """needs_warmup del cliente (LLMClient: True, Ollama carga el modelo en RAM;
+    GLMClient: False, la nube no carga nada). Un cliente que no lo declare sigue
+    la regla de siempre: se calienta solo el local (LLMClient)."""
+    necesita = getattr(llm, "needs_warmup", None)
+    if necesita is not None:
+        return bool(necesita)
+    from crotolamo.core.llm import LLMClient
+
+    return isinstance(llm, LLMClient)
+
+
+def _warm_llm(settings: Any) -> None:
+    """Calienta el LLM primario si es un modelo local. Corre en el hilo WarmLLM y
+    nunca propaga.
+
+    El PRIMER comando con Ollama arranca el modelo en frío (~60-120s en CPU) y
+    deja la voz "pensando" un buen rato: una llamada dummy al arrancar lo deja
+    residente (keep_alive lo mantiene). Con GLM no hay nada que cargar: era una
+    completion real a la API por arranque, en un cliente desechable cuyo socket
+    no reutiliza nadie (el HTTPTransport es por hilo). build_primary_llm sigue
+    siendo la única regla de cuál es el primario: glm sin API key es Ollama, y
+    ese sí se calienta.
+
+    Cliente PROPIO, no agent.llm: el del loop puede ser FallbackLLM y compartir
+    su HTTPTransport entre este hilo y BrainThread corrompía el socket; además,
+    un fallo del warm-up abriría el circuit breaker 60s.
+    """
+    try:
+        from crotolamo.core.engine import build_primary_llm
+
+        llm = build_primary_llm(settings)
+        if not _llm_necesita_calentarse(llm):
+            log.info("cerebro en la nube: no hay LLM que calentar")
+            return
+        llm.chat([{"role": "user", "content": "di solo: ok"}])
+        log.info("LLM caliente, patrón.")
+    except Exception as error:  # noqa: BLE001
+        log.warning("no pude calentar el LLM: %s", error)
 
 
 def run_listen(argv: list[str] | None = None) -> int:
@@ -766,57 +1222,70 @@ def run_listen(argv: list[str] | None = None) -> int:
     _sweep_stale_tmp(_HUD_STATE_PATH.parent)
     settings = get_settings()
     cfg = ListenerConfig.from_settings(settings)
+    # M3: por defecto, loop concurrente. --simple = modo secuencial viejo (fallback).
+    # Barge-in conservador: half-duplex por defecto; --barge-in lo activa (auriculares).
+    # Se lee lo primero: el modo decide qué modelos se calientan y en qué orden.
+    argv = argv or []
+    simple = "--simple" in argv
+    allow_barge_in = ("--barge-in" in argv) and ("--no-barge-in" not in argv)
+
+    tts = TTS.from_settings(settings)
+    # Precalentar la VOZ en segundo plano (hilo WarmVoice, ver _Warmer): sin esto
+    # la primera orden pagaba la carga de los modelos (sorda al transcribir, muda
+    # al responder). Piper va PRIMERO en todos los modos y se encola antes de
+    # decidir el modo: el saludo es lo primero que suena, y así su carga va a la
+    # vez que la de openWakeWord en este hilo, en vez de detrás de dos Whisper.
+    warmer = _Warmer()
+    # UN solo dueño para el calentador: salga run_listen como salga (su return, un
+    # error al decidir el modo o al armar el monitor de música, el import del loop,
+    # un KeyboardInterrupt en build_agent o en el saludo, SystemExit), lo que quede
+    # en cola ya no se carga y la carga en curso se espera, acotado. Un intérprete
+    # que se apaga con una carga nativa a medias (la sesión ONNX de Piper o de
+    # Silero) aborta (SIGABRT, rc 134, con core) en vez de salir con su código. Va
+    # después del finally de cada loop, que ya publicó el idle del HUD: su espera
+    # no lo retrasa.
+    try:
+        # Piper por su cargador, como Whisper (ver _warm_plan): un .onnx que no abre
+        # se avisa al arrancar. Sin .onnx no hay voz ni nada que cargar (False).
+        warmer.add("piper", lambda: tts.available() and tts._get_voice() is not None)
+        return _listen_with_warmer(settings, cfg, tts, warmer, simple=simple,
+                                   allow_barge_in=allow_barge_in)
+    finally:
+        warmer.stop()
+        # Dueño también del hilo de pre-síntesis del TTS ([voice].tts_presynth),
+        # si llegó a arrancar. Un TTS falso sin close() no tiene nada que parar.
+        cerrar_tts = getattr(tts, "close", None)
+        if callable(cerrar_tts):
+            cerrar_tts()
+
+
+def _listen_with_warmer(settings: Any, cfg: ListenerConfig, tts: TTS, warmer: _Warmer, *,
+                        simple: bool, allow_barge_in: bool) -> int:
+    """El resto de run_listen, con el calentamiento ya en marcha (Piper en cola);
+    run_listen es el dueño del calentador y lo para al salir."""
+    wake_detector = WakeWordDetector.from_settings(settings)
+    # El modo queda decidido aquí (ver _choose_wake): el confirm_fn (más abajo) y
+    # el resto del calentamiento dependen de él.
+    use_oww, concurrente = _choose_wake(settings, wake_detector, simple)
+    # [wake].pregate (apagado de fábrica): solo con el wake difuso.
+    pregate = _choose_pregate(settings, wake_detector, use_oww)
+
     stt = STT.from_settings(settings)  # 'base' para el comando
     # I3: modelo barato solo para escuchar la palabra de activación.
     # initial_prompt=None es CLAVE: con pista, Whisper la regurgita sobre el
-    # silencio (incluye "crotolamo") y dispara falsos wakes.
+    # silencio (incluye "crotolamo") y dispara falsos wakes. Construirlo no carga
+    # nada: su modelo solo se calienta si el wake es el difuso (ver _warm_plan).
     wake_stt = STT(
         model_size=settings.voice.get("wake_whisper_model", "tiny"),
-        sample_rate=settings.voice.get("sample_rate", 16000),
+        sample_rate=settings.voice.get("sample_rate", DEFAULTS.sample_rate),
         initial_prompt=None,
     )
-    tts = TTS.from_settings(settings)
-
-    # Precalentar la VOZ en segundo plano: Whisper (comando y wake) y Piper se
-    # cargaban en el PRIMER uso, así que la primera orden pagaba varios segundos
-    # de carga de modelos (sorda al transcribir, muda al responder). Cargarlos
-    # al arrancar deja el primer turno igual de rápido que los demás.
-    def _warm_voice() -> None:
-        try:
-            stt._get_model()
-            if wake_stt.model_size != stt.model_size:
-                wake_stt._get_model()
-            if tts.available():
-                tts._get_voice()
-            log.info("voz caliente (Whisper y Piper cargados)")
-        except Exception as error:  # noqa: BLE001 - sin extra [voice], se avisa al usar
-            log.warning("no pude precalentar la voz: %s", error)
-
-    threading.Thread(target=_warm_voice, name="WarmVoice", daemon=True).start()
-
-    # M1: wake word dedicado con openWakeWord; si no está, fallback al difuso (Whisper).
-    # [wake].use_oww = false fuerza el wake DIFUSO (Whisper), que sí reconoce
-    # "crotolamo" (vía variants), a costa de más latencia/CPU y sin barge-in.
-    # openWakeWord (true, default) es rápido y fiable pero dispara con "hey jarvis"
-    # (modelo puente) hasta entrenar un modelo propio de "crotolamo".
-    wake_detector = WakeWordDetector.from_settings(settings)
-    use_oww = settings.wake.get("use_oww", True) and wake_detector.available()
-    if use_oww:
-        # El modelo se carga AQUÍ, antes de elegir el loop: se cargaba en el
-        # primer chunk, dentro del hilo del oído, y con un oww_model malo (ruta
-        # que no existe, pesos que faltan) el asistente decía "Crotolamo
-        # escuchando" y el oído se rendía al instante: sordo, o reiniciado por
-        # systemd sin fin. No es trabajo extra: el primer chunk lo pagaba igual.
-        # Si no carga, el wake difuso (Whisper) no lo necesita. Un detector sin
-        # carga explícita (solo la interfaz de wake) se usa tal cual.
-        cargar_modelo = getattr(wake_detector, "_get_model", None)
-        if callable(cargar_modelo):
-            try:
-                cargar_modelo()
-            except VoiceUnavailable as error:
-                log.warning("openWakeWord no carga (%s); uso el wake difuso", error)
-                print(str(error), flush=True)
-                use_oww = False
+    # Lo demás, en el orden en que lo usa el loop elegido. Mismo default que la
+    # grabación del modo simple (stt._record_frames): sin clave, energía.
+    vad_silero = settings.voice.get("vad_backend", DEFAULTS.vad_backend) == "silero"
+    for nombre, cargar in _warm_plan(concurrente, use_oww, vad_silero, stt, wake_stt):
+        warmer.add(nombre, cargar)
+    warmer.close()
 
     # Wake consciente de la música (media_aware.py), compartido por los dos
     # loops: un sondeo en segundo plano dice si algo suena (umbral de wake más
@@ -853,8 +1322,19 @@ def run_listen(argv: list[str] | None = None) -> int:
         except Exception as error:  # noqa: BLE001
             log.warning("voz falló: %s", error)
 
+    # La sesión de captura del loop simple ([voice].audio_session), si la hay: se
+    # abre más abajo, tras el saludo, y voice_confirm (que corre dentro de un
+    # turno) escucha la respuesta en ella.
+    sesion_mic: list[MicSession] = []
+
     def voice_confirm(reason: str) -> bool:
         say(reason + " Di 'confirmo' o 'cancela', patrón.")
+        fuente: dict[str, Any] = {}
+        if sesion_mic:
+            # La pregunta que acaba de sonar (y lo de antes) no es la respuesta:
+            # fuera, como con el stream que antes se abría aquí.
+            sesion_mic[0].flush()
+            fuente = {"source": sesion_mic[0]}
         try:
             # C5: la respuesta la transcribe el modelo de la ORDEN, no el 'tiny'
             # del wake (solo para la palabra de activación): un mishear vale "no"
@@ -862,22 +1342,18 @@ def run_listen(argv: list[str] | None = None) -> int:
             # ventanas (respuesta de una palabra) y sin hotwords: no es un
             # comando. min_audio_s: si nadie contestó, "" (un "no") sin pasar el
             # silencio por Whisper.
-            answer = stt.listen_once(silence_ms=cfg.wake_silence_ms, max_seconds=5,
-                                     min_audio_s=0.3)
-        except VoiceUnavailable:
+            answer = stt.listen_once(silence_ms=cfg.wake_silence_ms,
+                                     max_seconds=cfg.confirm_max_s,
+                                     min_audio_s=cfg.min_audio_s, **fuente)
+        except (VoiceUnavailable, MicFailed):
+            # Sin micrófono no hay "sí": lo seguro. El loop se entera del
+            # MicFailed en su siguiente escucha.
             return False
         return wake.confirmation_from_answer(answer)
 
-    # M3: por defecto, loop concurrente. --simple = modo secuencial viejo (fallback).
-    # Barge-in conservador: half-duplex por defecto; --barge-in lo activa (auriculares).
-    # La decisión va ANTES de build_agent porque el confirm_fn depende del modo:
-    # concurrente → deny_with_notice (el EarThread ya tiene el mic; un segundo
-    # InputStream de voice_confirm chocaría con él); simple → voice_confirm.
-    argv = argv or []
-    simple = "--simple" in argv
-    allow_barge_in = ("--barge-in" in argv) and ("--no-barge-in" not in argv)
-    concurrente = not simple and use_oww
-
+    # El modo (decidido arriba) va ANTES de build_agent porque el confirm_fn
+    # depende de él: concurrente → deny_with_notice (el EarThread ya tiene el mic;
+    # un segundo InputStream de voice_confirm chocaría con él); simple → voice_confirm.
     # El aviso concurrente suena con el modo del VoiceLoop (ver _make_notice_say),
     # que todavía no existe: se engancha al crearlo, más abajo.
     voice_loops: list[Any] = []
@@ -892,25 +1368,9 @@ def run_listen(argv: list[str] | None = None) -> int:
         media.stop()  # sin dejar vivo su playerctl --follow
         return 1
 
-    # Calentar el LLM en segundo plano: el PRIMER comando arranca llama en frío
-    # (~60-120s en CPU), lo que deja la voz "pensando" un buen rato. Una llamada
-    # dummy al arrancar lo deja residente (keep_alive lo mantiene) para que la
-    # primera orden responda rápido. No bloquea el arranque.
-    def _warm_llm() -> None:
-        # Cliente PROPIO, no agent.llm: el del loop puede ser FallbackLLM y
-        # compartir su HTTPTransport entre este hilo y BrainThread corrompía el
-        # socket; además, un fallo del warm-up abriría el circuit breaker 60s.
-        try:
-            from crotolamo.core.engine import build_primary_llm
-
-            build_primary_llm(settings).chat(
-                [{"role": "user", "content": "di solo: ok"}]
-            )
-            log.info("LLM caliente, patrón.")
-        except Exception as error:  # noqa: BLE001
-            log.warning("no pude calentar el LLM: %s", error)
-
-    threading.Thread(target=_warm_llm, name="WarmLLM", daemon=True).start()
+    # Calentar el LLM en segundo plano (solo si es un modelo local: ver _warm_llm).
+    # No bloquea el arranque.
+    threading.Thread(target=_warm_llm, args=(settings,), name="WarmLLM", daemon=True).start()
 
     # HUD: los dos loops publican el estado en tiempo real al archivo canónico,
     # por la compuerta que el apagado cierra antes del idle final (_HudGate).
@@ -923,11 +1383,25 @@ def run_listen(argv: list[str] | None = None) -> int:
 
         modo_bi = "barge-in (auriculares)" if allow_barge_in else "half-duplex"
         say(f"Crotolamo escuchando, patrón. (concurrente, {modo_bi})")
+        # [voice].audio_session: el oído lee de la sesión de captura, que ante un
+        # fallo del dispositivo lo cierra, avisa una vez por mensaje y lo reabre
+        # con espera creciente, sin salir del proceso; si se rinde (solo bajo
+        # systemd), el oído recibe MicFailed y el loop sale con 1. Sin ella (de
+        # fábrica), el _RealMic de siempre: el oído se rinde a los ~10 fallos
+        # seguidos y systemd reinicia el servicio.
+        sesion = _abrir_sesion_mic(settings, cfg)
+        con_sesion: dict[str, Any] = {} if sesion is None else {"mic": sesion}
+        # [voice].stream_speak_concurrent (apagada de fábrica): sin ella el
+        # VoiceLoop recibe los argumentos de siempre.
+        if cfg.stream_speak_concurrent:
+            con_sesion["stream_speak"] = True
         try:
             voice_loop = VoiceLoop(agent, stt, tts, wake_detector,
                                    allow_barge_in=allow_barge_in, silence_ms=cfg.silence_ms,
                                    hud_publisher=hud_gate.publish, control_path=CONTROL_PATH,
-                                   ducker=ducker)
+                                   ducker=ducker, start_timeout_s=cfg.command_start_timeout_s,
+                                   max_command_s=cfg.max_command_s,
+                                   post_speak_grace_s=cfg.post_speak_grace_s, **con_sesion)
             voice_loops.append(voice_loop)
             # run() devuelve != 0 si murió un hilo del loop (el oído que se
             # rindió ante un micro que no vuelve): ese código sale del proceso
@@ -941,6 +1415,8 @@ def run_listen(argv: list[str] | None = None) -> int:
             # el idle ya se escribió desde el manejador de señal. Por la
             # compuerta: stop() hace join con timeout y un hilo rezagado (la Boca
             # a media frase) todavía puede publicar después.
+            if sesion is not None:
+                sesion.close()  # stop() del loop ya la cerró; esto cubre un fallo antes
             media.stop()
             hud_gate.close_with_idle()
         return codigo
@@ -960,15 +1436,25 @@ def run_listen(argv: list[str] | None = None) -> int:
     # Mientras el loop está bloqueado esperando el wake, la pausa del panel la
     # publica este vigía (ver _start_control_watcher).
     stop_control_watch = _start_control_watcher(hud_state, CONTROL_PATH)
+    # Tras el saludo: lo que el micrófono capture empieza aquí. Sin sesión
+    # (audio_session=false o si no abre) el loop recibe los argumentos de siempre.
+    sesion = _abrir_sesion_mic(settings, cfg)
+    con_sesion = {}
+    if sesion is not None:
+        sesion_mic.append(sesion)
+        con_sesion = {"mic": sesion}
 
     try:
         return _run_simple_loop(
             agent=agent, stt=stt, wake_stt=wake_stt, tts=tts,
             wake_detector=wake_detector, use_oww=use_oww, cfg=cfg,
-            hud_state=hud_state, say=say, media=media, ducker=ducker,
+            hud_state=hud_state, say=say, media=media, ducker=ducker, pregate=pregate,
+            **con_sesion,
         )
     finally:
         stop_control_watch()
+        if sesion is not None:
+            sesion.close()
         media.stop()
         hud_gate.close_with_idle()
 

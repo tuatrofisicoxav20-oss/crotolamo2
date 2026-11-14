@@ -20,14 +20,29 @@ import queue
 import re
 import threading
 import time
-from collections.abc import Callable
+from collections import deque
+from collections.abc import Callable, Iterable
 from pathlib import Path
+from typing import Any
 
 from crotolamo.logging_setup import get_logger
 from crotolamo.voice import runtime
 from crotolamo.voice.clean import limpiar_para_voz
 
 log = get_logger("voice.tts")
+
+# Una frase que lleva esto sin avanzar (ni un chunk de Piper ni una escritura al
+# dispositivo) se da por trabada (sink de audio colgado): quien espera su turno
+# para hablar habla igual, como antes de que hubiera turno.
+_VOZ_TRABADA_S = 10.0
+
+# [voice].tts_presynth: frases sintetizadas por adelantado que pueden esperar a que
+# las hablen (más no: CPU que un barge-in tiraría), y pedidos pendientes como mucho.
+_PRESINT_ADELANTO = 2
+_PRESINT_PEDIDOS = 16
+# Lo más que el que habla espera un chunk de la pre-síntesis (Piper colgado).
+_PRESINT_ESPERA_S = 60.0
+_PRESINT_FIN = object()  # fin de los chunks de una frase presintetizada
 
 
 # --- Segmentación unificada (split_sentences y StreamSpeaker) ---
@@ -116,6 +131,84 @@ def split_sentences(text: str) -> list[str]:
     return pieces
 
 
+class SentenceFeeder:
+    """Tokens del LLM -> frases cerradas: la ÚNICA segmentación en streaming.
+
+    La usan StreamSpeaker (loop simple) y el BrainThread del loop concurrente
+    ([voice].stream_speak_concurrent); antes cada uno iba a tener la suya. Misma
+    regla que split_sentences (_split): un '.' al final del buffer se retiene
+    hasta ver el siguiente carácter (¿decimal? ¿abreviatura?). `emit` recibe
+    cada frase cerrada y `fed` cuenta las emitidas.
+    """
+
+    def __init__(self, emit: Callable[[str], None]) -> None:
+        self._emit = emit
+        self._buffer = ""
+        self.fed = 0
+
+    def feed(self, token: str) -> None:
+        self._buffer += token
+        pieces, self._buffer = _split(self._buffer, final=False)
+        for piece in pieces:
+            self.fed += 1
+            self._emit(piece)
+
+    def flush(self) -> None:
+        """Fin de la respuesta: lo que quedó sin cerrar frase va como frase."""
+        tail = self._buffer.strip()
+        self._buffer = ""
+        if tail:
+            self.fed += 1
+            self._emit(tail)
+
+
+class _AvisoEnFraseAparte:
+    """on_token de los dos loops: el aviso de un LLM que se cae a media respuesta
+    se habla como frase PROPIA, no pegado a la frase cortada.
+
+    El agente lo emite como su último token, on_token("\\n" + aviso), y devuelve
+    el aviso. La segmentación no corta en un salto de línea suelto (cómo suenan
+    los saltos en general es decisión pendiente, voice-runtime#18), así que se
+    oía "La capital de Francia es GLM no respondió a tiempo...". Por eso un
+    token que empieza por salto se retiene hasta el siguiente, y entonces pasa
+    tal cual (la misma segmentación de siempre, un token más tarde), o hasta el
+    final del turno: si era "\\n" + la respuesta, va tras un salto doble, que sí
+    cierra frase.
+    """
+
+    def __init__(self, feed: Callable[[str], None]) -> None:
+        self._feed = feed
+        self._retenido: str | None = None
+
+    def __call__(self, token: str) -> None:
+        retenido, self._retenido = self._retenido, None
+        if retenido is not None:
+            self._feed(retenido)
+        if token.startswith("\n"):
+            self._retenido = token
+        else:
+            self._feed(token)
+
+    def cerrar(self, reply: str) -> None:
+        """Fin del turno: suelta lo retenido, como frase aparte si era el aviso."""
+        retenido, self._retenido = self._retenido, None
+        if retenido is not None:
+            self._feed("\n" + retenido if retenido == "\n" + reply else retenido)
+
+
+class _Presintesis:
+    """Una frase pedida a la pre-síntesis ([voice].tts_presynth): sus chunks de
+    Piper van llegando a `chunks` conforme salen, y al final _PRESINT_FIN (o la
+    excepción de la síntesis, que relanza quien la habla)."""
+
+    __slots__ = ("texto", "chunks", "empezada")
+
+    def __init__(self, texto: str) -> None:
+        self.texto = texto
+        self.chunks: queue.Queue[Any] = queue.Queue()
+        self.empezada = False
+
+
 def _piper_arena_keep_phonemes(voice_cfg) -> int:
     """[voice].piper_arena_keep_phonemes: frases de hasta tantos phoneme ids
     conservan el arena de ONNX Runtime; las más largas devuelven su pico al terminar.
@@ -133,7 +226,8 @@ def _piper_arena_keep_phonemes(voice_cfg) -> int:
 
 class TTS:
     def __init__(self, voice_model: Path, *,
-                 arena_keep_phonemes: int = runtime.PIPER_KEEP_PHONEMES) -> None:
+                 arena_keep_phonemes: int = runtime.PIPER_KEEP_PHONEMES,
+                 presynth: bool = False) -> None:
         self.voice_model = Path(voice_model)
         self._voice = None  # PiperVoice perezoso, cargado una sola vez
         self.arena_keep_phonemes = arena_keep_phonemes
@@ -142,13 +236,32 @@ class TTS:
         # _voice en None y cargaban el modelo dos veces (CPU y RAM dobles).
         self._voice_lock = threading.Lock()
         self._stop_flag = threading.Event()  # M3.1: señal de corte thread-safe
+        # Turno de voz: UNA frase suena a la vez, la pida quien la pida (la Boca,
+        # StreamSpeaker, say(), la pregunta de voice_confirm, el aviso de una tool
+        # delicada). Sin él se abrían dos OutputStream a la vez y las dos frases
+        # sonaban encimadas; y como cada una limpia la bandera de corte al
+        # entrar, la segunda podía deshacer el stop() de la primera.
+        self._voz = threading.Condition(threading.Lock())
+        self._voz_dueno: object | None = None
+        self._voz_avance = 0.0  # monotonic del último progreso de quien habla
+        self._cortes = 0  # cuántos stop(): quien esperaba turno antes de uno no habla
+        # [voice].tts_presynth (false de fábrica): la frase siguiente se sintetiza
+        # MIENTRAS suena la actual, en UN hilo propio (perezoso) por el que pasa
+        # entonces toda la síntesis: Piper nunca corre en dos hilos a la vez.
+        self.presynth = presynth
+        self._presint: deque[_Presintesis] = deque()  # pedidas, en el orden de hablar
+        self._presint_urgentes: deque[_Presintesis] = deque()  # ya esperadas por speak()
+        self._presint_cv = threading.Condition(threading.Lock())
+        self._presint_hilo: threading.Thread | None = None
+        self._cerrado = False
 
     @classmethod
     def from_settings(cls, settings) -> "TTS":
         voces = settings.paths.get("voces", Path.home() / "voices")
         piper_voice = settings.voice.get("piper_voice", "es_MX-ald-medium.onnx")
         return cls(voces / piper_voice,
-                   arena_keep_phonemes=_piper_arena_keep_phonemes(settings.voice))
+                   arena_keep_phonemes=_piper_arena_keep_phonemes(settings.voice),
+                   presynth=bool(settings.voice.get("tts_presynth", False)))
 
     def available(self) -> bool:
         """Hay voz si existe el .onnx (la reproducción ya no depende de ffplay)."""
@@ -235,10 +348,51 @@ class TTS:
             log.warning("falta sounddevice; voz desactivada")
             return
 
+        turno = self._tomar_voz(should_abort)
+        if turno is None:
+            return  # un stop() o el turno que caducó mientras esperaba: no suena
         try:
             self._speak_streaming(text, should_abort)
         except Exception as error:  # noqa: BLE001 - una voz rota no debe matar el agente
             log.warning("error sintetizando/reproduciendo con Piper: %s", error)
+        finally:
+            self._soltar_voz(turno)
+
+    def _tomar_voz(self, should_abort: Callable[[], bool] | None) -> object | None:
+        """Espera a que nadie más esté hablando y toma el turno de voz.
+
+        Devuelve None (no hablar) si mientras esperaba llegó un stop() o
+        should_abort() se cumplió: sin turno las dos frases habrían sonado a la
+        vez y ese corte también habría cortado esta. Si quien habla lleva
+        _VOZ_TRABADA_S sin avanzar (audio colgado), se habla igual, como antes:
+        un sink trabado no puede dejar mudo al resto. Sin nadie hablando (lo
+        normal) no se espera nada.
+        """
+        with self._voz:
+            corte = self._cortes
+            while self._voz_dueno is not None:
+                restante = self._voz_avance + _VOZ_TRABADA_S - time.monotonic()
+                if restante <= 0:
+                    log.warning("la frase anterior lleva %.0f s sin avanzar (¿audio trabado?);"
+                                " hablo igual", _VOZ_TRABADA_S)
+                    break
+                self._voz.wait(restante)
+                # Tras CADA espera, también si el turno ya quedó libre: la frase
+                # cortada lo suelta en cuanto ve el stop(), a veces antes de que
+                # esta despierte.
+                if self._cortes != corte or (should_abort is not None and should_abort()):
+                    return None
+            turno = object()
+            self._voz_dueno = turno
+            self._voz_avance = time.monotonic()
+            return turno
+
+    def _soltar_voz(self, turno: object) -> None:
+        with self._voz:
+            # Si otro tomó el turno porque esta frase estaba trabada, ya es suyo.
+            if self._voz_dueno is turno:
+                self._voz_dueno = None
+                self._voz.notify_all()
 
     def _speak_streaming(
         self, text: str, should_abort: Callable[[], bool] | None = None,
@@ -266,7 +420,8 @@ class TTS:
         cortado = False
         step = 2048  # muestras por escritura: corte perceptible en <100ms
         try:
-            for chunk in voice.synthesize(text):
+            for chunk in self._chunks_de(voice, text):
+                self._voz_avance = time.monotonic()  # progreso: ver _tomar_voz
                 if _cortar():
                     cortado = True
                     return False
@@ -283,6 +438,7 @@ class TTS:
                         cortado = True
                         return False
                     stream.write(audio[i:i + step])
+                    self._voz_avance = time.monotonic()
             return True
         finally:
             if stream is not None:
@@ -314,9 +470,127 @@ class TTS:
             stream = sd.get_stream()
         return not self._stop_flag.is_set()
 
+    def _chunks_de(self, voice, text: str) -> Iterable[Any]:
+        """Los chunks de Piper de `text` (ya limpio): los de voice.synthesize, como
+        siempre; con [voice].tts_presynth, los del hilo de pre-síntesis."""
+        if not self.presynth or self._cerrado:
+            return voice.synthesize(text)
+        return self._leer_presintesis(self._tomar_presintesis(text))
+
+    def prepare(self, text: str) -> None:
+        """[voice].tts_presynth: pide YA la síntesis de una frase que sonará
+        enseguida, para que la siguiente esté lista al acabar la que suena (sin
+        esto, entre frase y frase había ~85 ms de silencio sintetizando). Lo
+        llaman quienes encolan frases (StreamSpeaker, el BrainThread,
+        speak_sentences), en el orden en que se hablarán; speak() recoge el audio
+        por su texto limpio. Sin la clave (de fábrica) no hace nada. Nunca lanza.
+        """
+        if not self.presynth:
+            return
+        try:
+            texto = limpiar_para_voz(text)
+            if not texto or not self.voice_model.exists():
+                return  # speak() tampoco sintetizaría nada
+            with self._presint_cv:
+                if self._cerrado or len(self._presint) >= _PRESINT_PEDIDOS:
+                    return  # de sobra: se sintetizará al hablarla, como sin la clave
+                self._presint.append(_Presintesis(texto))
+                self._despertar_presintesis()
+        except Exception as error:  # noqa: BLE001 - adelantar es opcional: quien encola sigue
+            log.debug("no pude pedir la pre-síntesis (%s)", error)
+
+    def _despertar_presintesis(self) -> None:
+        """Con _presint_cv tomado: arranca el hilo la primera vez y lo avisa."""
+        if self._presint_hilo is None:
+            hilo = threading.Thread(target=self._presintetizar, name="TtsPresintesis",
+                                    daemon=True)
+            hilo.start()
+            self._presint_hilo = hilo  # solo si arrancó: close() no espera a uno que no
+        self._presint_cv.notify_all()
+
+    def _tomar_presintesis(self, texto: str) -> _Presintesis:
+        """La frase que speak() va a hablar, sacada de la pre-síntesis. Lo pedido
+        ANTES que ella ya no va a sonar (se habla en el orden en que se pidió: era
+        de un turno cortado) y se tira. Si no estaba pedida (un say() suelto), se
+        pide ahora por delante de todo."""
+        with self._presint_cv:
+            for i, pedida in enumerate(self._presint):
+                if pedida.texto == texto:
+                    for _ in range(i + 1):
+                        self._presint.popleft()
+                    break
+            else:
+                pedida = _Presintesis(texto)
+            if not pedida.empezada:
+                self._presint_urgentes.append(pedida)
+            if self._cerrado:
+                pedida.chunks.put(_PRESINT_FIN)
+            else:
+                self._despertar_presintesis()
+            return pedida
+
+    def _leer_presintesis(self, pedida: _Presintesis) -> Iterable[Any]:
+        while True:
+            try:
+                item = pedida.chunks.get(timeout=_PRESINT_ESPERA_S)
+            except queue.Empty:
+                raise RuntimeError(
+                    f"la pre-síntesis no dio audio en {_PRESINT_ESPERA_S:.0f} s") from None
+            if item is _PRESINT_FIN:
+                return
+            if isinstance(item, BaseException):
+                raise item  # el aviso de siempre lo da speak()
+            yield item
+
+    def _siguiente_presintesis(self) -> _Presintesis | None:
+        """Con _presint_cv tomado: lo próximo a sintetizar. Primero lo que ya
+        espera speak(); luego lo pedido, sin adelantarse más de _PRESINT_ADELANTO
+        frases a la que suena (lo adelantado que un barge-in tira es CPU perdida)."""
+        if self._presint_urgentes:
+            return self._presint_urgentes.popleft()
+        if sum(1 for p in self._presint if p.empezada) >= _PRESINT_ADELANTO:
+            return None
+        return next((p for p in self._presint if not p.empezada), None)
+
+    def _presintetizar(self) -> None:
+        """Hilo TtsPresintesis (dueño: este TTS; close() lo para). Una frase a la vez."""
+        while True:
+            with self._presint_cv:
+                pedida = self._siguiente_presintesis()
+                while pedida is None and not self._cerrado:
+                    self._presint_cv.wait()
+                    pedida = self._siguiente_presintesis()
+                if self._cerrado:
+                    return
+                assert pedida is not None
+                pedida.empezada = True
+            try:
+                for chunk in self._get_voice().synthesize(pedida.texto):
+                    pedida.chunks.put(chunk)
+                pedida.chunks.put(_PRESINT_FIN)
+            except Exception as error:  # noqa: BLE001 - quien la hable da el aviso
+                log.debug("pre-síntesis falló (%s)", error)
+                pedida.chunks.put(error)
+
+    def close(self) -> None:
+        """Para el hilo de pre-síntesis (si llegó a arrancar), con espera acotada.
+        Quien estuviera esperando audio de él recibe el final y no se cuelga."""
+        with self._presint_cv:
+            self._cerrado = True
+            self._presint.clear()
+            while self._presint_urgentes:
+                self._presint_urgentes.popleft().chunks.put(_PRESINT_FIN)
+            self._presint_cv.notify_all()
+            hilo = self._presint_hilo
+        if hilo is not None and hilo is not threading.current_thread():
+            hilo.join(timeout=2.0)
+
     def speak_sentences(self, text: str) -> None:
         """Habla el texto frase por frase. Ya NO recarga el modelo: _get_voice() lo cachea."""
-        for sentence in split_sentences(text):
+        sentences = split_sentences(text)
+        for sentence in sentences:
+            self.prepare(sentence)  # [voice].tts_presynth; sin ella no hace nada
+        for sentence in sentences:
             self.speak(sentence)
 
     def beep(self) -> None:
@@ -339,8 +613,15 @@ class TTS:
             log.warning("no pude sonar el bip: %s", error)
 
     def stop(self) -> None:
-        """Corta cualquier reproducción en curso (thread-safe, M3.1)."""
+        """Corta cualquier reproducción en curso (thread-safe, M3.1), y también la
+        frase que esperaba turno para sonar detrás (ver _tomar_voz). Lo
+        presintetizado ([voice].tts_presynth) era de lo que se cortó: fuera."""
         self._stop_flag.set()
+        with self._voz:
+            self._cortes += 1
+            self._voz.notify_all()
+        with self._presint_cv:
+            self._presint.clear()
         try:
             import sounddevice as sd
 
@@ -368,13 +649,17 @@ class StreamSpeaker:
     El error de un LLM caído ya no necesita el fallback: el agente lo emite por
     on_token (tras un salto de línea si ya se había hablado algo). Ese salto
     suelto no corta frase aquí: el loop simple lo convierte en frase aparte
-    (interfaces/listener.py, _AvisoEnFraseAparte).
+    envolviendo feed() en _AvisoEnFraseAparte (arriba).
     """
 
     def __init__(self, tts: TTS, on_first=None) -> None:
         self.tts = tts
         self._on_first = on_first
-        self._buffer = ""
+        # La segmentación es la de SentenceFeeder (la misma del loop concurrente).
+        self._feeder = SentenceFeeder(self._encolar)
+        # [voice].tts_presynth: cada frase se pide al encolarla (un TTS falso sin
+        # prepare() no lo necesita).
+        self._prepare = getattr(tts, "prepare", None)
         self._spoke = False
         self._q: queue.Queue[str | None] = queue.Queue()
         # finish() se rindió (C6): el hilo no habla ni una frase más de la cola.
@@ -408,14 +693,16 @@ class StreamSpeaker:
     def feed(self, token: str) -> None:
         """on_token del agente: acumula y encola las frases ya cerradas.
 
-        Usa la MISMA segmentación que split_sentences (_split): en streaming
-        solo se decide con lo que hay, así que un '.' al final del buffer se
-        retiene hasta ver el siguiente carácter (¿decimal? ¿abreviatura?).
+        Usa la MISMA segmentación que split_sentences (SentenceFeeder): en
+        streaming solo se decide con lo que hay, así que un '.' al final del
+        buffer se retiene hasta ver el siguiente carácter (¿decimal? ¿abreviatura?).
         """
-        self._buffer += token
-        pieces, self._buffer = _split(self._buffer, final=False)
-        for piece in pieces:
-            self._q.put(piece)
+        self._feeder.feed(token)
+
+    def _encolar(self, sentence: str) -> None:
+        if self._prepare is not None:
+            self._prepare(sentence)
+        self._q.put(sentence)
 
     def finish(self, timeout_s: float = 120.0) -> bool:
         """Habla lo que quede en el buffer, espera la cola y devuelve si habló.
@@ -428,10 +715,7 @@ class StreamSpeaker:
         seguía (HUD idle, escucha del followup) y la cola sonaba ENCIMA de la
         grabación, que el STT tomaba por una orden. Ahora se cancela el hilo.
         """
-        tail = self._buffer.strip()
-        self._buffer = ""
-        if tail:
-            self._q.put(tail)
+        self._feeder.flush()
         self._q.put(None)
         inicio = time.monotonic()
         while self._thread.is_alive():

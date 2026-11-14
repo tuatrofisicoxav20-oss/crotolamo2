@@ -35,6 +35,7 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -717,7 +718,7 @@ def _check_portaudio(ctx: _Ctx) -> list[Check]:
     return [Check("portaudio", True, f"portaudio OK (sounddevice ve {n} dispositivos)")]
 
 
-def _check_oww(ctx: _Ctx) -> list[Check]:
+def _check_oww(ctx: _Ctx | None) -> list[Check]:
     # El MISMO import que hace el demonio (voice_runtime.import_openwakeword): sin
     # el módulo de entrenamiento, que arrastraba sklearn y scipy solo para decir
     # "importable".
@@ -730,6 +731,42 @@ def _check_oww(ctx: _Ctx) -> list[Check]:
         return [Check("voz-oww", False,
                       "falta openwakeword (sin él, solo modo simple/difuso está disponible)",
                       "pip install openwakeword  (o pip install -e '.[voice]')")]
+    # Importable no es cargable: con [wake].use_oww el doctor prueba la MISMA carga
+    # que hace el listener al arrancar (WakeWordDetector.can_load). Con el
+    # crotolamo.onnx del repo, al que le falta su .onnx.data, decía "modo
+    # concurrente OK" y el servicio caía al wake difuso (antes, arrancaba sordo).
+    # Sin la descarga del paquete: va por red sin timeout. Con use_oww=false no
+    # se carga nada, como en el listener.
+    if ctx is not None and ctx.settings.wake.get("use_oww", True):
+        from crotolamo.voice.wakeword import WakeWordDetector
+
+        detector = WakeWordDetector.from_settings(ctx.settings)
+        # openwakeword 0.5+ recién instalado: sus modelos llegan con la descarga
+        # que hace el servicio al arrancar. Sin ellos la carga sin red fallaría
+        # seguro y el ❌ diría lo contrario de lo que pasará: se avisa sin probarla.
+        pendientes = detector.pending_downloads()
+        if pendientes:
+            return [Check(
+                "voz-oww", True,
+                f"openwakeword importable; falta descargar {', '.join(pendientes)}: se "
+                "descarga al arrancar el servicio (sin red, usará el wake difuso)",
+                "Arranca el servicio una vez con red y repite el doctor para probar la carga.",
+                warn=True)]
+        # openwakeword 0.4 crea sus sesiones pidiendo CUDA: sin GPU, onnxruntime
+        # avisa por stderr. Ruido que la salida del doctor no traía; solo ese aviso.
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=".*CUDAExecutionProvider",
+                                    category=UserWarning)
+            cargado = detector.can_load(download=False)
+        if not cargado:
+            return [Check(
+                "voz-oww", False,
+                f"openwakeword importa pero [wake].oww_model no carga ({detector.load_error}); "
+                "el servicio usará el wake difuso (Whisper)",
+                "Revisa la ruta de [wake].oww_model. Si el .onnx se exportó con los pesos "
+                "aparte, pon su .onnx.data a su lado (o reexpórtalo con los pesos dentro); "
+                "un modelo pre-entrenado se descarga al arrancar el servicio con red. "
+                "Pruébalo con: python scripts/wake_debug.py --como-produccion")]
     return [Check("voz-oww", True, "openwakeword importable (modo concurrente OK)")]
 
 

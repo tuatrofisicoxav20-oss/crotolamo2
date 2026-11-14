@@ -19,6 +19,15 @@ reaccione en paralelo:  systemctl --user stop crotolamo.service
   python scripts/wake_debug.py                  # umbral de la config (oww_threshold)
   python scripts/wake_debug.py --threshold 0.6  # probar un candidato
   python scripts/wake_debug.py --verbose        # además, cada frame con score>piso
+  python scripts/wake_debug.py --como-produccion  # lo que decide el loop concurrente
+
+Por defecto mide frames exactos de 1280 muestras con score() (la referencia, la
+de listen_for_wake en --simple). --como-produccion mide lo que ve el oído del
+loop concurrente: chunks de 512 float32 (lo que entrega _RealMic) por el MISMO
+re-encuadre de feed(); en openwakeword 0.4 esos scores difieren de los de 1280.
+Solo imprime las predicciones NUEVAS (los chunks que no completan frame repiten
+la anterior), y "frames" cuenta predicciones. Producción resetea el detector al
+disparar; aquí no, para que el pico de cada activación no dependa del umbral.
 
 Ctrl+C termina e imprime el resumen para la bitácora.
 """
@@ -48,13 +57,16 @@ _FLOOR = 0.05
 # ráfaga de frames altos de UN "crotolamo" como UN evento (1 s a 80 ms/frame).
 _REFRACTORY_FRAMES = 12
 
+# Chunk del micrófono del loop concurrente (_RealMic): el frame que exige Silero.
+_CHUNK_PRODUCCION = 512
+
 
 def _fmt_clock(seconds: float) -> str:
     m, s = divmod(int(seconds), 60)
     return f"{m:02d}:{s:02d}"
 
 
-def run(threshold: float | None, verbose: bool) -> int:
+def run(threshold: float | None, verbose: bool, como_produccion: bool = False) -> int:
     settings = get_settings()
     detector = WakeWordDetector.from_settings(settings)
     if threshold is not None:
@@ -73,6 +85,9 @@ def run(threshold: float | None, verbose: bool) -> int:
     print(f"Umbral:  {detector.threshold:.2f}  (candidato --threshold)"
           if threshold is not None else
           f"Umbral:  {detector.threshold:.2f}  ([wake].oww_threshold)")
+    if como_produccion:
+        print("Modo:    como producción (chunks de 512 por el re-encuadre de feed(); "
+              "solo scores nuevos)")
     print("Escuchando... di 'crotolamo' (§1) o haz vida normal (§2). Ctrl+C = resumen.")
 
     start = time.monotonic()
@@ -100,12 +115,20 @@ def run(threshold: float | None, verbose: bool) -> int:
         print(f"(micrófono: {_device})")
 
     try:
-        with sd.InputStream(samplerate=_SAMPLE_RATE, channels=1, dtype="int16",
+        with sd.InputStream(samplerate=_SAMPLE_RATE, channels=1,
+                            dtype="float32" if como_produccion else "int16",
                             device=_device) as stream:
             while True:
-                block, _ = stream.read(_FRAME)
-                audio = np.squeeze(np.asarray(block, dtype=np.int16))
-                mx = detector.score(audio)
+                if como_produccion:
+                    block, _ = stream.read(_CHUNK_PRODUCCION)
+                    mx, nuevo = detector.stream_score(
+                        np.squeeze(np.asarray(block, dtype=np.float32)))
+                    if not nuevo:
+                        continue  # el score guardado: nada nuevo que medir
+                else:
+                    block, _ = stream.read(_FRAME)
+                    audio = np.squeeze(np.asarray(block, dtype=np.int16))
+                    mx = detector.score(audio)
                 frames += 1
                 now = time.monotonic()
                 clock = _fmt_clock(now - start)
@@ -172,7 +195,12 @@ def main() -> int:
                         help="candidato de umbral a probar (default: config)")
     parser.add_argument("--verbose", action="store_true",
                         help=f"imprime cada frame con score>={_FLOOR}")
+    parser.add_argument("--como-produccion", action="store_true",
+                        help="chunks de 512 por el re-encuadre de feed(), como el loop "
+                             "concurrente (default: frames exactos de 1280)")
     args = parser.parse_args()
+    if args.como_produccion:
+        return run(args.threshold, args.verbose, como_produccion=True)
     return run(args.threshold, args.verbose)
 
 

@@ -10,14 +10,18 @@ o grabar se exige la extra [voice].
 
 from __future__ import annotations
 
+import math
 import tempfile
 import threading
 import wave
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from crotolamo.logging_setup import get_logger
 from crotolamo.voice import runtime
 from crotolamo.voice.normalize import normalize_text
+from crotolamo.voice.vad import DEFAULTS, FIN, SIN_VOZ, Endpointer, resolve_neg_threshold
 
 log = get_logger("voice.stt")
 
@@ -117,6 +121,102 @@ class VoiceUnavailable(RuntimeError):
     """Faltan las dependencias de voz. Instala con: pip install -e '.[voice]'."""
 
 
+# Lo que el pre-filtro del wake ([wake].pregate) deja ANTES de su disparo: la
+# ventana que puntúa openWakeWord (16 embeddings = 1.28 s). Así la palabra encabeza
+# lo que transcribe Whisper (split_wake_command mira las 3 primeras palabras)
+# aunque se dijera a media ventana.
+_GATE_LOOKBACK_S = 1.28
+
+
+class _GateRun:
+    """Una grabación con pre-filtro (`gate`: rearm() y feed(chunk) -> bool, el
+    WakeWordDetector o un envoltorio). Al abrir el stream se le pide rearm() (el
+    del listener solo olvida tras un hueco del loop: ver listener._PreFiltro),
+    recibe CADA chunk leído hasta su primer disparo (el pre-roll incluido) y
+    recuerda en qué chunk fue.
+
+    Sin gate (None) no hace nada: la grabación es la de siempre. Un gate que lanza
+    se avisa y la ventana sigue SIN él, entera a Whisper como sin pre-filtro: el
+    pre-filtro solo ahorra pasadas, no puede dejar sordo al wake.
+    """
+
+    def __init__(self, gate: Any, lookback_chunks: int) -> None:
+        self.gate = gate
+        self.lookback = lookback_chunks
+        self.fired_at: int | None = None
+        if gate is not None:
+            self._call(gate.rearm)
+
+    def feed(self, index: int, block) -> None:
+        if self.gate is not None and self.fired_at is None and self._call(self.gate.feed, block):
+            self.fired_at = index
+
+    def _call(self, fn: Callable[..., Any], *args: Any) -> Any:
+        try:
+            return fn(*args)
+        except Exception as error:  # noqa: BLE001 - un pre-filtro roto no tumba la escucha
+            log.warning("pre-filtro del wake falló (%s); esta ventana va entera a Whisper",
+                        error)
+            self.gate = None
+            return False
+
+    def trim(self, frames: list, first_index: int) -> list:
+        """Lo que se devuelve: los frames tal cual sin gate; [] si nunca disparó
+        (nada para Whisper); si disparó, desde `lookback` chunks antes del disparo.
+        `first_index` es el chunk del que viene frames[0]."""
+        if self.gate is None:
+            return frames
+        if self.fired_at is None:
+            return []
+        return frames[max(0, self.fired_at - self.lookback - first_index):]
+
+
+def _leer_fuente(source: Any, frames: int, on_idle: Callable[[], bool] | None) -> Any:
+    """Siguiente bloque de `frames` muestras de una fuente YA abierta (el
+    contrato de capture.MicSession). Si en 1 s no llega audio (el micrófono
+    reintentando, la sesión suspendida o cerrada) se pregunta a on_idle: True =
+    seguir esperando; sin on_idle o False = None, y la grabación acaba ahí."""
+    while True:
+        block = source.read(timeout=1.0, frames=frames)
+        if block is not None:
+            return block
+        # Cerrada no entregará nada más: su read() vuelve al instante, y seguir
+        # preguntando a on_idle sería girar en vacío.
+        if getattr(source, "closed", False) or on_idle is None or not on_idle():
+            return None
+
+
+class _FuenteVigilada:
+    """La fuente de una grabación, recordando si fue ELLA la que lanzó.
+
+    Con el stream propio, cualquier error dentro de la grabación con Silero se
+    toma por un fallo del VAD y se reintenta con energía (y otro stream). Con
+    una fuente ya abierta, un fallo del micrófono no es del VAD ni lo arregla
+    otro VAD: _record_frames lo deja subir tal cual."""
+
+    def __init__(self, source: Any) -> None:
+        self._source = source
+        self.error: BaseException | None = None
+
+    @property
+    def closed(self) -> bool:
+        return bool(getattr(self._source, "closed", False))
+
+    def read(self, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return self._source.read(*args, **kwargs)
+        except Exception as error:
+            self.error = error
+            raise
+
+    def pending(self, *args: Any, **kwargs: Any) -> int:
+        try:
+            return self._source.pending(*args, **kwargs)
+        except Exception as error:
+            self.error = error
+            raise
+
+
 def _require(module: str):
     try:
         return __import__(module)
@@ -152,7 +252,7 @@ def _whisper_cpu_threads() -> int:
 
 
 class STT:
-    def __init__(self, model_size: str = "small", sample_rate: int = 16000,
+    def __init__(self, model_size: str = "small", sample_rate: int = DEFAULTS.sample_rate,
                  language: str = "es", initial_prompt: str | None = _INITIAL_PROMPT,
                  beam_size: int = 5) -> None:
         self.model_size = model_size
@@ -171,7 +271,7 @@ class STT:
         voice = settings.voice
         return cls(
             model_size=voice.get("whisper_model", "small"),
-            sample_rate=voice.get("sample_rate", 16000),
+            sample_rate=voice.get("sample_rate", DEFAULTS.sample_rate),
             beam_size=voice.get("beam_size", 5),
         )
 
@@ -220,15 +320,24 @@ class STT:
             wav.writeframes(data.tobytes())
 
     def _record_frames(self, silence_ms: int | None, max_seconds: float,
-                       start_timeout_s: float) -> list:
+                       start_timeout_s: float, gate: Any = None, source: Any = None,
+                       on_idle: Callable[[], bool] | None = None) -> list:
         """Graba hasta el silencio y devuelve los frames float32 crudos. Backend
         según [voice].vad_backend: 'silero' (M2) o 'energy' (fallback). Silero
         suma un buffer de pre-activación para no perder las primeras sílabas.
+        gate: pre-filtro del wake difuso (ver _GateRun); None = lo de siempre.
+        source/on_idle: fuente ya abierta (capture.MicSession) en vez de un
+        stream propio, ver _silero_de_fuente; None = lo de siempre. Con fuente,
+        un fallo de la FUENTE sube tal cual: no es del VAD (ver _FuenteVigilada).
         """
         voice = _voice_cfg()
         if silence_ms is None:
-            silence_ms = voice.get("vad_silence_ms", 640)
-        backend = voice.get("vad_backend", "energy")
+            silence_ms = voice.get("vad_silence_ms", DEFAULTS.silence_ms)
+        backend = voice.get("vad_backend", DEFAULTS.vad_backend)
+        # Sin fuente, los grabadores reciben exactamente los argumentos de siempre.
+        fuente = None if source is None else _FuenteVigilada(source)
+        extra: dict[str, Any] = {} if fuente is None else {"source": fuente,
+                                                            "on_idle": on_idle}
 
         if backend == "silero":
             if _silero_load_error is not None:
@@ -237,15 +346,19 @@ class STT:
             else:
                 try:
                     return self._record_silero(silence_ms, max_seconds, start_timeout_s,
-                                               voice)
+                                               voice, gate=gate, **extra)
                 except VoiceUnavailable:
                     raise
                 except Exception as error:  # noqa: BLE001 - si silero falla, caemos a energía
+                    if fuente is not None and fuente.error is error:
+                        raise
                     log.warning("VAD silero falló (%s); uso energía", error)
-        return self._record_energy(silence_ms, max_seconds, start_timeout_s)
+        return self._record_energy(silence_ms, max_seconds, start_timeout_s, gate=gate,
+                                   **extra)
 
-    def record_until_silence(self, silence_ms: int | None = None, max_seconds: float = 12.0,
-                             start_timeout_s: float = 4.0) -> Path:
+    def record_until_silence(self, silence_ms: int | None = None,
+                             max_seconds: float = DEFAULTS.max_command_s,
+                             start_timeout_s: float = DEFAULTS.command_start_timeout_s) -> Path:
         """Compat: graba y devuelve un WAV temporal. El camino caliente ya no
         pasa por aquí (usa record_audio_until_silence, sin tocar disco)."""
         return self._frames_to_wav(
@@ -253,16 +366,24 @@ class STT:
         )
 
     def record_audio_until_silence(self, silence_ms: int | None = None,
-                                   max_seconds: float = 12.0,
-                                   start_timeout_s: float = 4.0):
+                                   max_seconds: float = DEFAULTS.max_command_s,
+                                   start_timeout_s: float = DEFAULTS.command_start_timeout_s,
+                                   gate: Any = None,
+                                   source: Any = None,
+                                   on_idle: Callable[[], bool] | None = None):
         """Graba hasta el silencio y devuelve el audio float32 EN MEMORIA.
 
         Misión velocidad: faster-whisper acepta el ndarray directo, así que el
         WAV temporal (escribir a disco + relerlo + borrarlo por frase) era costo
         puro. Este es el camino caliente de todos los comandos.
+
+        source/on_idle: leer de una fuente ya abierta (capture.MicSession) en vez
+        de abrir el micrófono; ver _silero_de_fuente. None = lo de siempre.
         """
+        extra: dict[str, Any] = {} if source is None else {"source": source,
+                                                            "on_idle": on_idle}
         return self._frames_to_audio(
-            self._record_frames(silence_ms, max_seconds, start_timeout_s)
+            self._record_frames(silence_ms, max_seconds, start_timeout_s, gate=gate, **extra)
         )
 
     def _frames_to_audio(self, frames: list):
@@ -285,9 +406,16 @@ class STT:
         return path
 
     def _record_energy(self, silence_ms: int, max_seconds: float,
-                       start_timeout_s: float) -> list:
+                       start_timeout_s: float, gate: Any = None, source: Any = None,
+                       on_idle: Callable[[], bool] | None = None) -> list:
         """VAD por energía RMS. Calibra el piso de ruido con ~10 chunks (M1 audit).
-        Si en la ventana solo hubo ruido estable, devuelve [] (igual que Silero)."""
+        Si en la ventana solo hubo ruido estable, devuelve [] (igual que Silero).
+        gate: pre-filtro del wake difuso (ver _GateRun).
+        source/on_idle: fuente ya abierta en vez de un stream propio (ver
+        _energia_de_fuente); None = lo de siempre."""
+        if source is not None:
+            return self._energia_de_fuente(silence_ms, max_seconds, start_timeout_s,
+                                           gate, source, on_idle)
         np = _require("numpy")
         sd = _require("sounddevice")
 
@@ -310,10 +438,12 @@ class STT:
 
         with sd.InputStream(samplerate=self.sample_rate, channels=1, dtype="float32",
                             device=_voice_cfg().get("input_device")) as stream:
+            gated = _GateRun(gate, math.ceil(_GATE_LOOKBACK_S * self.sample_rate / chunk))
             for i in range(max_chunks):
                 block, _ = stream.read(chunk)
                 block = np.squeeze(block)
                 frames.append(block)
+                gated.feed(i, block)
                 rms = float(np.sqrt(np.mean(block ** 2)) + 1e-9)
                 if rms > 1e-6 and (rms_floor == 0.0 or rms < rms_floor):
                     rms_floor = rms
@@ -348,74 +478,197 @@ class STT:
         # algún chunk supera 3x el más bajo, y el audio llega a Whisper como antes.
         if not speaking and (rms_floor == 0.0 or rms_max < rms_floor * ratio):
             return []
-        return frames
+        return gated.trim(frames, 0)
 
-    def _record_silero(self, silence_ms: int, max_seconds: float,
-                       start_timeout_s: float, voice: dict) -> list:
-        """VAD neuronal Silero (de GLaDOS, M2). Probabilidad de voz por chunk de
-        32 ms + buffer circular de pre-activación para no perder el inicio.
-        """
+    def _energia_de_fuente(self, silence_ms: int, max_seconds: float,
+                           start_timeout_s: float, gate: Any, source: Any,
+                           on_idle: Callable[[], bool] | None) -> list:
+        """_record_energy sobre una fuente ya abierta: mismas decisiones chunk a
+        chunk (bloques de 30 ms que la fuente re-encuadra), con lo propio de leer
+        de una fuente que explica _silero_de_fuente. Al pedir seguir tras una
+        espera agotada, recalibra y empieza los frames ahí, como una llamada
+        nueva (la energía no tiene pre-activación que conservar)."""
         np = _require("numpy")
-        sd = _require("sounddevice")
-        from collections import deque
 
-        from crotolamo.voice.vad import is_voice, resolve_neg_threshold
-
-        model = _get_silero_vad()
-        model.reset_states()
-        threshold = voice.get("vad_threshold", 0.8)
-        # Histéresis (misma decisión que el loop concurrente, ver voice/vad.py):
-        # ausente/None = sin histéresis, comportamiento idéntico al histórico.
-        neg_threshold = resolve_neg_threshold(threshold, voice.get("vad_neg_threshold"))
-        pre_ms = voice.get("vad_preactivation_ms", 800)
-
-        chunk = 512  # Silero exige 512 muestras a 16 kHz (32 ms).
-        chunk_ms = chunk * 1000 / self.sample_rate
+        chunk_ms = 30
+        chunk = int(self.sample_rate * chunk_ms / 1000)
         silence_chunks = max(1, int(silence_ms / chunk_ms))
         max_chunks = int(max_seconds * 1000 / chunk_ms)
         start_chunks = int(start_timeout_s * 1000 / chunk_ms)
-        pre_chunks = max(1, int(pre_ms / chunk_ms))
+        calib_chunks = 10
+        ratio = 3.0  # voz = RMS >= max(piso de ruido * ratio, 0.01)
 
-        pre_buffer: deque = deque(maxlen=pre_chunks)
         frames: list = []
         speaking = False
         silent_run = 0
+        threshold = None
+        calib_rms: list[float] = []
+        rms_floor = rms_max = 0.0
+        origen = 0  # chunk del que viene frames[0] (y con el que empieza la calibración)
+        # Chunk desde el que cuentan los plazos: el de la llamada, tras lo que la
+        # fuente ya tenía capturado (como si el stream se abriera aquí).
+        ventana = int(source.pending(chunk))
+        lookback = math.ceil(_GATE_LOOKBACK_S * self.sample_rate / chunk)
+        gated = _GateRun(gate, lookback)
+        i = -1
+        while True:
+            i += 1
+            if i - ventana >= max_chunks:
+                break
+            block = _leer_fuente(source, chunk, on_idle)
+            if block is None:
+                break
+            block = np.squeeze(block)
+            frames.append(block)
+            gated.feed(i, block)
+            rms = float(np.sqrt(np.mean(block ** 2)) + 1e-9)
+            if rms > 1e-6 and (rms_floor == 0.0 or rms < rms_floor):
+                rms_floor = rms
+            rms_max = max(rms_max, rms)
+
+            if i - origen < calib_chunks:
+                calib_rms.append(rms)
+                continue
+            if threshold is None:
+                noise_floor = float(np.mean(calib_rms)) if calib_rms else 0.0
+                threshold = max(noise_floor * ratio, 0.01)
+
+            if rms >= threshold:
+                speaking = True
+                silent_run = 0
+            elif speaking:
+                silent_run += 1
+                if silent_run >= silence_chunks:
+                    break
+
+            if not speaking and i - ventana >= start_chunks:
+                if on_idle is None or not on_idle():
+                    break
+                frames, calib_rms, threshold = [], [], None
+                rms_floor = rms_max = 0.0
+                origen = ventana = i + 1
+                gated = _GateRun(gate, lookback)
+
+        if not speaking and (rms_floor == 0.0 or rms_max < rms_floor * ratio):
+            return []
+        return gated.trim(frames, origen)
+
+    def _record_silero(self, silence_ms: int, max_seconds: float,
+                       start_timeout_s: float, voice: dict, gate: Any = None,
+                       source: Any = None, on_idle: Callable[[], bool] | None = None) -> list:
+        """VAD neuronal Silero (de GLaDOS, M2). Probabilidad de voz por chunk de
+        32 ms + buffer circular de pre-activación para no perder el inicio.
+        gate: pre-filtro del wake difuso (ver _GateRun).
+        source/on_idle: fuente ya abierta en vez de un stream propio (ver
+        _silero_de_fuente); None = lo de siempre.
+        """
+        if source is not None:
+            return self._silero_de_fuente(silence_ms, max_seconds, start_timeout_s, voice,
+                                          gate, source, on_idle)
+        np = _require("numpy")
+        sd = _require("sounddevice")
+
+        model = _get_silero_vad()
+        model.reset_states()
+        chunk = 512  # Silero exige 512 muestras a 16 kHz (32 ms).
+        ep, max_chunks = self._endpointer(silence_ms, max_seconds, start_timeout_s, voice,
+                                          chunk)
 
         # input_device: None = default del sistema; "crotolamo_aec_source" tras el AEC.
         with sd.InputStream(samplerate=self.sample_rate, channels=1, dtype="float32",
                             device=voice.get("input_device")) as stream:
+            gated = _GateRun(gate, math.ceil(_GATE_LOOKBACK_S * self.sample_rate / chunk))
             for i in range(max_chunks):
                 block, _ = stream.read(chunk)
                 block = np.squeeze(np.asarray(block, dtype=np.float32))
+                gated.feed(i, block)
                 # ascontiguousarray evita la copia extra que hacía .copy(): solo
                 # copia si el bloque no es ya un array float32 contiguo. El modelo
                 # recibe numpy: ya no hace falta torch (antes, sin torch, esto
                 # lanzaba VoiceUnavailable y el servicio salía en bucle).
                 prob = float(model(np.ascontiguousarray(block, dtype=np.float32),
                                    self.sample_rate))
+                if ep.feed(block, prob) in (FIN, SIN_VOZ):
+                    break
 
-                if not speaking:
-                    pre_buffer.append(block)
-                    # Entrar exige el umbral ALTO (no despertar con cualquier ruido).
-                    if is_voice(prob, speaking=False, threshold=threshold,
-                                neg_threshold=neg_threshold):
-                        speaking = True
-                        frames.extend(pre_buffer)  # M2.2: anteponer la pre-activación
-                        silent_run = 0
-                    elif i >= start_chunks:
-                        break
-                else:
-                    frames.append(block)
-                    # Mantenerse basta con el umbral BAJO (histéresis).
-                    if is_voice(prob, speaking=True, threshold=threshold,
-                                neg_threshold=neg_threshold):
-                        silent_run = 0
-                    else:
-                        silent_run += 1
-                        if silent_run >= silence_chunks:
-                            break
+        return gated.trim(ep.frames, ep.first)
 
-        return frames
+    def _endpointer(self, silence_ms: int, max_seconds: float, start_timeout_s: float,
+                    voice: dict, chunk: int, ahead: int = 0) -> tuple[Endpointer, int]:
+        """El Endpointer (voice/vad.py) de una grabación con Silero y su tope en chunks.
+
+        El modo simple siempre esperó la voz UN chunk más que su plazo (su `i >=
+        start_chunks` contaba los chunks ANTERIORES al actual; el oído cuenta el
+        actual): de ahí el + 1, que conserva cada decisión tal cual. ahead: chunks
+        ya capturados por la fuente al empezar (ver _silero_de_fuente).
+        """
+        threshold = voice.get("vad_threshold", DEFAULTS.vad_threshold)
+        # Histéresis (misma decisión que el loop concurrente, ver voice/vad.py):
+        # ausente/None = sin histéresis, comportamiento idéntico al histórico.
+        neg_threshold = resolve_neg_threshold(
+            threshold, voice.get("vad_neg_threshold", DEFAULTS.vad_neg_threshold))
+        pre_ms = voice.get("vad_preactivation_ms", DEFAULTS.vad_preactivation_ms)
+        chunk_ms = chunk * 1000 / self.sample_rate
+        max_chunks = int(max_seconds * 1000 / chunk_ms)
+        ep = Endpointer(threshold=threshold, neg_threshold=neg_threshold,
+                        silence_chunks=max(1, int(silence_ms / chunk_ms)),
+                        max_chunks=max_chunks,
+                        start_chunks=int(start_timeout_s * 1000 / chunk_ms) + 1,
+                        pre_chunks=max(1, int(pre_ms / chunk_ms)), ahead=ahead)
+        return ep, max_chunks
+
+    def _silero_de_fuente(self, silence_ms: int, max_seconds: float,
+                          start_timeout_s: float, voice: dict, gate: Any, source: Any,
+                          on_idle: Callable[[], bool] | None) -> list:
+        """_record_silero sobre una fuente ya abierta (capture.MicSession): las
+        mismas decisiones chunk a chunk que con el stream propio (lo comparan
+        los tests de tests/test_capture.py), más lo que solo existe porque el
+        micrófono no se abre aquí:
+
+        - Los plazos (start_timeout_s, max_seconds) cuentan desde ESTA llamada,
+          como cuando el stream se abría aquí: lo que la fuente ya tenía (lo que
+          sonó mientras Whisper decodificaba) se lee primero y los alarga igual.
+        - Agotada la espera sin voz, o si en 1 s no llega audio, se pregunta a
+          on_idle(): True = seguir esperando en la misma fuente (tras la espera
+          agotada, como una llamada nueva: Silero en blanco y plazos desde ahí,
+          pero CONSERVANDO la pre-activación, que una llamada nueva perdía); sin
+          on_idle o False, la grabación acaba ahí: [] sin voz, lo grabado con ella.
+        - Un error de la fuente sube tal cual (ver _FuenteVigilada).
+        """
+        np = _require("numpy")
+
+        model = _get_silero_vad()
+        model.reset_states()
+        chunk = 512  # Silero exige 512 muestras a 16 kHz (32 ms).
+        # Los plazos cuentan desde la llamada, tras lo ya capturado (ahead) y, si
+        # on_idle pide seguir, desde el chunk siguiente a la espera agotada.
+        ep, _ = self._endpointer(silence_ms, max_seconds, start_timeout_s, voice, chunk,
+                                 ahead=int(source.pending(chunk)))
+        lookback = math.ceil(_GATE_LOOKBACK_S * self.sample_rate / chunk)
+        gated = _GateRun(gate, lookback)
+        i = -1
+        while True:
+            i += 1
+            if ep.expired():
+                break
+            block = _leer_fuente(source, chunk, on_idle)
+            if block is None:
+                break
+            block = np.squeeze(np.asarray(block, dtype=np.float32))
+            gated.feed(i, block)
+            prob = float(model(np.ascontiguousarray(block, dtype=np.float32),
+                               self.sample_rate))
+            estado = ep.feed(block, prob)
+            if estado == SIN_VOZ:
+                if on_idle is None or not on_idle():
+                    break
+                model.reset_states()
+                ep.restart()
+                gated = _GateRun(gate, lookback)
+            elif estado == FIN:
+                break
+
+        return gated.trim(ep.frames, ep.first)
 
     # --- transcripción ---
     def transcribe(self, audio, hotwords: str | None = None) -> str:
@@ -460,42 +713,59 @@ class STT:
         return self._listen_transcribe(**vad_kwargs)
 
     def _listen_transcribe(self, hotwords: str | None = None,
-                           min_audio_s: float = 0.0, **vad_kwargs) -> str:
+                           min_audio_s: float = 0.0,
+                           transcribe_if: Callable[[], bool] | None = None,
+                           **vad_kwargs) -> str:
         """Graba y transcribe EN MEMORIA (sin WAV temporal). min_audio_s: si la
         grabación quedó más corta (el VAD nunca detectó voz), devuelve "" SIN
         pasar por Whisper — el modelo paddea a ventanas de 30s, así que
         transcribir silencio cuesta ~1s con el micrófono cerrado. En el bucle
         del wake eso era una ventana SORDA cada ciclo silencioso; ahora el mic
         reabre de inmediato.
+
+        transcribe_if: se consulta con la grabación YA hecha; si dice False,
+        devuelve "" sin Whisper. Es para quien tiraría el texto de todos modos
+        (el wake difuso con la escucha pausada a media ventana): no cambia
+        ninguna transcripción, solo se ahorra la que nadie iba a usar.
         """
         audio = self.record_audio_until_silence(**vad_kwargs)
         if min_audio_s > 0 and (audio.size / self.sample_rate) < min_audio_s:
             return ""
+        if transcribe_if is not None and not transcribe_if():
+            return ""
         return self.transcribe(audio, hotwords=hotwords)
 
-    def listen_smart(self, silence_ms: int | None = None, max_seconds: float = 12.0,
-                     start_timeout_s: float = 4.0, rounds: int = 2,
-                     continue_timeout_s: float = 2.5,
+    def listen_smart(self, silence_ms: int | None = None,
+                     max_seconds: float = DEFAULTS.max_command_s,
+                     start_timeout_s: float = DEFAULTS.command_start_timeout_s,
+                     rounds: int = DEFAULTS.endpoint_rounds,
+                     continue_timeout_s: float = DEFAULTS.endpoint_continue_s,
                      hotwords: str | None = None,
-                     min_audio_s: float = 0.0) -> str:
+                     min_audio_s: float = 0.0, source: Any = None) -> str:
         """Escucha con endpointing inteligente: si la frase parece INCOMPLETA
         (pausa de pensar: termina en "de", "para", coma...), reabre la escucha
         `continue_timeout_s` segundos y concatena la continuación, hasta
         `rounds` veces. Si la continuación sale vacía (de verdad ya terminó),
         se queda con lo que hay. Con rounds=0 equivale a listen_once.
+
+        source: fuente ya abierta (capture.MicSession) para TODAS las rondas.
+        Con el stream propio, la continuación abría el suyo tras decodificar la
+        primera parte y el arranque de la frase que seguía se perdía; con la
+        fuente, eso queda capturado y se lee primero. None = lo de siempre.
         """
         from crotolamo.voice.endpoint import seems_incomplete
 
+        fuente: dict[str, Any] = {} if source is None else {"source": source}
         text = self._listen_transcribe(
             hotwords=hotwords, min_audio_s=min_audio_s, silence_ms=silence_ms,
-            max_seconds=max_seconds, start_timeout_s=start_timeout_s,
+            max_seconds=max_seconds, start_timeout_s=start_timeout_s, **fuente,
         )
         for _ in range(max(0, rounds)):
             if not text.strip() or not seems_incomplete(text):
                 break
             extra = self._listen_transcribe(
                 hotwords=hotwords, min_audio_s=min_audio_s, silence_ms=silence_ms,
-                max_seconds=max_seconds, start_timeout_s=continue_timeout_s,
+                max_seconds=max_seconds, start_timeout_s=continue_timeout_s, **fuente,
             )
             if not extra.strip():
                 break

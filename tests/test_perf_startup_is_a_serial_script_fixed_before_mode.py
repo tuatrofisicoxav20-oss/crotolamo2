@@ -8,6 +8,17 @@ lanza ni se queda con la decisión del fallback: el primer uso real avisa y deci
 exactamente como sin calentar. Se fija con cuentas (construcciones, hilos que
 chocaron en el cargador), no con relojes.
 
+Paso 2 (listener): primero se decide el modo y luego se calienta, en el hilo
+WarmVoice, lo que ese loop usa y en el orden en que lo usa: Piper primero (el
+saludo, a la vez que la decisión del modo), Silero, y el Whisper de la orden; el
+'tiny' del wake solo con el wake difuso. Se fija con construcciones por hilo y en
+orden, de punta a punta por run_listen con los cargadores reales. El calentador
+tiene dueño: al salir run_listen no carga más y su espera es acotada.
+
+Paso 3 (listener): el warm-up del LLM solo llama a chat() si el primario es un
+modelo local (needs_warmup, o LLMClient si el cliente no lo declara): con GLM, 0
+llamadas a la nube por arranque; con Ollama (o glm sin key), 1, como antes.
+
 Paso 4 (MCP): los handshakes de los servers corren A LA VEZ y el registro sigue
 en serie, en el hilo del llamador y en el orden de la config. Se fija con
 CUENTAS, no con relojes: handshakes en vuelo a la vez, lanzamientos (Popen) por
@@ -598,6 +609,511 @@ def test_wake_warm_sin_openwakeword_no_lanza(monkeypatch):
     assert det.warm() is False
     assert _error(det._get_model) == sin_calentar
     assert sin_calentar.startswith("VoiceUnavailable: Falta openwakeword")
+
+
+# ---------------------------------------------------------------------------
+# Paso 2: primero el modo, luego el calentamiento en el orden del primer uso
+# ---------------------------------------------------------------------------
+
+_ORDEN = "_perf_orden_"  # tamaños de Whisper que solo usan estos tests
+_WAKE = "_perf_wake_"
+
+
+class _SttPlan:
+    """Lo mínimo de STT que mira _warm_plan: el tamaño y su cargador (_get_model)."""
+
+    def __init__(self, model_size: str, llamadas: list[str]) -> None:
+        self.model_size = model_size
+        self._llamadas = llamadas
+
+    def _get_model(self) -> object:
+        self._llamadas.append(f"whisper:{self.model_size}")
+        return object()
+
+
+@pytest.mark.parametrize("modo, concurrente, use_oww, vad_silero, esperado", [
+    # El oído del concurrente usa Silero SIEMPRE (_SileroVad no mira vad_backend).
+    ("concurrente", True, True, True, ["silero", "whisper:base"]),
+    ("concurrente", True, True, False, ["silero", "whisper:base"]),
+    # simple + openWakeWord: grabación de la orden (Silero según vad_backend) y su
+    # Whisper; la confirmación por voz también usa el de la orden (C5).
+    ("simple_oww", False, True, True, ["silero", "whisper:base"]),
+    ("simple_oww", False, True, False, ["whisper:base"]),
+    # difuso: grabación del wake y los dos Whisper; el de la orden primero, como
+    # antes (con 'tiny' primero el proceso queda con ~40-50 MB más de RSS).
+    ("difuso", False, False, True, ["silero", "whisper:base", "whisper:tiny"]),
+    ("difuso", False, False, False, ["whisper:base", "whisper:tiny"]),
+])
+def test_plan_de_calentamiento_por_modo(monkeypatch, modo, concurrente, use_oww, vad_silero,
+                                         esperado):
+    """El orden es el del primer uso del loop elegido, y el 'tiny' del wake solo
+    entra con el wake difuso: el concurrente y el simple+oww nunca lo usan."""
+    from interfaces import listener
+
+    llamadas: list[str] = []
+    monkeypatch.setattr(listener, "warm_vad", lambda: llamadas.append("silero") or True)
+    plan = listener._warm_plan(concurrente, use_oww, vad_silero,
+                               _SttPlan("base", llamadas), _SttPlan("tiny", llamadas))
+    assert [nombre for nombre, _ in plan] == esperado
+    assert ("whisper:tiny" in esperado) is (modo == "difuso")
+    # Cada nombre llama al cargador de SU objeto (el del wake no carga la orden).
+    for _nombre, cargar in plan:
+        assert cargar() is True
+    assert llamadas == esperado
+
+
+def test_plan_difuso_con_el_mismo_tamano_carga_whisper_una_vez(monkeypatch):
+    from interfaces import listener
+
+    monkeypatch.setattr(listener, "warm_vad", lambda: True)
+    plan = listener._warm_plan(False, False, True, _SttPlan("base", []), _SttPlan("base", []))
+    assert [nombre for nombre, _ in plan] == ["silero", "whisper:base"]
+
+
+def _settings_voz(tmp_path: Path, *, use_oww: bool, vad: str) -> types.SimpleNamespace:
+    """Config mínima para run_listen con los STT/TTS/WakeWordDetector REALES: sin
+    ducking ni umbrales con música (no arranca el monitor de playerctl)."""
+    (tmp_path / "voz.onnx").touch()
+    return types.SimpleNamespace(
+        voice={"whisper_model": _ORDEN, "wake_whisper_model": _WAKE, "vad_backend": vad,
+               "piper_voice": "voz.onnx", "wake_duck": False, "wake_threshold_media": 0.67},
+        wake={"use_oww": use_oww, "oww_model": "hey_jarvis", "oww_threshold_media": 0.5},
+        paths={"voces": tmp_path},
+    )
+
+
+def _arnes_arranque(monkeypatch, tmp_path: Path, settings: Any) -> dict[str, Any]:
+    """run_listen con las clases de voz reales sobre los vendors falsos de `cargas`;
+    todo lo demás (agente, LLM, HUD, señales, el cuerpo de los loops) es falso. El
+    loop falso espera a que WarmVoice termine y anota con qué lo armaron."""
+    from crotolamo.core import engine
+    from crotolamo.voice import loop as voice_loop
+    from crotolamo.voice import state as voice_state
+    from interfaces import listener
+
+    visto: dict[str, Any] = {"dichos": []}
+    real_read = voice_state.read_control_enabled
+    control = tmp_path / "control.json"
+    monkeypatch.setitem(sys.modules, "sounddevice", types.ModuleType("sounddevice"))
+    monkeypatch.setattr(stt_mod, "_models", {})
+    monkeypatch.setattr(stt_mod, "_model_locks", {})
+    # El saludo no sintetiza: así Piper solo lo construye quien lo precalienta.
+    monkeypatch.setattr(TTS, "speak", lambda self, text, **kw: visto["dichos"].append(text))
+    monkeypatch.setattr(listener, "get_settings", lambda: settings)
+    monkeypatch.setattr(listener, "_install_signal_handlers", lambda: None)
+    monkeypatch.setattr(listener, "build_agent",
+                        lambda confirm_fn=None: (types.SimpleNamespace(), None))
+    monkeypatch.setattr(engine, "build_primary_llm",
+                        lambda s: types.SimpleNamespace(needs_warmup=False))
+    monkeypatch.setattr(listener, "_HUD_STATE_PATH", tmp_path / "hud_state.json")
+    monkeypatch.setattr(listener, "CONTROL_PATH", control)
+    monkeypatch.setattr(listener, "read_control_enabled", lambda path=control: real_read(path))
+    for nombre in ("_ACTIVE_DUCKER", "_ACTIVE_MEDIA", "_ACTIVE_HUD_GATE"):
+        monkeypatch.setattr(listener, nombre, None)
+
+    def esperar_calentamiento() -> None:
+        visto["calentador_vivo_en_el_loop"] = [
+            t.name for t in threading.enumerate() if t.name == "WarmVoice"]
+        for hilo in threading.enumerate():
+            if hilo.name == "WarmVoice":
+                hilo.join(5)
+
+    class _Loop:
+        def __init__(self, agent, stt, tts, wake_detector, **kwargs: Any) -> None:
+            visto["loop"] = ("concurrente", stt.model_size)
+            self.state = None
+
+        def run(self) -> int:
+            if not visto.get("no_esperar"):
+                esperar_calentamiento()
+            return 0
+
+    def _simple(*, stt, wake_stt, use_oww, **kwargs: Any) -> int:
+        visto["loop"] = ("simple", stt.model_size, wake_stt.model_size, use_oww)
+        esperar_calentamiento()
+        return 0
+
+    monkeypatch.setattr(voice_loop, "VoiceLoop", _Loop)
+    monkeypatch.setattr(listener, "_run_simple_loop", _simple)
+    return visto
+
+
+def _por_hilo(cargas: Construcciones) -> dict[str, list[str]]:
+    hilos: dict[str, list[str]] = {}
+    for etiqueta, hilo in cargas.hechas:
+        hilos.setdefault(hilo, []).append(etiqueta)
+    return hilos
+
+
+@pytest.mark.parametrize("argv, use_oww, vad, loop, principal, calentador", [
+    ([], True, "silero", "concurrente", ["oww"], ["piper", "silero", f"whisper:{_ORDEN}"]),
+    # _SileroVad del oído no mira vad_backend: con 'energy' el concurrente sigue con Silero.
+    ([], True, "energy", "concurrente", ["oww"], ["piper", "silero", f"whisper:{_ORDEN}"]),
+    (["--simple"], True, "silero", "simple", ["oww"],
+     ["piper", "silero", f"whisper:{_ORDEN}"]),
+    (["--simple"], True, "energy", "simple", ["oww"], ["piper", f"whisper:{_ORDEN}"]),
+    (["--simple"], False, "silero", "simple", [],
+     ["piper", "silero", f"whisper:{_ORDEN}", f"whisper:{_WAKE}"]),
+    (["--simple"], False, "energy", "simple", [],
+     ["piper", f"whisper:{_ORDEN}", f"whisper:{_WAKE}"]),
+    # use_oww=false sin --simple: el wake difuso, igual que con --simple.
+    ([], False, "silero", "simple", [],
+     ["piper", "silero", f"whisper:{_ORDEN}", f"whisper:{_WAKE}"]),
+])
+def test_run_listen_calienta_lo_que_usa_el_modo_en_su_orden(
+        cargas, monkeypatch, tmp_path, argv, use_oww, vad, loop, principal, calentador):
+    """De punta a punta con los cargadores reales: WarmVoice construye Piper
+    primero (el saludo) y luego lo que el loop elegido usa, en orden de primer
+    uso; el modelo de openWakeWord lo sigue cargando el hilo principal (decide el
+    modo). El 'tiny' del wake: 0 construcciones fuera del difuso (antes, 1 en
+    todos los modos: +64 MB que el concurrente jamás usa). Nada se construye dos
+    veces ni en otro hilo."""
+    from interfaces import listener
+
+    visto = _arnes_arranque(monkeypatch, tmp_path, _settings_voz(tmp_path, use_oww=use_oww,
+                                                                 vad=vad))
+    assert listener.run_listen(argv) == 0
+    assert _por_hilo(cargas) == ({"MainThread": principal, "WarmVoice": calentador}
+                                 if principal else {"WarmVoice": calentador})
+    assert visto["loop"][0] == loop and visto["loop"][1] == _ORDEN
+    if loop == "simple":
+        # El loop simple sigue recibiendo el STT del wake tal cual (difuso o no).
+        assert visto["loop"][2:] == (_WAKE, use_oww)
+    assert visto["dichos"][0].startswith("Crotolamo escuchando, patrón.")
+    assert not [t for t in threading.enumerate() if t.name == "WarmVoice"]
+
+
+def test_piper_carga_mientras_se_decide_el_modo(cargas, monkeypatch, tmp_path):
+    """Piper se encola ANTES de la decisión del modo: su carga va a la vez que la
+    de openWakeWord en el hilo principal (antes: detrás de dos Whisper). Se prueba
+    con esperas acotadas, no con relojes: available() ve a Piper ya cargando."""
+    from interfaces import listener
+
+    piper_empezo = threading.Event()
+    real_load = sys.modules["piper"].PiperVoice.load
+
+    def load(path: str) -> Any:
+        piper_empezo.set()
+        return real_load(path)
+
+    monkeypatch.setattr(sys.modules["piper"].PiperVoice, "load", staticmethod(load))
+    real_available = WakeWordDetector.available
+    vio_piper: list[bool] = []
+
+    def available(self: WakeWordDetector) -> bool:
+        vio_piper.append(piper_empezo.wait(5))
+        return real_available(self)
+
+    monkeypatch.setattr(WakeWordDetector, "available", available)
+    _arnes_arranque(monkeypatch, tmp_path, _settings_voz(tmp_path, use_oww=True, vad="silero"))
+    assert listener.run_listen([]) == 0
+    assert vio_piper == [True]
+    assert cargas.hechas[0] == ("piper", "WarmVoice")
+
+
+def test_el_calentador_tiene_dueno_al_salir_espera_acotada_y_no_carga_mas(
+        cargas, monkeypatch, tmp_path):
+    """Si el loop termina con el calentamiento a medias (el oído se rindió al
+    arrancar), run_listen no espera más de _WARM_STOP_S a la carga en curso, y lo
+    que quedaba en cola ya no se carga: el hilo termina en cuanto suelta esa carga."""
+    from interfaces import listener
+
+    soltar = threading.Event()
+    piper_empezo = threading.Event()
+    real_load = sys.modules["piper"].PiperVoice.load
+
+    def load(path: str) -> Any:
+        piper_empezo.set()
+        soltar.wait(10)
+        return real_load(path)
+
+    monkeypatch.setattr(sys.modules["piper"].PiperVoice, "load", staticmethod(load))
+    monkeypatch.setattr(listener, "_WARM_STOP_S", 0.2)
+    real_plan = listener._warm_plan
+
+    def plan(*args: Any) -> Any:
+        # Determinista: Piper ya está cargando (en vuelo) cuando el loop termina. Si
+        # WarmVoice arrancara tarde (máquina cargada), stop() llegaría antes que su
+        # primer item y, bien hecho, no cargaría nada: no es lo que se prueba aquí.
+        assert piper_empezo.wait(5)
+        return real_plan(*args)
+
+    monkeypatch.setattr(listener, "_warm_plan", plan)
+    visto = _arnes_arranque(monkeypatch, tmp_path,
+                            _settings_voz(tmp_path, use_oww=True, vad="silero"))
+    visto["no_esperar"] = True
+    try:
+        assert listener.run_listen([]) == 0
+        calentador = [t for t in threading.enumerate() if t.name == "WarmVoice"]
+        assert len(calentador) == 1, "run_listen esperó sin límite a la carga en curso"
+    finally:
+        soltar.set()
+    calentador[0].join(5)
+    assert not calentador[0].is_alive()
+    assert _por_hilo(cargas) == {"MainThread": ["oww"], "WarmVoice": ["piper"]}
+
+
+def test_un_arranque_que_revienta_al_decidir_el_modo_no_deja_al_calentador_esperando(
+        cargas, monkeypatch, tmp_path):
+    """El error sube como siempre, y el hilo WarmVoice (que ya tenía a Piper) no
+    se queda colgado esperando el resto del plan."""
+    from interfaces import listener
+
+    def available(self: WakeWordDetector) -> bool:
+        raise RuntimeError("openwakeword roto")
+
+    monkeypatch.setattr(WakeWordDetector, "available", available)
+    _arnes_arranque(monkeypatch, tmp_path, _settings_voz(tmp_path, use_oww=True, vad="silero"))
+    with pytest.raises(RuntimeError, match="openwakeword roto"):
+        listener.run_listen([])
+    assert esperar(lambda: not [t for t in threading.enumerate() if t.name == "WarmVoice"])
+    assert set(cargas.etiquetas()) <= {"piper"}
+
+
+def test_el_calentador_sobrevive_a_un_cargador_que_revienta(monkeypatch, caplog):
+    """Frontera de excepciones: un cargador que lanza (en vez de devolver False) no
+    mata al hilo; se avisa y se sigue con el resto, en orden."""
+    from interfaces import listener
+
+    hechos: list[str] = []
+
+    def revienta() -> bool:
+        raise RuntimeError("cargador roto")
+
+    caplog.set_level(logging.INFO, logger="crotolamo")
+    calentador = listener._Warmer()
+    calentador.add("piper", lambda: hechos.append("piper") or True)
+    calentador.add("silero", revienta)
+    calentador.add("whisper:base", lambda: hechos.append("whisper:base") or True)
+    calentador.add("whisper:tiny", lambda: False)  # no cargó: lo decide su primer uso
+    calentador.close()
+    calentador.join(5)
+    assert hechos == ["piper", "whisper:base"]
+    mensajes = [(r.levelno, r.getMessage()) for r in caplog.records
+                if r.name.startswith("crotolamo.listener")]
+    assert (logging.WARNING, "no pude precalentar la voz: cargador roto (silero)") in mensajes
+    assert (logging.INFO, "voz caliente (piper, whisper:base); sin precalentar (lo decide "
+            "su primer uso): silero, whisper:tiny") in mensajes
+
+
+# ---------------------------------------------------------------------------
+# Revisión del paso 2: el aviso de una voz rota y el dueño en todas las salidas
+# ---------------------------------------------------------------------------
+
+def _causa(fn: Callable[[], Any]) -> str:
+    """El texto del error tal cual (lo que el aviso de antes ponía tras los dos puntos)."""
+    try:
+        fn()
+    except Exception as error:  # noqa: BLE001 - se compara el texto tal cual
+        return str(error)
+    raise AssertionError("no lanzó")
+
+
+@pytest.mark.parametrize("argv, use_oww, rompe, cargados, sin_cargar", [
+    # Concurrente sin el extra [voice] completo: falta faster_whisper.
+    ([], True, "faster_whisper", ["piper", "silero"], [f"whisper:{_ORDEN}"]),
+    # Difuso (el modo del patrón): los dos Whisper fallan por LA MISMA causa; antes
+    # el hilo se cortaba en el primero y había un solo aviso, y sigue habiéndolo.
+    (["--simple"], False, "faster_whisper", ["piper", "silero"],
+     [f"whisper:{_ORDEN}", f"whisper:{_WAKE}"]),
+    # Un .onnx de Piper que no abre.
+    ([], True, "piper", ["silero", f"whisper:{_ORDEN}"], ["piper"]),
+])
+def test_una_voz_rota_se_avisa_al_arrancar_como_antes(
+        cargas, monkeypatch, tmp_path, caplog, argv, use_oww, rompe, cargados, sin_cargar):
+    """Antes (HEAD), una carga de Whisper o Piper que fallaba al precalentar dejaba
+    en el journal, con el nivel INFO de fábrica, 'no pude precalentar la voz: <el
+    error>' (WARNING): sin faster_whisper, con la instrucción para instalarlo. Con
+    los warm() ese aviso bajó a DEBUG y la causa solo aparecía tras el primer wake.
+    Vuelve a ser un WARNING al arrancar, con el texto de antes como comienzo, uno
+    por causa; y nada queda cacheado: el primer uso real da el error de siempre."""
+    from interfaces import listener
+
+    if rompe == "faster_whisper":
+        monkeypatch.setitem(sys.modules, "faster_whisper", None)
+        causa = _causa(STT(model_size=_ORDEN)._get_model)
+        assert "pip install -e '.[voice]'" in causa
+    else:
+        def load(path: str) -> Any:
+            raise RuntimeError("onnx corrupto")
+
+        monkeypatch.setattr(sys.modules["piper"].PiperVoice, "load", staticmethod(load))
+        causa = "onnx corrupto"
+    _arnes_arranque(monkeypatch, tmp_path, _settings_voz(tmp_path, use_oww=use_oww,
+                                                         vad="silero"))
+    caplog.set_level(logging.DEBUG, logger="crotolamo")
+    assert listener.run_listen(argv) == 0
+    avisos = [r.getMessage() for r in caplog.records
+              if r.levelno >= logging.WARNING and r.threadName == "WarmVoice"]
+    assert len(avisos) == 1, avisos
+    assert avisos[0].startswith(f"no pude precalentar la voz: {causa}")
+    assert (f"voz caliente ({', '.join(cargados)}); sin precalentar (lo decide su primer "
+            f"uso): {', '.join(sin_cargar)}") in [r.getMessage() for r in caplog.records]
+    if rompe == "faster_whisper":
+        assert _ORDEN not in stt_mod._models
+        assert _causa(STT(model_size=_ORDEN)._get_model) == causa
+
+
+@pytest.mark.parametrize("argv, donde, error", [
+    # Ctrl+C sin el manejador de señales (run_listen fuera del hilo principal) con un
+    # handshake MCP lento, o durante el saludo: BaseException, no Exception.
+    ([], "build_agent", KeyboardInterrupt),
+    ([], "saludo", KeyboardInterrupt),
+    # Ya cerrado el plan: el monitor de música, el import del loop concurrente, o
+    # el prólogo del loop simple revientan.
+    ([], "media", RuntimeError),
+    ([], "import_loop", ImportError),
+    (["--simple"], "vigia", RuntimeError),
+])
+def test_el_calentador_se_para_salga_por_donde_salga_run_listen(
+        cargas, monkeypatch, tmp_path, argv, donde, error):
+    """UN dueño para WarmVoice: salga run_listen como salga, lo que quedaba en cola
+    ya no se carga y la carga en curso se espera (acotado). Antes solo tres salidas
+    lo paraban: con un error entre el cierre del plan y los loops, el intérprete se
+    apagaba con la sesión ONNX de Piper o Silero a medio crear y abortaba (SIGABRT,
+    rc 134, medido 4/6 con los modelos reales) en vez de salir con su código."""
+    from interfaces import listener
+
+    soltar = threading.Event()
+    piper_empezo = threading.Event()
+    real_load = sys.modules["piper"].PiperVoice.load
+
+    def load(path: str) -> Any:
+        piper_empezo.set()
+        soltar.wait(10)
+        return real_load(path)
+
+    monkeypatch.setattr(sys.modules["piper"].PiperVoice, "load", staticmethod(load))
+    monkeypatch.setattr(listener, "_WARM_STOP_S", 0.2)
+    real_plan = listener._warm_plan
+
+    def plan(*args: Any) -> Any:
+        # Determinista: Piper ya está cargando (en vuelo) cuando llega cada fallo.
+        assert piper_empezo.wait(5)
+        return real_plan(*args)
+
+    monkeypatch.setattr(listener, "_warm_plan", plan)
+    _arnes_arranque(monkeypatch, tmp_path, _settings_voz(tmp_path, use_oww=True, vad="silero"))
+
+    def revienta(*args: Any, **kwargs: Any) -> Any:
+        raise error(donde)
+
+    if donde == "build_agent":
+        monkeypatch.setattr(listener, "build_agent", revienta)
+    elif donde == "saludo":
+        monkeypatch.setattr(TTS, "speak", revienta)
+    elif donde == "media":
+        monkeypatch.setattr(listener, "MediaMonitor", revienta)
+    elif donde == "import_loop":
+        monkeypatch.setitem(sys.modules, "crotolamo.voice.loop", None)
+    else:
+        monkeypatch.setattr(listener, "_start_control_watcher", revienta)
+    try:
+        with pytest.raises(error):
+            listener.run_listen(argv)
+    finally:
+        soltar.set()
+    hilos = [t for t in threading.enumerate() if t.name == "WarmVoice"]
+    for hilo in hilos:
+        hilo.join(5)
+    assert not [t for t in hilos if t.is_alive()]
+    # Silero y el Whisper de la orden seguían en cola: stop() llegó antes de soltarlos.
+    assert _por_hilo(cargas) == {"MainThread": ["oww"], "WarmVoice": ["piper"]}
+
+
+# ---------------------------------------------------------------------------
+# Paso 3: el LLM se calienta solo si es un modelo local
+# ---------------------------------------------------------------------------
+
+_OK = [{"role": "user", "content": "di solo: ok"}]
+
+
+def _cliente_que_cuenta(monkeypatch, cls: type, llamadas: list) -> None:
+    """chat() de la CLASE anotando (clase, mensajes): sin red."""
+    monkeypatch.setattr(cls, "chat", lambda self, messages, tools=None: llamadas.append(
+        (cls.__name__, messages)))
+
+
+def test_warm_llm_con_cerebro_en_la_nube_no_manda_nada(monkeypatch, caplog):
+    from crotolamo.core import engine
+    from crotolamo.core.glm import GLMClient
+    from interfaces import listener
+
+    llamadas: list = []
+    _cliente_que_cuenta(monkeypatch, GLMClient, llamadas)
+    monkeypatch.setattr(engine, "build_primary_llm", lambda s: GLMClient(api_key="k"))
+    caplog.set_level(logging.INFO, logger="crotolamo")
+    listener._warm_llm(object())
+    assert llamadas == []
+    assert any("no hay LLM que calentar" in r.getMessage() for r in caplog.records)
+
+
+def test_warm_llm_con_ollama_calienta_una_vez_como_siempre(monkeypatch):
+    from crotolamo.core import engine
+    from crotolamo.core.llm import LLMClient
+    from interfaces import listener
+
+    llamadas: list = []
+    _cliente_que_cuenta(monkeypatch, LLMClient, llamadas)
+    monkeypatch.setattr(engine, "build_primary_llm", lambda s: LLMClient())
+    listener._warm_llm(object())
+    assert llamadas == [("LLMClient", _OK)]
+
+
+@pytest.mark.parametrize("clase, calienta", [("LLMClient", True), ("GLMClient", False)])
+def test_warm_llm_sin_needs_warmup_decide_por_el_tipo(monkeypatch, clase, calienta):
+    """Si el cliente no declara needs_warmup (el cambio del cerebro aún no está),
+    la regla de siempre: solo el cliente local se calienta."""
+    from crotolamo.core import engine
+    from crotolamo.core.glm import GLMClient
+    from crotolamo.core.llm import LLMClient
+    from interfaces import listener
+
+    cls = {"LLMClient": LLMClient, "GLMClient": GLMClient}[clase]
+    monkeypatch.delattr(cls, "needs_warmup", raising=False)
+    llamadas: list = []
+    _cliente_que_cuenta(monkeypatch, cls, llamadas)
+    cliente = LLMClient() if cls is LLMClient else GLMClient(api_key="k")
+    assert not hasattr(cliente, "needs_warmup")
+    monkeypatch.setattr(engine, "build_primary_llm", lambda s: cliente)
+    listener._warm_llm(object())
+    assert llamadas == ([(clase, _OK)] if calienta else [])
+
+
+@pytest.mark.parametrize("backend, key, esperado", [
+    ("glm", "secreta", []),                       # la nube: 0 llamadas (antes, 1)
+    ("glm", None, [("LLMClient", _OK)]),          # glm sin key cae a Ollama: se calienta
+    ("ollama", "secreta", [("LLMClient", _OK)]),  # Ollama primario: igual que antes
+])
+def test_warm_llm_con_el_cableado_real_de_build_primary_llm(monkeypatch, backend, key, esperado):
+    from crotolamo.core.glm import API_KEY_ENVS, GLMClient
+    from crotolamo.core.llm import LLMClient
+    from crotolamo.settings import get_settings
+    from interfaces import listener
+
+    for env in API_KEY_ENVS:
+        monkeypatch.delenv(env, raising=False)
+    if key is not None:
+        monkeypatch.setenv(API_KEY_ENVS[0], key)
+    monkeypatch.setenv("CROTOLAMO_LLM_BACKEND", backend)
+    llamadas: list = []
+    _cliente_que_cuenta(monkeypatch, GLMClient, llamadas)
+    _cliente_que_cuenta(monkeypatch, LLMClient, llamadas)
+    listener._warm_llm(get_settings())
+    assert llamadas == esperado
+
+
+def test_warm_llm_que_falla_solo_avisa(monkeypatch, caplog):
+    from crotolamo.core import engine
+    from interfaces import listener
+
+    def revienta(settings: Any) -> Any:
+        raise RuntimeError("sin config")
+
+    monkeypatch.setattr(engine, "build_primary_llm", revienta)
+    caplog.set_level(logging.WARNING, logger="crotolamo")
+    listener._warm_llm(object())  # no lanza
+    assert [r.getMessage() for r in caplog.records] == ["no pude calentar el LLM: sin config"]
 
 
 # ---------------------------------------------------------------------------

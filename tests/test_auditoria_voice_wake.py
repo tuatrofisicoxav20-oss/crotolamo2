@@ -650,7 +650,8 @@ def test_el_mismo_score_repetido_se_loguea_una_sola_vez(caplog):
     assert [det.feed(_SILENCIO) for _ in range(12)] == [False] * 12
     assert _lineas_score(caplog) == [
         "wake score=0.200 (umbral=0.50) -> no",
-        "wake score=0.300 (umbral=0.50) -> no",
+        # El 0.300 del mismo episodio (sin cambio de decisión) va a DEBUG desde
+        # el paso 4 de tests/test_perf_no_fit_for_purpose_wake_detector.py.
         # Predicción nueva tras una sin señal: vuelve a salir aunque repita valor.
         "wake score=0.300 (umbral=0.50) -> no",
     ]

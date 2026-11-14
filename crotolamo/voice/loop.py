@@ -33,6 +33,7 @@ from crotolamo.voice.threads import (
     Utterance,
     _drain_queue,
 )
+from crotolamo.voice.vad import DEFAULTS
 
 # Re-exports de compatibilidad: los nombres históricos de loop.py siguen
 # importables desde aquí aunque ahora vivan en threads.py / adapters.py.
@@ -94,11 +95,20 @@ class VoiceLoop:
         ducker: Ducker de media_aware.py (opcional). Atenúa la música mientras
                 el loop no está en idle y la restaura al volver; se engancha al
                 publisher del estado. None (default) = sin ducking, nada cambia.
+        stream_speak: [voice].stream_speak_concurrent (ver BrainThread). False
+                (default) = la respuesta se habla cuando el LLM termina, como siempre.
+        start_timeout_s, max_command_s, post_speak_grace_s: espera de la orden
+                tras el wake, tope de la orden y gracia del oído tras un turno (los
+                da ListenerConfig; sin ellos, los de la tabla de voice/vad.py).
     """
 
     def __init__(self, agent, stt, tts, wake_detector, *, allow_barge_in: bool = False,
-                 silence_ms: int = 640, mic=None, wake_fn=None, vad_fn=None,
-                 to_wav=None, hud_publisher=None, control_path=None, ducker=None) -> None:
+                 silence_ms: int = DEFAULTS.silence_ms, mic=None, wake_fn=None, vad_fn=None,
+                 to_wav=None, hud_publisher=None, control_path=None, ducker=None,
+                 stream_speak: bool = False,
+                 start_timeout_s: float = DEFAULTS.command_start_timeout_s,
+                 max_command_s: float = DEFAULTS.max_command_s,
+                 post_speak_grace_s: float = DEFAULTS.post_speak_grace_s) -> None:
         self.ducker = ducker
         publisher = hud_publisher
         if ducker is not None:
@@ -146,7 +156,7 @@ class VoiceLoop:
         # input_device: None (default) = micrófono default del sistema. Apúntalo a
         # "crotolamo_aec_source" tras activar el AEC (ver desktop/aec.sh).
         self._mic = mic or _RealMic(
-            sample_rate=vcfg.get("sample_rate", 16000),
+            sample_rate=vcfg.get("sample_rate", DEFAULTS.sample_rate),
             device=vcfg.get("input_device"),
         )
         ear = EarThread(
@@ -158,25 +168,33 @@ class VoiceLoop:
             to_wav or stt._frames_to_audio,
             tts, self.stt_q, self.tts_q, self.state, self.shutdown,
             allow_barge_in=allow_barge_in, silence_ms=silence_ms,
-            vad_threshold=vcfg.get("vad_threshold", 0.8),
-            barge_in_grace_ms=vcfg.get("barge_in_grace_ms", 400),
-            barge_in_threshold_margin=vcfg.get("barge_in_threshold_margin", 0.1),
-            barge_in_min_chunks=vcfg.get("barge_in_min_chunks", 5),
+            vad_threshold=vcfg.get("vad_threshold", DEFAULTS.vad_threshold),
+            barge_in_grace_ms=vcfg.get("barge_in_grace_ms", DEFAULTS.barge_in_grace_ms),
+            barge_in_threshold_margin=vcfg.get("barge_in_threshold_margin",
+                                               DEFAULTS.barge_in_threshold_margin),
+            barge_in_min_chunks=vcfg.get("barge_in_min_chunks", DEFAULTS.barge_in_min_chunks),
             # None (default) = sin histéresis, comportamiento idéntico al previo.
-            vad_neg_threshold=vcfg.get("vad_neg_threshold"),
+            vad_neg_threshold=vcfg.get("vad_neg_threshold", DEFAULTS.vad_neg_threshold),
             # Lo que se antepone a la orden cuando el patrón calla un rato tras
             # el wake (V1); mismo valor y default que el modo simple.
-            preactivation_ms=vcfg.get("vad_preactivation_ms", 800),
+            preactivation_ms=vcfg.get("vad_preactivation_ms", DEFAULTS.vad_preactivation_ms),
+            start_timeout_s=start_timeout_s, max_command_s=max_command_s,
+            post_speak_grace_s=post_speak_grace_s,
+            # Tras un hueco (escucha pausada) el detector olvida lo de antes;
+            # con un wake_fn inyectado (tests) no hay detector que rearmar.
+            wake_rearm=None if wake_fn is not None else getattr(wake_detector, "rearm", None),
         )
         # El oído es el ÚNICO lector del micrófono: stop() lo espera antes de
         # cerrar el stream (ver stop()).
         self._ear = ear
         self.threads = [
             ear,
+            # Sin la clave, este loop sesga con los nombres de la tabla y el
+            # simple no (ListenerConfig.hotwords): diferencia de hoy, decisión K.
             SttThread(stt, self.stt_q, self.cmd_q, self.state, self.shutdown,
-                      hotwords=vcfg.get("hotwords",
-                                        "Crotolamo, Tletl, Huevonitis")),
-            BrainThread(agent, self.cmd_q, self.tts_q, self.state, self.shutdown),
+                      hotwords=vcfg.get("hotwords", DEFAULTS.hotwords_concurrent)),
+            BrainThread(agent, self.cmd_q, self.tts_q, self.state, self.shutdown,
+                        stream=stream_speak, tts=tts),
             MouthThread(tts, self.tts_q, self.state, self.shutdown),
         ]
         for hilo in self.threads:

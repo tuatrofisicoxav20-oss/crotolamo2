@@ -1,7 +1,10 @@
 """Tests de la misión velocidad: TTS streaming, beam configurable, num_ctx."""
 
+import random
+
 from crotolamo.core.llm import LLMClient
 from crotolamo.voice import stt as stt_mod
+from crotolamo.voice import tts as tts_mod
 from crotolamo.voice.tts import StreamSpeaker
 
 
@@ -149,3 +152,79 @@ def test_stream_speaker_no_parte_abreviaturas():
         sp.feed(token)
     assert sp.finish() is True
     assert tts.spoken == ["Llama al Dr. López.", "Ya le avisé."]
+
+
+# --- SentenceFeeder: UNA segmentación en streaming (la de StreamSpeaker, tal cual) ---
+# Causa raíz voice-pipeline-forked-audio-owned-per-call, paso 5 del diseño: la
+# usan StreamSpeaker (loop simple) y el BrainThread ([voice].stream_speak_concurrent).
+
+def _ref_stream_speaker(tokens: list[str]) -> list[str]:
+    """Copia LITERAL de StreamSpeaker.feed/finish antes del paso (la referencia de
+    "mismas frases en el mismo orden")."""
+    buffer = ""
+    frases: list[str] = []
+    for token in tokens:
+        buffer += token
+        pieces, buffer = tts_mod._split(buffer, final=False)
+        frases.extend(pieces)
+    tail = buffer.strip()
+    if tail:
+        frases.append(tail)
+    return frases
+
+
+_TROZOS = ["Hola", "patrón", "Dr", "40", "5", "GB", "etc", "No", "Av", "ya", "1", "12",
+           ".", ".", ". ", " ", " ", "\n", "!", "?", "¿", "¡", ",", "**", "_", "á", "ñ"]
+
+
+def _tokens_al_azar(rng: random.Random) -> list[str]:
+    texto = "".join(rng.choice(_TROZOS) + rng.choice(["", " "]) for _ in range(rng.randint(1, 30)))
+    tokens, i = [], 0
+    while i < len(texto):
+        n = rng.randint(1, 6)
+        tokens.append(texto[i:i + n])
+        i += n
+    return tokens
+
+
+def test_sentence_feeder_corta_igual_que_stream_speaker_antes():
+    rng = random.Random(20261114)
+    for _ in range(3000):
+        tokens = _tokens_al_azar(rng)
+        frases: list[str] = []
+        feeder = tts_mod.SentenceFeeder(frases.append)
+        for token in tokens:
+            feeder.feed(token)
+        feeder.flush()
+        assert frases == _ref_stream_speaker(tokens), tokens
+        assert feeder.fed == len(frases)
+
+
+class _TtsQueAnota:
+    """TTS falso que anota lo hablado y lo pedido a la pre-síntesis, en orden."""
+
+    def __init__(self) -> None:
+        self.eventos: list[tuple[str, str]] = []
+
+    def speak(self, text: str) -> None:
+        self.eventos.append(("habla", text))
+
+    def prepare(self, text: str) -> None:
+        self.eventos.append(("pide", text))
+
+
+def test_stream_speaker_habla_lo_mismo_y_pide_cada_frase_al_encolarla():
+    rng = random.Random(7)
+    for _ in range(200):
+        tokens = _tokens_al_azar(rng)
+        tts = _TtsQueAnota()
+        sp = StreamSpeaker(tts)  # type: ignore[arg-type]
+        for token in tokens:
+            sp.feed(token)
+        sp.finish()
+        esperado = _ref_stream_speaker(tokens)
+        assert [t for e, t in tts.eventos if e == "habla"] == esperado
+        assert [t for e, t in tts.eventos if e == "pide"] == esperado
+        # Cada frase se pide antes de hablarla.
+        for frase in esperado:
+            assert tts.eventos.index(("pide", frase)) < tts.eventos.index(("habla", frase))

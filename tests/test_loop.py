@@ -9,6 +9,7 @@ import threading
 import time
 
 from pathlib import Path
+from types import SimpleNamespace
 
 from crotolamo.voice.loop import VoiceLoop
 from crotolamo.voice.threads import (
@@ -455,3 +456,187 @@ def test_m38_en_thinking_no_aplica_margen_ni_gracia(monkeypatch):
 
     assert ear._is_patron_voice(0.85, Mode.THINKING) is False  # racha 1/2
     assert ear._is_patron_voice(0.85, Mode.THINKING) is True   # 2/2: dispara
+
+
+# --- BrainThread en streaming ([voice].stream_speak_concurrent, apagada) -----------
+# Causa raíz voice-pipeline-forked-audio-owned-per-call, paso 5 del diseño: la
+# primera frase va a la Boca antes de que el LLM termine; las de un turno abortado
+# no; el aviso de un turno roto va detrás de lo dicho.
+_TURNO_ROTO = "Se me trabaron los cables, patrón. Vuelve a intentarlo."
+
+
+class _AgenteQueHabla:
+    """LLM falso: emite `tokens` por on_token y devuelve `reply`. Se para tras
+    `parar_tras` tokens hasta que el test lo suelta; `revienta` lanza al final."""
+
+    def __init__(self, tokens, reply, parar_tras=None, revienta=False) -> None:
+        self.tokens = tokens
+        self.reply = reply
+        self.parar_tras = parar_tras
+        self.revienta = revienta
+        self.parado = threading.Event()
+        self.suelta = threading.Event()
+        self.con_on_token: list[bool] = []
+
+    def handle_turn(self, command, on_token=None):
+        self.con_on_token.append(on_token is not None)
+        for i, token in enumerate(self.tokens):
+            if i == self.parar_tras:
+                self.parado.set()
+                assert self.suelta.wait(5)
+            if on_token is not None:
+                on_token(token)
+        if self.revienta:
+            raise RuntimeError("se cayó el hook")
+        return self.reply
+
+
+def _brain(agente, *, stream=True, tts=None):
+    state = SharedState()
+    turno = state.new_turn()
+    cmd_q: queue.Queue = queue.Queue()
+    tts_q: queue.Queue = queue.Queue()
+    shutdown = threading.Event()
+    brain = BrainThread(agente, cmd_q, tts_q, state, shutdown, stream=stream, tts=tts)
+    brain.start()
+    cmd_q.put(("saluda", turno))
+    return brain, state, tts_q, shutdown
+
+
+def _vaciar(tts_q: queue.Queue) -> list:
+    return [x.text if isinstance(x, Utterance) else x for x in list(tts_q.queue)]
+
+
+def _parar(brain, shutdown) -> None:
+    shutdown.set()
+    brain.join(timeout=3.0)
+    assert not brain.is_alive()
+
+
+def test_brain_en_streaming_la_primera_frase_sale_antes_de_que_acabe_el_llm():
+    # Se para con "Ya " ya dado: el '.' de "patrón." solo cierra frase al ver
+    # lo que le sigue (¿decimal? ¿abreviatura?).
+    agente = _AgenteQueHabla(["Hola, ", "patrón. ", "Ya ", "quedó."],
+                             "Hola, patrón. Ya quedó.", parar_tras=3)
+    brain, state, tts_q, shutdown = _brain(agente)
+    try:
+        assert agente.parado.wait(3)
+        # El LLM sigue "generando" y la primera frase ya está en la cola de la Boca.
+        assert _wait(lambda: _vaciar(tts_q) == ["Hola, patrón."])
+        assert state.get_mode() is Mode.THINKING
+        agente.suelta.set()
+        assert _wait(lambda: _vaciar(tts_q)[-1:] == [END])
+        assert _vaciar(tts_q) == ["Hola, patrón.", "Ya quedó.", END]
+        assert all(u.turn_id == 1 for u in list(tts_q.queue) if isinstance(u, Utterance))
+        assert state._text == "Hola, patrón. Ya quedó."
+        assert agente.con_on_token == [True]
+    finally:
+        agente.suelta.set()
+        _parar(brain, shutdown)
+
+
+def test_brain_en_streaming_un_turno_abortado_no_encola_mas():
+    agente = _AgenteQueHabla(["Hola. ", "Esto ", "ya ", "no."], "Hola. Esto ya no.",
+                             parar_tras=2)
+    brain, state, tts_q, shutdown = _brain(agente)
+    try:
+        assert agente.parado.wait(3)
+        assert _wait(lambda: _vaciar(tts_q) == ["Hola."])
+        state.new_turn()  # barge-in: el turno 1 ya no es el vigente
+        agente.suelta.set()
+        # La orden del turno vigente sale DESPUÉS de la vieja (FIFO): cuando su
+        # END llega, el turno 1 ya terminó de procesarse.
+        brain.cmd_q.put(("otra", 2))
+        assert _wait(lambda: _vaciar(tts_q)[-1:] == [END])
+        por_turno = [(u.turn_id, u.text) for u in list(tts_q.queue) if isinstance(u, Utterance)]
+        # Del turno 1 solo lo que se encoló antes del barge-in; ni su END.
+        assert por_turno == [(1, "Hola."), (2, "Hola."), (2, "Esto ya no.")]
+        assert list(tts_q.queue).count(END) == 1
+    finally:
+        agente.suelta.set()
+        _parar(brain, shutdown)
+
+
+def test_brain_en_streaming_sin_tokens_habla_la_respuesta_entera():
+    """Un atajo que no pasa por el LLM (fastpath) no llama a on_token: se habla
+    la respuesta entera, como sin streaming."""
+    agente = _AgenteQueHabla([], "Listo. Ya.")
+    brain, _state, tts_q, shutdown = _brain(agente)
+    try:
+        assert _wait(lambda: _vaciar(tts_q)[-1:] == [END])
+        assert _vaciar(tts_q) == ["Listo.", "Ya.", END]
+    finally:
+        _parar(brain, shutdown)
+
+
+def test_brain_en_streaming_si_el_turno_revienta_el_aviso_va_detras_de_lo_dicho():
+    """Igual que el loop simple: lo que alcanzó a decir (también la cola sin
+    cerrar) y detrás el aviso de turno roto."""
+    agente = _AgenteQueHabla(["Hola. ", "Ya casi"], "", revienta=True)
+    brain, state, tts_q, shutdown = _brain(agente)
+    try:
+        assert _wait(lambda: _vaciar(tts_q)[-1:] == [END])
+        assert _vaciar(tts_q) == ["Hola.", "Ya casi", "Se me trabaron los cables, patrón.",
+                                  "Vuelve a intentarlo.", END]
+        assert state._text == _TURNO_ROTO
+    finally:
+        _parar(brain, shutdown)
+
+
+def test_brain_en_streaming_el_aviso_del_llm_caido_va_en_frase_aparte():
+    aviso = "GLM no respondió a tiempo."
+    agente = _AgenteQueHabla(["La capital ", "de Francia es", "\n" + aviso], aviso)
+    brain, _state, tts_q, shutdown = _brain(agente)
+    try:
+        assert _wait(lambda: _vaciar(tts_q)[-1:] == [END])
+        assert _vaciar(tts_q) == ["La capital de Francia es", aviso, END]
+    finally:
+        _parar(brain, shutdown)
+
+
+def test_brain_en_streaming_respuesta_vacia_sin_nada_dicho_vuelve_a_reposo():
+    agente = _AgenteQueHabla([], "")
+    brain, state, tts_q, shutdown = _brain(agente)
+    try:
+        assert _wait(lambda: state.get_mode() is Mode.IDLE)
+        assert tts_q.empty()
+    finally:
+        _parar(brain, shutdown)
+
+
+def test_brain_pide_la_presintesis_de_cada_frase_en_el_orden_de_hablar():
+    from tests.test_speed import _TtsQueAnota
+
+    tts = _TtsQueAnota()
+    for stream in (False, True):
+        tts.eventos.clear()
+        agente = _AgenteQueHabla(["Una. ", "Dos. ", "Tres."], "Una. Dos. Tres.")
+        brain, _state, tts_q, shutdown = _brain(agente, stream=stream, tts=tts)
+        try:
+            assert _wait(lambda: _vaciar(tts_q)[-1:] == [END])
+            assert tts.eventos == [("pide", "Una."), ("pide", "Dos."), ("pide", "Tres.")]
+            assert _vaciar(tts_q) == ["Una.", "Dos.", "Tres.", END]
+        finally:
+            _parar(brain, shutdown)
+
+
+def test_brain_por_defecto_no_pasa_on_token_y_el_voiceloop_tampoco():
+    agente = _AgenteQueHabla(["Hola. "], "Hola.")
+    brain, _state, tts_q, shutdown = _brain(agente, stream=False)
+    try:
+        assert _wait(lambda: _vaciar(tts_q)[-1:] == [END])
+        assert agente.con_on_token == [False]
+    finally:
+        _parar(brain, shutdown)
+
+    class _Mic:
+        def read(self):
+            return None
+
+    comunes = dict(mic=_Mic(), wake_fn=lambda c: False, vad_fn=lambda c: 0.0,
+                   to_wav=lambda f: f)
+    vl = VoiceLoop(agente, SimpleNamespace(), SimpleNamespace(), None, **comunes)
+    assert vl.threads[2].stream is False
+    vl = VoiceLoop(agente, SimpleNamespace(), SimpleNamespace(), None, stream_speak=True,
+                   **comunes)
+    assert vl.threads[2].stream is True

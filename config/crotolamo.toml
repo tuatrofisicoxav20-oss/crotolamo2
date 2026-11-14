@@ -402,6 +402,39 @@ sample_rate        = 16000
 # crotolamo_aec_sink, así que ese debe ser el sink por defecto
 # (`pactl set-default-sink crotolamo_aec_sink`; `desktop/aec.sh status` lo comprueba).
 # input_device = "crotolamo_aec_source"
+# Quién es dueño del micrófono. false (de fábrica) = lo de siempre: en el loop simple
+# cada grabación (cada ventana de 6 s del wake difuso, la orden, cada ronda de
+# smart_endpoint, el followup, la confirmación) abre y cierra su propio stream, y lo
+# que suena entre dos (Whisper decodificando el wake o la primera parte de una
+# orden, el atenuado de la música) no lo oye nadie. true = el micrófono se abre UNA
+# vez y un hilo lo lee sin parar a una cola; las grabaciones leen de ella. La voz de
+# Crotolamo, la guarda de 0.5 s tras responder y la pausa del panel se siguen
+# descartando (en pausa el micrófono se cierra). MEDIDO (bench en tiempo virtual,
+# loop simple): aperturas del micrófono 10 -> 0 por minuto de silencio (14.400 -> 0
+# al día); una orden empezada 0.6 s tras el wake perdía 332 ms y llegaba como "la
+# música." (4/4 intactas con true, 3/4 sin él); "Mueve el archivo de ... huevonitis
+# a descargas" tras una pausa de pensar perdía 377 ms y la palabra tras la pausa
+# (intacta con true); con el micro caído, al journal va stdout y también el log
+# (stderr): con false, 2 prints y un WARNING "VAD silero falló" por reintento (8
+# líneas el primer minuto y luego ~2 por minuto, ~2.880 al día si sigue caído, y
+# culpando al VAD) -> con true, 2 avisos en todo el incidente (uno por mensaje
+# distinto) que nombran al micrófono; y en el primer minuto 11 reaperturas -> 5.
+# Con use_oww = true (loop concurrente) el oído lee de la misma
+# sesión: un fallo del dispositivo se reintenta dentro del proceso en vez de
+# rendirse a los ~10 fallos seguidos y esperar a que systemd reinicie el servicio;
+# si cae en plena orden, la orden se cierra tras 1 s sin audio (con lo oído) en vez
+# de seguir "escuchando" con la música atenuada mientras dure el corte.
+# Si la sesión no puede abrir el micrófono al arrancar, se avisa una vez y se sigue
+# con un stream por grabación. Sin validar en hardware: qué hace PortAudio tras
+# suspender el portátil, `systemctl --user restart pipewire`, desenchufar un headset
+# o con crotolamo_aec_source; pruébalo así antes de dejarlo en true.
+audio_session = false
+# Con audio_session = true y SOLO como servicio (systemd pone INVOCATION_ID): tras
+# estos segundos de fallos seguidos del micrófono el listener sale con código 1 y
+# Restart=on-failure lo reinicia. Mientras tanto reabre con espera creciente (1, 2,
+# 4... hasta 30 s) y avisa una vez por mensaje distinto. En una terminal no se rinde
+# nunca. 0 = no rendirse nunca, tampoco como servicio.
+mic_give_up_s = 90
 # VAD (M2, de GLaDOS): 'silero' (neuronal) o 'energy' (fallback sin modelo).
 vad_backend          = "silero"
 vad_threshold        = 0.8
@@ -469,6 +502,22 @@ ack = "beep"
 # la música..."); el adelanto de la primera palabra solo aplica a la charla del motor
 # local (turnos sin tools).
 stream_speak = true
+# Lo mismo para el loop CONCURRENTE (use_oww = true): cada frase va a la Boca en
+# cuanto el LLM la cierra, con la misma segmentación. false (de fábrica) = lo de
+# siempre: ese loop habla la respuesta cuando el LLM termina (stream_speak no le
+# aplica). MEDIDO (bench en tiempo virtual, LLM que emite palabra a palabra: 400 ms
+# hasta el 1er token y 3 frases): la primera palabra suena 3009 -> 2049 ms después de
+# acabar la orden. Con backend="glm" aplica el mismo OJO de stream_speak: la
+# respuesta con tools a la vista se retiene hasta el final (ver stream_release).
+stream_speak_concurrent = false
+# Pre-síntesis: la frase siguiente se sintetiza con Piper MIENTRAS suena la actual,
+# en un hilo propio (toda la síntesis pasa entonces por él: Piper nunca corre en dos
+# hilos a la vez). false (de fábrica) = cada frase se sintetiza al tocarle sonar. Mismo
+# audio; cambia cuándo suena la siguiente. MEDIDO (bench, Piper a 15 caracteres/s,
+# respuesta de 3 frases): silencio entre frases 85 + 91 ms -> 0, en los dos loops; la
+# primera palabra igual (+-16 ms). Sin validar en tu portátil: que sintetizar mientras
+# suena no cause cortes (underruns) en el audio.
+tts_presynth = false
 # Cuándo se suelta al TTS (o a `shell --stream`) la respuesta de una llamada con
 # tools a la vista; con backend="glm", todas (el OJO de stream_speak). "final" (de
 # fábrica, lo de siempre) = retenerla hasta el final del stream: el preámbulo de un
@@ -547,8 +596,9 @@ threshold = 0.72
 # (secuencial). Si openwakeword no está instalado se cae solo al difuso. Con true
 # se despierta con la frase del modelo de oww_model ("hey jarvis" con el puente de
 # abajo), NO con "crotolamo" (ese nombre solo lo busca el difuso). OJO:
-# varias claves de [voice] solo aplican al modo simple: ack, stream_speak,
-# smart_endpoint/endpoint_*, followup_s, wake_silence_ms/wake_max_seconds.
+# varias claves de [voice] solo aplican al modo simple: ack, stream_speak (el
+# concurrente tiene la suya: stream_speak_concurrent), smart_endpoint/endpoint_*,
+# followup_s, wake_silence_ms/wake_max_seconds.
 use_oww = true
 # M1: wake word dedicado con openWakeWord. 'crotolamo' no tiene modelo pre-entrenado,
 # así que se usa un modelo PUENTE soportado hasta entrenar uno propio.
@@ -562,11 +612,47 @@ oww_threshold = 0.5
 # [voice].wake_threshold_media). Escala DISTINTA a la del wake difuso: aquí 0.5
 # es lo normal y 0.7 ya es estricto; por eso son dos knobs y no uno.
 oww_threshold_media = 0.7
+# Encuadre de openWakeWord en el loop concurrente. El oído entrega chunks de 512
+# muestras (lo que pide Silero) y el modelo solo saca features nuevas cada 1280:
+# el detector junta los chunks y lo llama una vez por frame, con los MISMOS scores
+# que llamándolo en cada chunk y un tercio de las llamadas. false (de fábrica) =
+# ese encuadre de siempre. true = frames exactos de 1280, los de --simple y de
+# scripts/wake_debug.py: lo que calibras es lo que decide el loop. Con openwakeword
+# 0.4 eso cambia ~15 % de los resultados (medido en 120 pruebas sintéticas: 11 se
+# pierden y 7 se ganan): re-calibra oww_threshold antes de activarlo. En 0.5+ el
+# paquete ya encuadra así por dentro y la clave no cambia nada.
+oww_exact_frames = false
+# openWakeWord puntúa los últimos 1.28 s que OYÓ, y con la escucha pausada (panel)
+# no oye nada: al reanudar, lo de antes de la pausa seguía en esa ventana. Medido
+# con el modelo real: un "Hey Jarvis" cortado por la pausa justo antes de disparar
+# abría un turno fantasma a los 0.03-0.3 s de reanudar, aunque la pausa durase
+# horas (15 de 15 casos). true (de fábrica) = al reanudar se olvida (0 de 15), y un
+# wake dicho justo al reanudar dispara igual que tras un turno (18 de 18). Tras un
+# turno no cambia nada: el disparo ya vacía la ventana. false = la ventana vieja se
+# queda, como antes.
+oww_rearm = true
+# Pre-filtro del wake DIFUSO (use_oww = false). "" (de fábrica) = sin filtro: Whisper
+# transcribe cada ventana con voz (con la tele, 12 pasadas por minuto). "oww" = el
+# modelo de oww_model oye cada chunk de esa ventana con oww_threshold (con música en
+# Playing, con oww_threshold_media, como el wake): si no dispara, la ventana no pasa
+# por Whisper; si dispara, se recorta a ~1.3 s antes del disparo (la palabra queda al
+# principio) y Whisper + variants deciden como siempre. Medido en el bench con el
+# puente hey_jarvis: minuto de tele 12 -> 0 pasadas; el pre-filtro cuesta ~1.4-1.6
+# CPU-s por minuto de micrófono abierto, también en silencio. Solo sirve con un modelo que
+# oiga TU "crotolamo" (con hey_jarvis no despertaría nunca): entrénalo, pruébalo con
+# scripts/wake_debug.py --como-produccion (mide sin música) y baja oww_threshold y
+# también oww_threshold_media, o con música seguirá pidiendo 0.7. Si el modelo no
+# carga se avisa y el difuso sigue sin filtro. Ojo: si el modelo dispara tarde (tras
+# callar wake_silence_ms) la ventana se pierde; no validado con tu voz.
+pregate = ""
 # Variantes CERCANAS a "crotolamo" (cómo lo transcribe mal Whisper). Se podaron
 # las muy lejanas ("corto la mano", "control amo", "cuatro lamo", "proto/troto
 # lamo") que provocaban falsos positivos. Se añadieron mishears reales del log
 # ("gotolamo", "cottoy amo"). Si ves en el log que tu "crotolamo" se transcribe
-# distinto, añade esa forma aquí.
+# distinto, añade esa forma aquí. El log (INFO) trae las activaciones y los
+# casi-wakes ("wake difuso: score=... cabeza=..."), solo con las 3 primeras
+# palabras; lo que se habla en el cuarto entero, solo con CROTOLAMO_WAKE_DEBUG=1
+# (o con el nivel DEBUG).
 variants  = [
     "crotolamo", "croto lamo", "gotolamo", "grotolamo", "crotoamo",
     "coto lamo", "coto y amo", "cottoy amo", "croto el amo", "crotolo amo",

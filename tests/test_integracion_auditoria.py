@@ -117,6 +117,15 @@ class _Detector:
             raise self.carga_falla
         return object()
 
+    def can_load(self):
+        # Como WakeWordDetector.can_load: la carga de _get_model, sin lanzar.
+        try:
+            self._get_model()
+        except VoiceUnavailable as error:
+            self.load_error = str(error)
+            return False
+        return True
+
     def listen_for_wake(self, timeout_s=None):
         self.esperas += 1
         raise KeyboardInterrupt
