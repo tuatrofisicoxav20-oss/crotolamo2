@@ -9,7 +9,13 @@ from typing import Any, Callable
 
 from crotolamo.core.engine import LLMEngine
 from crotolamo.core.llm import LLMError
-from crotolamo.core.streaming import LiveStreamer as _LiveStreamer
+from crotolamo.core.streaming import (
+    RELEASE_FINAL,
+    RELEASE_POLICIES,
+    Emitter as _Emitter,
+    LiveStreamer as _LiveStreamer,
+    TurnCancelled,
+)
 from crotolamo.core.tool_parsing import (
     coerce_text_tool_calls as _coerce_text_tool_calls,
     is_hard_error as _is_hard_error,
@@ -21,6 +27,10 @@ log = get_logger("core.agent")
 
 # Lo que se contesta cuando el modelo devuelve content vacío sin haber hecho nada.
 _EN_BLANCO = "Me quedé en blanco, patrón. Repíteme eso."
+# Cierre del historial de un turno cancelado (barge-in) y resultado de las tools
+# que ya no se ejecutaron: cada tool_call necesita su respuesta.
+_INTERRUMPIDO = "(Turno interrumpido por el patrón.)"
+_TOOL_CANCELADA = "Cancelado: el patrón interrumpió."
 
 
 class Agent:
@@ -30,13 +40,20 @@ class Agent:
         self.llm = llm
         self.conversation = conversation
 
-    def handle_turn(self, text: str, on_token=None) -> str:
+    def handle_turn(self, text: str, on_token=None, should_abort=None) -> str:
         """Un turno conversacional con memoria. Sin tools todavía (Fase 1).
 
         on_token: misma firma que en ToolAgent (el listener lo usa para hablar
         en streaming); aquí el fallback emite la respuesta completa de golpe.
+        should_abort: también la de ToolAgent, para que quien la cablee no
+        reviente con este agente (el shell cae a él si el registry falla). Hay
+        un solo punto de control, antes de la llamada al LLM, que es una y no
+        es streaming.
         """
         self.conversation.add_user(text)
+        if should_abort is not None and should_abort():
+            self.conversation.add_assistant(_INTERRUMPIDO)
+            return ""
 
         try:
             response = self.llm.chat(self.conversation.to_messages())
@@ -93,8 +110,19 @@ class ToolAgent(Agent):
         direct_tools: set[str] | None = None,
         fastpath: bool = True,
         after_turn_hooks: list[Callable[[str, str], None]] | None = None,
+        stream_release: str = RELEASE_FINAL,
     ) -> None:
         super().__init__(llm, conversation)
+        # Cuándo soltar el texto en streaming si la llamada lleva tools a la
+        # vista: "final" (retener hasta saber que no hubo tool-call, lo de
+        # siempre) o "sentence" (en cuanto cierra la 1ª frase y le sigue más
+        # texto; ver LiveStreamer). Un valor desconocido no puede dejar al
+        # patrón sin voz ni hablar preámbulos: cae a "final" avisando.
+        if stream_release not in RELEASE_POLICIES:
+            log.warning("stream_release=%r no existe (valen %s); uso %r",
+                        stream_release, ", ".join(RELEASE_POLICIES), RELEASE_FINAL)
+            stream_release = RELEASE_FINAL
+        self.stream_release = stream_release
         self.registry = registry
         self.guard = guard
         self.max_iterations = max_iterations
@@ -205,8 +233,28 @@ class ToolAgent(Agent):
                 log.warning("hook falló: %s", error)
         return value
 
-    def handle_turn(self, text: str, on_token=None) -> str:
-        reply = self._handle_turn(text, on_token)
+    def _log_release(self, calls, content: str) -> None:
+        """El dato para decidir [voice].stream_release con el motor REAL: cuánto
+        preámbulo suelta (o soltaría) "sentence" antes de un tool-call."""
+        if not calls:
+            log.debug("stream_release: 'sentence' adelanta la primera frase")
+            return
+        verbo = "soltó" if self.stream_release != RELEASE_FINAL else "habría hablado"
+        log.info("stream_release: 'sentence' %s un preámbulo de %d caracteres "
+                 "antes del tool-call", verbo, len(content))
+
+    def handle_turn(self, text: str, on_token=None, should_abort=None) -> str:
+        """should_abort: callable sin argumentos; si devuelve True el turno se
+        corta en el siguiente punto de control (cada línea del stream, haya
+        texto o no; cada iteración; antes de cada tool; antes de que
+        FallbackLLM arranque el local) y devuelve "". None = nunca se cancela."""
+        try:
+            reply = self._handle_turn(text, on_token, should_abort)
+        except TurnCancelled:
+            # El historial cierra con un assistant (como al agotar iteraciones)
+            # y un turno que el patrón canceló no alimenta la memoria semántica.
+            self.conversation.add_assistant(_INTERRUMPIDO)
+            return ""
         # El texto CRUDO del patrón (sin pre-hooks) y la respuesta final. Un hook
         # roto no toca la respuesta: ya está calculada y ya se habló.
         for hook in self.after_turn_hooks:
@@ -216,7 +264,7 @@ class ToolAgent(Agent):
                 log.warning("after-turn hook falló: %s", error)
         return reply
 
-    def _handle_turn(self, text: str, on_token=None) -> str:
+    def _handle_turn(self, text: str, on_token=None, should_abort=None) -> str:
         # Enrutamos sobre el texto LIMPIO del patrón (antes de que los pre-hooks le
         # antepongan fecha/hechos), que es la señal real de intención. El set de
         # tools se fija UNA vez por turno y se mantiene en todas las iteraciones,
@@ -252,12 +300,17 @@ class ToolAgent(Agent):
 
         # ¿Ya salió texto por on_token en este turno? Lo necesita la salida por
         # LLMError de abajo para no pegar el error a una frase cortada a medias.
-        hablo = False
+        # Uno por TURNO; el streamer (uno por llamada) emite a través de él.
+        emit = _Emitter(on_token) if on_token is not None else None
+        # Con "sentence" lo que se suelta en vivo no pasa por los post-hooks
+        # (solo alcanzan al texto final): el limpiador de preámbulos meta se
+        # aplica a lo acumulado antes de soltarlo, si el agente lo usa.
+        clean_head = None
+        if self.stream_release != RELEASE_FINAL:
+            from crotolamo.core.hooks import meta_preamble_cleaner
 
-        def _emit(chunk: str) -> None:
-            nonlocal hablo
-            hablo = True
-            on_token(chunk)
+            if meta_preamble_cleaner in self.post_hooks:
+                clean_head = meta_preamble_cleaner
 
         # (tool, resultado) de las iteraciones ANTERIORES de este turno. Lo miran
         # el cierre por content vacío y el short-circuit: ambos necesitan saber
@@ -265,6 +318,8 @@ class ToolAgent(Agent):
         previos: list[tuple[str, str]] = []
 
         for _ in range(self.max_iterations):
+            if should_abort is not None and should_abort():
+                raise TurnCancelled()
             # Una tool retirada a mitad de turno (un server MCP desconectado por
             # timeouts, M4) no debe seguir a la vista del modelo en la siguiente
             # iteración: filtramos por presencia en el registry (barato).
@@ -274,16 +329,21 @@ class ToolAgent(Agent):
                     if self.registry.get(s.get("function", {}).get("name", "")) is not None
                 ]
             # Con tools a la vista, el modelo puede anunciar lo que va a hacer antes
-            # de pedirla; retenemos hasta saber si hubo tool_call. Sin tools (charla),
-            # se habla en vivo.
+            # de pedirla; retenemos hasta saber si hubo tool_call (o, con
+            # "sentence", hasta que cierre la 1ª frase). Sin tools (charla), se
+            # habla en vivo. Al motor va el streamer ENTERO, no su `feed`:
+            # FallbackLLM le pide `restart` antes de repetir la llamada en local
+            # y los parsers consultan su `checkpoint` con cada línea del stream.
             streamer = (
-                _LiveStreamer(_emit, hold_until_done=bool(schemas))
-                if on_token is not None else None
+                _LiveStreamer(emit, hold_until_done=bool(schemas),
+                              release=self.stream_release, should_abort=should_abort,
+                              clean_head=clean_head)
+                if emit is not None else None
             )
             try:
                 if streamer is not None:
                     response = self.llm.chat_stream(
-                        self.conversation.to_messages(), tools=schemas, on_token=streamer.feed,
+                        self.conversation.to_messages(), tools=schemas, on_token=streamer,
                     )
                 else:
                     response = self.llm.chat(self.conversation.to_messages(), tools=schemas)
@@ -296,9 +356,9 @@ class ToolAgent(Agent):
                 # modelo recibía de golpe las órdenes sin contestar.
                 reply = str(error)
                 self.conversation.add_assistant(reply)
-                if on_token is not None:
+                if emit is not None:
                     # Si ya se habló media frase en vivo, el error va en línea aparte.
-                    on_token(f"\n{reply}" if hablo else reply)
+                    emit(f"\n{reply}" if emit.released else reply)
                 return reply
 
             calls = response.tool_calls
@@ -306,6 +366,8 @@ class ToolAgent(Agent):
             # Fallback: el modelo puso el tool-call como JSON en content.
             if not calls:
                 calls = _coerce_text_tool_calls(response.content, known)
+            if streamer is not None and streamer.would_release_early:
+                self._log_release(calls, response.content)
 
             if not calls:
                 # Content vacío: "Listo" solo si en este turno corrió alguna tool
@@ -332,6 +394,12 @@ class ToolAgent(Agent):
 
             results: list[tuple[str, str]] = []
             for call in calls:
+                if should_abort is not None and should_abort():
+                    # Las tools que faltan ya no corren (el patrón interrumpió),
+                    # pero cada tool_call necesita su resultado en el historial.
+                    for pending in calls[len(results):]:
+                        self.conversation.add_tool_result(pending["name"], _TOOL_CANCELADA)
+                    raise TurnCancelled()
                 result = self._safe_execute(call["name"], call.get("arguments", {}))
                 self.conversation.add_tool_result(call["name"], result)
                 results.append((call["name"], result))

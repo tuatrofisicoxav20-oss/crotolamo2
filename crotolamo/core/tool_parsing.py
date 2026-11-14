@@ -30,6 +30,26 @@ def parse_arguments(args: Any) -> dict[str, Any]:
     return {}
 
 
+def arguments_complete(args: Any) -> bool:
+    """¿Llegaron ENTEROS los `arguments` de un tool-call? Un dict, o un texto
+    que es un JSON completo.
+
+    Solo importa en un stream que acabó sin su cierre ([DONE] / done:true):
+    ahí un texto vacío o a medias no se puede degradar a {} como hace
+    `parse_arguments`, porque la tool correría con sus defaults en vez de con
+    lo que pidió el modelo.
+    """
+    if isinstance(args, dict):
+        return True
+    if isinstance(args, str):
+        try:
+            json.loads(args)
+        except json.JSONDecodeError:
+            return False
+        return True
+    return False
+
+
 _JSON_OPEN = re.compile(r"[{\[]")
 _DECODER = json.JSONDecoder()
 

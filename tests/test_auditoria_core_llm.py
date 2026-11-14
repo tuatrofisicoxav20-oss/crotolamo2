@@ -24,8 +24,10 @@ falsas inyectadas en `HTTPTransport._connect`.
   cuyo "name" es un objeto, lee los argumentos de "parameters" o de un string
   JSON, y saca TODAS las llamadas cuando vienen como objetos seguidos.
 - Un stream con un `error` dentro, sin el cierre del motor ([DONE]/finish_reason,
-  done=true) o un 3xx ya no pasa por una respuesta buena (vacía, cortada, o con
-  un tool_call a medio llegar que se ejecutaba con {}).
+  done=true) y sin nada usable, o un 3xx ya no pasa por una respuesta buena
+  (vacía, o con un tool_call a medio llegar que se ejecutaba con {}). Con texto
+  ya llegado, el final limpio sin cierre se acepta avisando en el log (criterio
+  híbrido; ver test_transport.py).
 """
 
 from __future__ import annotations
@@ -800,21 +802,23 @@ def test_un_error_tras_media_frase_tampoco_se_traga(monkeypatch, motor):
 
 
 @pytest.mark.parametrize("motor", ["glm", "ollama"])
-@pytest.mark.parametrize("lineas", [0, 1], ids=["sin tokens", "a media frase"])
-def test_stream_que_se_acaba_sin_el_cierre_del_motor_es_un_corte(monkeypatch, motor, lineas):
-    """Ni `[DONE]`/`finish_reason` (OpenAI) ni `done: true` (Ollama): al stream lo
-    cortaron, aunque el HTTP no se queje (FIN entre chunks, o un proxy que cierra
-    bien el chunked de un upstream que se le murió)."""
-    cuerpo = [_MEDIA_FRASE[motor]][:lineas]
-    for respuesta in (_stream_sin_cierre_http(cuerpo), _stream_entero(cuerpo)):
+def test_stream_que_se_acaba_sin_el_cierre_del_motor_es_un_corte(monkeypatch, motor):
+    """Ni `[DONE]`/`finish_reason` (OpenAI) ni `done: true` (Ollama) y sin nada
+    usable: al stream lo cortaron, aunque el HTTP no se queje (FIN entre chunks,
+    o un proxy que cierra bien el chunked de un upstream que se le murió).
+
+    Con texto ya llegado el final limpio se ACEPTA con un aviso en el log
+    (criterio híbrido): ver test_transport.py::
+    test_stream_truncado_avisa_y_no_marca_finish."""
+    for respuesta in (_stream_sin_cierre_http([]), _stream_entero([])):
         client = _cliente(motor, monkeypatch, respuesta)
         dichos: list[str] = []
 
-        # Antes: ChatResponse con el texto cortado (o vacío) dado por bueno.
+        # Antes: ChatResponse vacío dado por bueno.
         with pytest.raises(TransientLLMError, match="a medias, patrón"):
             client.chat_stream(_MSGS, on_token=dichos.append)
 
-        assert dichos == ["La capital de Francia es"][:lineas]
+        assert dichos == []
 
 
 def test_sse_con_finish_reason_y_sin_done_esta_completo():
@@ -848,9 +852,13 @@ _BORRAR_A_MEDIAS = {
         "index": 0, "id": "c1",
         "function": {"name": "borrar_todo", "arguments": '{"accion": "papel'},
     }]}}]}),
-    # Ollama manda la llamada entera, pero el turno no llegó a cerrarse.
+    # Ollama manda la llamada entera, pero algunos modelos ponen los argumentos
+    # como texto JSON: aquí llegó a medias y el turno no llegó a cerrarse. (Una
+    # llamada entera tras un corte limpio sí vale: ver
+    # test_perf_llm_turn_is_one_atomic_blocking_call.py::
+    # test_un_tool_call_entero_de_un_stream_cortado_si_se_ejecuta.)
     "ollama": _linea_ollama({"role": "assistant", "content": "", "tool_calls": [
-        {"function": {"name": "borrar_todo", "arguments": {"accion": "papelera"}}}]}),
+        {"function": {"name": "borrar_todo", "arguments": '{"accion": "papel'}}]}),
 }
 
 

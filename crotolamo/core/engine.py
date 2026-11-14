@@ -17,7 +17,9 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import ssl
 import threading
+import time
 import urllib.parse
 from typing import TYPE_CHECKING, Any, Callable, Protocol
 
@@ -31,6 +33,17 @@ log = get_logger("core.engine")
 OLLAMA = "ollama"
 GLM = "glm"
 VALID_BACKENDS = (OLLAMA, GLM)
+
+# Reloj del transporte (tope del drenaje y edad de un keep-alive). En Linux,
+# CLOCK_BOOTTIME: sigue contando mientras el portátil está suspendido, y
+# monotonic() no; tras despertar, un socket de "hace 5 s" puede tener horas.
+_BOOTTIME = getattr(time, "CLOCK_BOOTTIME", None)
+
+
+def _reloj() -> float:
+    if _BOOTTIME is not None:
+        return time.clock_gettime(_BOOTTIME)
+    return time.monotonic()
 
 
 class LLMEngine(Protocol):
@@ -57,7 +70,9 @@ class LLMEngine(Protocol):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         # El motor ignora lo que devuelva on_token; solo FallbackLLM lo mira
-        # (False = "retenido, no sonó"), por eso no se exige `-> None`.
+        # (False = "retenido, no sonó"), por eso no se exige `-> None`. Si
+        # on_token trae `checkpoint` (LiveStreamer), el motor lo consulta con
+        # cada línea del stream: es por donde se cancela un turno a medias.
         on_token: Callable[[str], object] | None = None,
     ) -> "ChatResponse":
         ...
@@ -72,10 +87,19 @@ class HTTPTransport:
 
     Qué maneja:
     - Reconexión transparente si el servidor cerró el keep-alive entre turnos
-      (un único reintento ante `BadStatusLine`/`ConnectionError`).
+      (un único reintento ante `BadStatusLine`/`ConnectionError`, y el
+      `ssl.SSLEOFError` con que Python 3.11/3.12 avisa de lo mismo sobre TLS).
     - Streaming: la respuesta devuelta se puede iterar línea a línea (SSE y
-      NDJSON). Si el caller no la drena entera, la siguiente petición detecta
-      la conexión sucia y abre una nueva.
+      NDJSON). El parser se detiene en el fin LÓGICO ([DONE] / done:true), un
+      paso antes del fin FÍSICO del cuerpo (el chunk terminal). Si el cliente
+      lo avisa con `finish(resp)`, la siguiente petición de ese hilo lee esa
+      cola, acotada en bytes y en tiempo total, y reutiliza el keep-alive.
+      Sin el aviso, si la cola no llega a tiempo o si la conexión lleva más
+      de `_REUSE_MAX_IDLE_S` quieta, la conexión sucia se tira y se abre
+      otra, como antes.
+    - Un fallo a media petición (timeout esperando la respuesta, por ejemplo)
+      cierra la conexión en el acto: con el socket abierto el servidor seguía
+      generando para nadie hasta la siguiente petición de ese hilo.
     - Timeouts (de conexión y de lectura, vía el timeout del socket).
 
     SEGURO ENTRE HILOS vía conexión POR HILO (threading.local): en el modo de
@@ -98,8 +122,10 @@ class HTTPTransport:
         self._port = parts.port  # None = puerto por defecto del esquema
         self.base_path = parts.path.rstrip("/")
         self.timeout = timeout
-        # Estado por hilo: .conn (la conexión keep-alive) y .last (la última
-        # respuesta, para detectar streams a medias). Ver docstring.
+        # Estado por hilo: .conn (la conexión keep-alive), .last (la última
+        # respuesta, para detectar streams a medias), .finishable (el
+        # consumidor avisó que .last llegó a su fin lógico) y .finished_at
+        # (cuándo, con `_reloj`). Ver docstring.
         self._local = threading.local()
 
     @property
@@ -123,6 +149,66 @@ class HTTPTransport:
             return http.client.HTTPSConnection(self._host, self._port, timeout=self.timeout)
         return http.client.HTTPConnection(self._host, self._port, timeout=self.timeout)
 
+    # Cola de un stream ya terminado lógicamente: línea en blanco + chunk
+    # terminal, unos pocos bytes que para la siguiente petición ya llegaron.
+    # Los topes acotan el caso raro (un servidor que sigue mandando o que
+    # retrasa el chunk terminal): pasado cualquiera, se descarta como antes.
+    # El de tiempo es del drenaje ENTERO, no de cada lectura: un goteo más
+    # rápido que eso retenía la petición hasta juntar los 64 KiB.
+    _DRAIN_BYTES = 65536
+    _DRAIN_TIMEOUT_S = 0.05
+    # Un stream terminado solo deja su keep-alive a la petición que llega en
+    # estos segundos (las llamadas de un turno con tools, una réplica rápida).
+    # Un socket muerto en silencio (NAT, cambio de wifi) no avisa: escribir
+    # "funciona" y la respuesta no llega nunca, así que costaría el timeout de
+    # lectura entero y abriría el breaker. Antes del finish() los streams
+    # nunca reutilizaban; pasado este tope, conexión nueva como entonces.
+    _REUSE_MAX_IDLE_S = 15.0
+
+    def finish(self, resp: Any) -> None:
+        """El consumidor llegó al fin LÓGICO de `resp` ([DONE] / done:true).
+
+        Solo lo ANOTA, así que el turno en curso no paga nada: la lectura de
+        la cola la hace la siguiente petición de este hilo (ver `_drain`).
+        Un aviso sobre otra respuesta, o desde otro hilo, no cuenta.
+        """
+        if resp is not None and resp is self._last:
+            self._local.finishable = True
+            self._local.finished_at = _reloj()
+
+    def _drain(self, resp: Any) -> bool:
+        """Lee la cola de `resp`, acotada; True si el socket quedó limpio.
+
+        read1 lee lo de UN chunk cada vez, con el timeout del socket recortado
+        a lo que queda del tope: entre lectura y lectura se mira el reloj, así
+        que un goteo no estira el total más allá de _DRAIN_TIMEOUT_S (más la
+        última espera, acotada por lo que quedaba).
+        """
+        if getattr(resp, "will_close", False):
+            return False  # `Connection: close`: el servidor no lo va a reutilizar
+        sock = getattr(self._conn, "sock", None)
+        limite = _reloj() + self._DRAIN_TIMEOUT_S
+        leidos = 0
+        try:
+            previous = sock.gettimeout() if sock is not None else None
+            try:
+                while not resp.isclosed():
+                    queda = limite - _reloj()
+                    if queda <= 0 or leidos >= self._DRAIN_BYTES:
+                        return False
+                    if sock is not None:
+                        sock.settimeout(queda)
+                    data = resp.read1(self._DRAIN_BYTES - leidos)
+                    if not data:
+                        break
+                    leidos += len(data)
+            finally:
+                if sock is not None:
+                    sock.settimeout(previous)
+        except Exception:  # noqa: BLE001 - si no se puede drenar, se descarta
+            return False
+        return bool(resp.isclosed())
+
     def close(self) -> None:
         """Suelta la conexión actual (la siguiente petición abrirá otra)."""
         if self._conn is not None:
@@ -132,6 +218,7 @@ class HTTPTransport:
                 pass
             self._conn = None
         self._last = None
+        self._local.finishable = False
 
     def post_json(
         self,
@@ -154,11 +241,17 @@ class HTTPTransport:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8", errors="replace")
         hdrs = {"Content-Type": "application/json", **(headers or {})}
 
-        # Si la respuesta anterior quedó a medias (p.ej. un stream que cortó en
-        # [DONE] sin drenar el resto), el socket tiene bytes pendientes y no es
-        # reutilizable: se tira y se abre conexión nueva.
-        if self._last is not None and not self._last.isclosed():
-            self.close()
+        # Si la respuesta anterior quedó a medias, el socket tiene bytes
+        # pendientes y no es reutilizable: se tira y se abre conexión nueva.
+        # Salvo que el consumidor avisara (finish) que llegó al fin lógico: lo
+        # que falta es solo la cola del cuerpo, que se lee y el socket sigue.
+        last = self._last
+        finishable = getattr(self._local, "finishable", False) and (
+            _reloj() - self._local.finished_at <= self._REUSE_MAX_IDLE_S)
+        self._local.finishable = False
+        if last is not None and not last.isclosed():
+            if not (finishable and self._drain(last)):
+                self.close()
 
         url = f"{self.base_path}{path}"
         for intento in (1, 2):
@@ -168,13 +261,21 @@ class HTTPTransport:
                 self._conn.request("POST", url, body=body, headers=hdrs)
                 resp = self._conn.getresponse()
             except (http.client.BadStatusLine, http.client.CannotSendRequest,
-                    ConnectionError) as error:
+                    ConnectionError, ssl.SSLEOFError) as error:
                 # El servidor cerró el keep-alive mientras esperábamos: se
                 # reconecta y se reintenta UNA vez. A la segunda, se propaga.
+                # SSLEOFError es ese mismo socket muerto visto por TLS en Python
+                # 3.11/3.12 (en 3.13 ya llega como ConnectionError).
                 self.close()
                 if intento == 2:
                     raise error
                 continue
+            except BaseException:
+                # Cualquier otro fallo (timeout esperando la respuesta, red
+                # caída): la petición quedó a medias y el servidor seguiría
+                # generando para nadie. Se cuelga ya; el error sigue su camino.
+                self.close()
+                raise
             self._last = resp
             return resp
         raise AssertionError("inalcanzable")  # pragma: no cover

@@ -213,6 +213,138 @@ def test_sse_ignora_lineas_basura_y_done():
     assert content == "ok"
 
 
+# --- parse_sse: el fin LÓGICO del stream, para que el cliente cierre el ciclo ---
+
+_HOLA = {"choices": [{"delta": {"content": "Hola"}}]}
+
+
+def _lineas(*objs) -> list[bytes]:
+    return [f"data: {json.dumps(o)}\n".encode() for o in objs]
+
+
+@pytest.mark.parametrize("stream, completo", [
+    (_lineas(_HOLA) + [b"data: [DONE]\n"], True),
+    # Hay servidores que cierran tras el chunk de finish_reason sin [DONE].
+    (_lineas(_HOLA, {"choices": [{"delta": {}, "finish_reason": "stop"}]}), True),
+    # Ni lo uno ni lo otro: el cuerpo se acabó antes (respuesta truncada).
+    (_lineas(_HOLA), False),
+], ids=["done", "finish_reason", "ninguno"])
+def test_parse_sse_reporta_fin_logico(stream, completo):
+    from crotolamo.core.sse import parse_sse
+
+    got: list[str] = []
+    content, msg, complete = parse_sse(iter(stream), got.append)
+
+    assert complete is completo
+    assert content == "Hola" and got == ["Hola"]
+    assert msg == {"role": "assistant", "content": "Hola"}
+    # El envoltorio de 2 valores devuelve lo mismo, sin el aviso.
+    assert consume_sse(iter(stream), None) == (content, msg)
+
+
+class _ConControl:
+    """on_token con punto de control (como LiveStreamer): cuenta las consultas
+    y, a partir de `corta_en`, cancela."""
+
+    def __init__(self, corta_en: int | None = None) -> None:
+        self.dichos: list[str] = []
+        self.consultas = 0
+        self.corta_en = corta_en
+
+    def __call__(self, texto: str) -> None:
+        self.dichos.append(texto)
+
+    def checkpoint(self) -> None:
+        from crotolamo.core.streaming import TurnCancelled
+
+        self.consultas += 1
+        if self.corta_en is not None and self.consultas >= self.corta_en:
+            raise TurnCancelled()
+
+
+def _tool_delta(args: str, primero: bool = False) -> dict:
+    call: dict = {"index": 0, "function": {"arguments": args}}
+    if primero:
+        call = {"index": 0, "id": "c1", "function": {"name": "escribir", "arguments": args}}
+    return {"choices": [{"delta": {"tool_calls": [call]}}]}
+
+
+def test_parse_sse_consulta_el_punto_de_control_en_cada_linea():
+    """Un tool-call (deltas de `arguments`), un razonamiento (reasoning_content,
+    con [llm.glm].thinking) o un delta vacío no traen texto y no pasan por
+    on_token: antes un turno de orden no se podía cancelar hasta el final del
+    stream. Cada línea leída es punto de control; los tokens no cambian."""
+    from crotolamo.core.sse import parse_sse
+
+    stream = _lineas(
+        {"choices": [{"delta": {"reasoning_content": "Veamos..."}}]},
+        _tool_delta('{"texto": ', primero=True),
+        _tool_delta('"hola"}'),
+        {"choices": [{"delta": {}}]},
+        _HOLA,
+        {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+    )
+    sink = _ConControl()
+
+    content, msg, complete = parse_sse(iter(stream), sink)
+
+    assert (content, complete, sink.dichos) == ("Hola", True, ["Hola"])
+    assert msg["tool_calls"][0]["function"] == {"name": "escribir", "arguments": {"texto": "hola"}}
+    assert sink.consultas == len(stream)
+
+
+@pytest.mark.parametrize("delta", [_tool_delta("xxxxxxxx"),
+                                   {"choices": [{"delta": {"reasoning_content": "mmm"}}]}])
+def test_parse_sse_el_punto_de_control_corta_un_stream_sin_texto(delta):
+    from crotolamo.core.sse import parse_sse
+    from crotolamo.core.streaming import TurnCancelled
+
+    stream = _lineas(_tool_delta('{"texto": "', primero=True), *[delta] * 50)
+    leidas: list[int] = []
+
+    def _iter():
+        for line in stream:
+            leidas.append(1)
+            yield line
+
+    with pytest.raises(TurnCancelled):
+        parse_sse(_iter(), _ConControl(corta_en=2))
+
+    assert len(leidas) == 2          # ni una línea más tras el barge-in
+
+
+def test_parse_sse_truncado_con_tool_call_entero_se_acepta():
+    """Corte limpio tras un tool_call cuyos argumentos llegaron ENTEROS: la
+    respuesta vale (con el aviso de truncado, que lo da el cliente)."""
+    from crotolamo.core.sse import parse_sse
+
+    stream = _lineas({"choices": [{"delta": {"tool_calls": [{
+        "index": 0, "id": "c1", "function": {"name": "music_control", "arguments": '{"a": 1}'},
+    }]}}]})
+
+    _, msg, complete = parse_sse(iter(stream), None)
+
+    assert complete is False
+    assert msg["tool_calls"][0]["function"] == {"name": "music_control", "arguments": {"a": 1}}
+
+
+@pytest.mark.parametrize("stream", [
+    [],                                                      # nada de nada
+    _lineas({"choices": [{"delta": {"content": "  "}}]}),    # solo espacios
+    # Argumentos a medio llegar: jamás se ejecutan degradados a {}.
+    _lineas({"choices": [{"delta": {"content": "Va."}}]}, {"choices": [{"delta": {
+        "tool_calls": [{"index": 0, "function": {"name": "borrar", "arguments": '{"ruta": "/ho'}}],
+    }}]}),
+    # Un tool_call que ni trajo argumentos tampoco se sabe entero.
+    _lineas({"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"name": "x"}}]}}]}),
+], ids=["vacio", "espacios", "args_a_medias", "sin_args"])
+def test_parse_sse_truncado_sin_nada_usable_sigue_siendo_un_corte(stream):
+    from crotolamo.core.sse import SSETruncated, parse_sse
+
+    with pytest.raises(SSETruncated):
+        parse_sse(iter(stream), None)
+
+
 # --- credenciales y selección de backend ---
 
 def test_sin_api_key_error_en_personaje(monkeypatch):

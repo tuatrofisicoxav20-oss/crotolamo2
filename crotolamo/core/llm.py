@@ -15,7 +15,10 @@ from dataclasses import dataclass, field
 from typing import Any, NoReturn
 
 from crotolamo.core.engine import HTTPTransport
-from crotolamo.core.tool_parsing import parse_arguments
+from crotolamo.core.tool_parsing import arguments_complete, parse_arguments
+from crotolamo.logging_setup import get_logger
+
+log = get_logger("core.llm")
 
 # Instrumentación opcional: con CROTOLAMO_LLM_PROF=1 imprime tiempo y tokens por
 # llamada a /api/chat (prompt_eval_count, eval_count). Útil para diagnosticar el
@@ -180,6 +183,9 @@ class LLMClient:
         try:
             raw = json.loads(resp.read().decode("utf-8"))
         except (TimeoutError, OSError) as error:
+            # El cuerpo no llegó entero: el socket queda a medias. Se cuelga ya;
+            # abierto, Ollama seguiría generando (y quemando CPU) para nadie.
+            self._transport.close()
             raise TransientLLMError(
                 f"Ollama no respondió a tiempo, patrón. ({error})"
             ) from error
@@ -188,6 +194,7 @@ class LLMClient:
             # cerraron antes de mandar lo prometido). Es HTTPException, NO
             # OSError: sin esta rama salía cruda de handle_turn (traceback) y
             # sin abrir el breaker de FallbackLLM, aunque es pura disponibilidad.
+            self._transport.close()
             raise TransientLLMError(
                 f"Ollama me cortó la respuesta a medias, patrón. ({error})"
             ) from error
@@ -224,16 +231,42 @@ class LLMClient:
         Acumula el contenido y los tool_calls de todo el stream. Útil para
         respuesta token-a-token (Fase 6). Funciona mejor con GPU o modelos que usan
         el campo nativo tool_calls.
+
+        Cierra el ciclo de la respuesta: al ver done=true avisa al transporte
+        (`finish`) para reutilizar el keep-alive; ante un corte, un fallo o un
+        consumidor que aborta, cuelga el socket, que es lo que hace que Ollama
+        deje de generar.
         """
         resp = self._send(self._payload(messages, tools, stream=True))
         try:
-            content, message = self._consume_stream(resp, on_token)
+            content, message, complete = self._parse_stream(resp, on_token)
         except (TimeoutError, OSError) as error:
+            self._transport.close()
             raise TransientLLMError(
                 f"Ollama no respondió a tiempo, patrón. ({error})") from error
         except http.client.HTTPException as error:  # stream cortado: ver chat()
+            self._transport.close()
             raise TransientLLMError(
                 f"Ollama me cortó la respuesta a medias, patrón. ({error})") from error
+        except BaseException:
+            # Error dentro del stream, corte sin nada usable (ver _parse_stream)
+            # o el consumidor abortó (on_token lanzó): colgar YA. Con el socket
+            # abierto Ollama sigue generando (y quemando CPU) para nadie.
+            self._transport.close()
+            raise
+        if complete:
+            self._transport.finish(resp)  # la cola se drena en la próxima petición
+        else:
+            # Final limpio sin done=true: se acepta (ver _parse_stream), pero
+            # queda dicho en el log. Esa conexión no se reutiliza: lo normal es
+            # que la cortara el servidor, y reusarla solo costaría una escritura
+            # fallida más el reintento.
+            log.warning(
+                "Ollama cerró el stream sin done=true: respuesta posiblemente "
+                "truncada (%d caracteres, %d tool_calls)",
+                len(content), len(message.get("tool_calls") or []),
+            )
+            self._transport.close()
 
         return ChatResponse(
             content=content.strip(),
@@ -243,25 +276,44 @@ class LLMClient:
 
     @staticmethod
     def _consume_stream(resp, on_token) -> tuple[str, dict[str, Any]]:
+        """Como `_parse_stream`, sin el aviso de fin lógico (tests y llamadores viejos)."""
+        content, message, _complete = LLMClient._parse_stream(resp, on_token)
+        return content, message
+
+    @staticmethod
+    def _parse_stream(resp, on_token) -> tuple[str, dict[str, Any], bool]:
         """Parsea el JSONL de /api/chat?stream=true. Reusable y testeable.
 
-        Devuelve (contenido, mensaje del turno ENTERO). Los tool_calls llegan
-        completos (no fragmentados como en el SSE de OpenAI) pero en un chunk
-        con done=false, y el stream SIEMPRE cierra con un chunk done=true cuyo
-        message viene vacío. Quedarse con el último message (lo que se hacía)
-        borraba la llamada: la tool no corría y el turno se cerraba en falso.
+        Devuelve (contenido, mensaje del turno ENTERO, ¿llegó done=true?). Con
+        el tercer valor el cliente le avisa al transporte que el socket se
+        puede reutilizar. Los tool_calls llegan completos (no fragmentados
+        como en el SSE de OpenAI) pero en un chunk con done=false, y el stream
+        cierra con un chunk done=true cuyo message viene vacío. Quedarse con
+        el último message borraba la llamada: la tool no corría y el turno se
+        cerraba en falso. Si el chunk final SÍ trae tool_calls (formato
+        antiguo, o la misma llamada repetida al cerrar), mandan esos: así
+        ninguna se pierde ni se ejecuta dos veces.
 
         Lanza TransientLLMError si Ollama avisa de un fallo dentro del stream
-        (una línea {"error": ...}, ya con el 200 dado) o si el stream se acaba
-        sin su done=true. Antes las dos cosas pasaban por una respuesta buena:
-        vacía, cortada a media frase, o con un tool_call de un turno sin cerrar.
+        (una línea {"error": ...}, ya con el 200 dado). Si el stream se acaba
+        sin done=true, lanza el mismo error cuando no deja nada usable (ni
+        texto ni tool_calls, o unos argumentos a medias); con algo usable lo
+        devuelve con False, igual que `parse_sse` (ver allí el porqué).
+
+        Como `parse_sse`, consulta el `checkpoint` del on_token (si lo trae)
+        con CADA línea: un chunk de razonamiento (`thinking`) o de tool_calls
+        llega con content vacío y no pasa por on_token.
         """
+        checkpoint = getattr(on_token, "checkpoint", None)
         parts: list[str] = []
-        calls: list[Any] = []
+        early_calls: list[Any] = []
+        final_calls: list[Any] = []
         # Que el HTTP no se queje no basta: un FIN entre dos chunks acaba la
         # iteración por líneas sin error. El cierre de verdad es done=true.
         complete = False
         for raw_line in resp:
+            if checkpoint is not None:
+                checkpoint()
             # "replace": una línea que ni es UTF-8 es basura como cualquier otra
             # y la descarta el filtro de abajo; con el codec estricto reventaba
             # aquí con un UnicodeDecodeError crudo antes de llegar a él.
@@ -283,7 +335,10 @@ class LLMClient:
                 )
             msg = obj.get("message", {}) or {}
             # Varias llamadas pueden venir en un chunk o repartidas en varios.
-            calls.extend(msg.get("tool_calls") or [])
+            if obj.get("done"):
+                final_calls.extend(msg.get("tool_calls") or [])
+            else:
+                early_calls.extend(msg.get("tool_calls") or [])
             delta = msg.get("content") or ""
             if delta:
                 parts.append(delta)
@@ -292,13 +347,20 @@ class LLMClient:
             if obj.get("done"):
                 complete = True
                 break
-        if not complete:
+        calls = final_calls or early_calls
+        content = "".join(parts)
+        if not complete and (
+            not (content.strip() or calls)
+            or not all(
+                arguments_complete((call.get("function") or {}).get("arguments", {}))
+                for call in calls
+            )
+        ):
             raise TransientLLMError(
                 "Ollama me cortó la respuesta a medias, patrón. (el stream acabó sin done)"
             )
-        content = "".join(parts)
         # Misma forma que devuelve `consume_sse`: `tool_calls` solo si hubo.
         message: dict[str, Any] = {"role": "assistant", "content": content}
         if calls:
             message["tool_calls"] = calls
-        return content, message
+        return content, message, complete

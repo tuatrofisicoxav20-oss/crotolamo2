@@ -16,7 +16,13 @@ así que `ToolAgent` no se entera. Dos decisiones que no son obvias:
    TTS. Si el primario revienta A MEDIA frase, reintentar con el respaldo haría que
    Crotolamo repitiera el principio. Si ya se emitió un token, el error se propaga.
    "Emitido" es lo que SALIÓ: un token que el consumidor retuvo (on_token devolvió
-   False, ver `LiveStreamer.feed`) no sonó, y ahí sí se usa el respaldo.
+   False, ver `LiveStreamer.feed`) no sonó, y ahí sí se usa el respaldo. Antes de
+   repetir la llamada se le pide al consumidor `restart()` (si lo tiene): lo que
+   retuvo de la nube no puede salir pegado a la respuesta del local.
+
+El punto de control del consumidor (`checkpoint`, ver `LiveStreamer`) sigue a la
+vista del primario a través del envoltorio, y se consulta antes de arrancar el
+local: un turno cancelado (barge-in) no paga el prompt-eval en CPU para nadie.
 """
 
 from __future__ import annotations
@@ -100,6 +106,21 @@ class FallbackLLM:
             log.info("el motor principal volvió")
         self._retry_at = 0.0
 
+    def preconnect(self) -> bool:
+        """Abre por adelantado la conexión del motor que respondería ahora.
+
+        Nunca lanza: es una optimización, y sin soporte (o sin red) el turno
+        conecta como siempre. Devuelve True si quedó una conexión lista.
+        """
+        preconnect = getattr(self.active, "preconnect", None)
+        if not callable(preconnect):
+            return False
+        try:
+            return bool(preconnect())
+        except Exception as error:  # noqa: BLE001 - nunca tumba a quien la llama
+            log.debug("preconnect falló: %s", error)
+            return False
+
     def chat(
         self,
         messages: list[dict[str, Any]],
@@ -125,6 +146,7 @@ class FallbackLLM:
         tools: list[dict[str, Any]] | None = None,
         on_token=None,
     ) -> ChatResponse:
+        checkpoint = getattr(on_token, "checkpoint", None)
         if not self._primary_down():
             hablo = False
 
@@ -137,6 +159,11 @@ class FallbackLLM:
                 # se asume que habló, como siempre.
                 if on_token is not None and on_token(chunk) is not False:
                     hablo = True
+
+            # Los parsers buscan el punto de control como atributo del on_token
+            # que reciben (este envoltorio): sin él, un tool-call o un
+            # razonamiento del primario no se podían cancelar a medio stream.
+            _marcar.checkpoint = checkpoint  # type: ignore[attr-defined]
 
             try:
                 response = self.primary.chat_stream(messages, tools=tools, on_token=_marcar)
@@ -153,4 +180,14 @@ class FallbackLLM:
             else:
                 self._recover()
                 return response
+            # No salió nada, pero el consumidor puede tener retenido el
+            # principio que soltó la nube (LiveStreamer con "sentence" lo
+            # soltaría al cerrar la frase, pegado a la respuesta del local).
+            restart = getattr(on_token, "restart", None)
+            if callable(restart):
+                restart()
+        if checkpoint is not None:
+            # Cancelado mientras el primario fallaba: el local no arranca. El
+            # fallo del primario ya contó para el breaker (fue real).
+            checkpoint()
         return self.secondary.chat_stream(messages, tools=tools, on_token=on_token)

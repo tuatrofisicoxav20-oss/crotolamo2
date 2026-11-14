@@ -291,3 +291,279 @@ def test_clientes_clasifican_transitorio_vs_permanente(monkeypatch):
     with pytest.raises(LLMError) as exc:
         client.chat([{"role": "user", "content": "hola"}])
     assert not isinstance(exc.value, TransientLLMError)
+
+
+# --- Lo retenido de la nube nunca se mezcla con la respuesta local -----------
+# (causa raíz "el turno del LLM es una llamada atómica y bloqueante", paso 6).
+# "Ya habló" sigue siendo lo que on_token devuelve (False = retenido, ver
+# LiveStreamer.feed); lo nuevo es que, antes de repetir la llamada en local,
+# FallbackLLM reinicia el streamer para que lo retenido no salga pegado.
+
+_LOCAL = ("Hola, ", "patrón. ", "Todo ", "bien.")
+
+
+def _streamer(dichos, modo):
+    from crotolamo.core.streaming import LiveStreamer
+
+    if modo == "final":       # tools a la vista, lo de siempre
+        return LiveStreamer(dichos.append, hold_until_done=True)
+    if modo == "sentence":    # tools a la vista, opt-in: retiene hasta cerrar frase
+        return LiveStreamer(dichos.append, hold_until_done=True, release="sentence")
+    return LiveStreamer(dichos.append)   # charla: retiene si empieza como JSON
+
+
+@pytest.mark.parametrize("modo, tokens_nube", [
+    ("final", ("¡Claro que sí, ", "patrón! Voy a")),
+    ("sentence", ("La nube iba diciendo", " algo sin cerrar")),
+    ("charla", ('{"name": "ram', '_usage"')),
+])
+@pytest.mark.parametrize("corte", [TransientLLMError("glm caído"),
+                                   GLMAuthError("GLM me rechazó la credencial (401)")])
+def test_lo_retenido_de_la_nube_no_se_mezcla_con_el_local(modo, tokens_nube, corte):
+    nube = _Fake("glm", tokens=tokens_nube, error=corte)
+    local = _Fake("ollama", tokens=_LOCAL)
+    dichos: list[str] = []
+    streamer = _streamer(dichos, modo)
+
+    r = FallbackLLM(nube, local).chat_stream([], on_token=streamer)
+    streamer.flush_if_held("".join(_LOCAL))
+
+    assert local.llamadas == 1
+    assert r.content == "soy ollama"
+    assert "".join(dichos) == "".join(_LOCAL)   # ni un trozo de la nube
+
+
+def test_restart_por_defecto_no_cambia_los_trozos_que_se_oyen():
+    """Sin tools a la vista, la nube empezó como JSON (retener) y se cayó: antes
+    del paso 6 el local seguía retenido y se oía de UNA vez el texto final (con
+    los post-hooks). `restart` no puede deshacer esa decisión: compara los
+    trozos, no solo lo concatenado."""
+    nube = _Fake("glm", tokens=('{"', "name"), falla=True)
+    local = _Fake("ollama", tokens=_LOCAL)
+    dichos: list[str] = []
+    streamer = _streamer(dichos, "charla")
+
+    FallbackLLM(nube, local).chat_stream([], on_token=streamer)
+    assert dichos == []                 # el local también quedó retenido
+    streamer.flush_if_held("Hola, patrón. Todo bien.")
+
+    assert dichos == ["Hola, patrón. Todo bien."]
+
+
+def _agente_sin_tools(llm):
+    from crotolamo.core.agent import ToolAgent
+    from crotolamo.core.memory import Conversation
+    from crotolamo.safety.guard import Guard
+    from crotolamo.tools import default_registry
+
+    # route_fn vacío: el turno no lleva tools (charla), hold_until_done=False.
+    return ToolAgent(llm, Conversation("SYS"), registry=default_registry(),
+                     guard=Guard(allowed_roots=[]), fastpath=False, route_fn=lambda t: [])
+
+
+def test_toolagent_charla_tras_json_de_la_nube_oye_lo_de_siempre():
+    """El mismo caso por el turno completo (lo que reporta la revisión con
+    6508165 como referencia): un único trozo, el texto final."""
+    nube = _Fake("glm", tokens=('{"', "name"), falla=True)
+    local = _Fake("ollama", tokens=_LOCAL)
+    dichos: list[str] = []
+
+    reply = _agente_sin_tools(FallbackLLM(nube, local)).handle_turn("hola", on_token=dichos.append)
+
+    assert (reply, dichos) == ("soy ollama", ["soy ollama"])
+
+
+def test_toolagent_charla_si_tambien_cae_el_local_solo_se_oye_el_error():
+    nube = _Fake("glm", tokens=('{"',), falla=True)
+    local = _Fake("ollama", tokens=("Hola", " pa"), falla=True)
+    dichos: list[str] = []
+
+    reply = _agente_sin_tools(FallbackLLM(nube, local)).handle_turn("hola", on_token=dichos.append)
+
+    assert (reply, dichos) == ("ollama caído", ["ollama caído"])
+
+
+def test_sin_reiniciar_lo_retenido_se_habria_pegado():
+    """Control del anterior: el streamer "sentence" sin `restart` mezclaba."""
+    nube = _Fake("glm", tokens=("La nube iba diciendo",), falla=True)
+    local = _Fake("ollama", tokens=_LOCAL)
+    dichos: list[str] = []
+    streamer = _streamer(dichos, "sentence")
+
+    # `streamer.feed` (método suelto): FallbackLLM no alcanza `restart`.
+    FallbackLLM(nube, local).chat_stream([], on_token=streamer.feed)
+
+    assert "".join(dichos).startswith("La nube iba diciendoHola")
+
+
+def test_no_reinicia_ni_reintenta_si_ya_salio_texto():
+    class _Espia:
+        def __init__(self):
+            self.dichos: list[str] = []
+            self.reinicios = 0
+
+        def __call__(self, texto):
+            self.dichos.append(texto)
+            return True          # salió hacia el patrón
+
+        def restart(self):
+            self.reinicios += 1
+
+    nube = _Fake("glm", tokens=("Órale ",), falla=True)
+    local = _Fake("ollama", tokens=("hola",))
+    espia = _Espia()
+
+    with pytest.raises(LLMError):
+        FallbackLLM(nube, local).chat_stream([], on_token=espia)
+
+    assert (espia.dichos, espia.reinicios, local.llamadas) == (["Órale "], 0, 0)
+
+
+def test_un_on_token_sin_restart_sigue_funcionando():
+    """Cualquier callable vale: sin `restart` no hay nada que reiniciar."""
+    nube = _Fake("glm", tokens=("retenido",), falla=True)
+    local = _Fake("ollama", tokens=("hola",))
+    dichos: list[str] = []
+
+    def retiene(texto):
+        dichos.append(texto)
+        return False
+
+    r = FallbackLLM(nube, local).chat_stream([], on_token=retiene)
+    assert r.content == "soy ollama"
+    assert dichos == ["retenido", "hola"]
+
+
+def test_toolagent_sentence_la_nube_cae_sin_haber_hablado_y_responde_el_local_limpio():
+    """El turno completo con el opt-in: la nube suelta media frase (retenida por
+    "sentence"), se cae el wifi y el local contesta; se oye SOLO el local."""
+    from crotolamo.core.agent import ToolAgent
+    from crotolamo.core.memory import Conversation
+    from crotolamo.safety.guard import Guard
+    from crotolamo.tools import default_registry
+
+    nube = _Fake("glm", tokens=("La nube iba", " diciendo algo"), falla=True)
+    local = _Fake("ollama", tokens=_LOCAL)
+    agent = ToolAgent(FallbackLLM(nube, local), Conversation("SYS"),
+                      registry=default_registry(), guard=Guard(allowed_roots=[]),
+                      fastpath=False, stream_release="sentence")
+    dichos: list[str] = []
+
+    reply = agent.handle_turn("hola", on_token=dichos.append)
+
+    assert reply == "soy ollama"
+    assert "".join(dichos) == "".join(_LOCAL)
+
+
+class _ConPreconnect(_Fake):
+    def __init__(self, name, resultado=True, error=None):
+        super().__init__(name)
+        self.resultado = resultado
+        self.error_pre = error
+        self.preconexiones = 0
+
+    def preconnect(self):
+        self.preconexiones += 1
+        if self.error_pre is not None:
+            raise self.error_pre
+        return self.resultado
+
+
+def test_preconnect_delega_en_el_motor_activo():
+    nube, local = _ConPreconnect("glm"), _ConPreconnect("ollama", resultado=False)
+    llm = FallbackLLM(nube, local, cooldown_s=300)
+
+    assert llm.preconnect() is True
+    assert (nube.preconexiones, local.preconexiones) == (1, 0)
+
+    llm._trip(TransientLLMError("glm caído"))          # breaker abierto: manda el local
+    assert llm.preconnect() is False
+    assert (nube.preconexiones, local.preconexiones) == (1, 1)
+
+
+def test_preconnect_nunca_lanza_y_sin_soporte_es_false():
+    assert FallbackLLM(_Fake("glm"), _Fake("ollama")).preconnect() is False
+    roto = _ConPreconnect("glm", error=OSError("sin red"))
+    assert FallbackLLM(roto, _Fake("ollama")).preconnect() is False
+
+
+# --- Un turno cancelado (barge-in) no sigue gastando en ningún motor -----------
+# El punto de control del consumidor (`LiveStreamer.checkpoint`) lo consultan los
+# parsers con cada línea del stream; FallbackLLM lo deja a la vista del primario
+# a través de su envoltorio y lo consulta antes de arrancar el local.
+
+
+class _ConsultaElControl(_Fake):
+    """Motor que, como los parsers reales, consulta el punto de control del
+    on_token que recibe con cada evento (aquí, uno antes de cada token)."""
+
+    def chat_stream(self, messages, tools=None, on_token=None):
+        self.llamadas += 1
+        checkpoint = getattr(on_token, "checkpoint", None)
+        for t in self.tokens or ("",):
+            if checkpoint is not None:
+                checkpoint()
+            if on_token and t:
+                on_token(t)
+        self._boom()
+        return ChatResponse(content=f"soy {self.model}")
+
+
+def test_el_primario_ve_el_punto_de_control_a_traves_del_envoltorio():
+    from crotolamo.core.streaming import LiveStreamer, TurnCancelled
+
+    nube = _ConsultaElControl("glm", tokens=("",))      # un tool-call: sin texto
+    local = _Fake("ollama", tokens=_LOCAL)
+    llm = FallbackLLM(nube, local)
+    streamer = LiveStreamer([].append, hold_until_done=True, should_abort=lambda: True)
+
+    with pytest.raises(TurnCancelled):
+        llm.chat_stream([], on_token=streamer)
+
+    # TurnCancelled no es un fallo del motor: ni breaker ni local.
+    assert (nube.llamadas, local.llamadas, llm.degraded) == (1, 0, False)
+
+
+def test_cancelado_mientras_la_nube_cae_no_arranca_el_local():
+    """El patrón interrumpe y la nube se cae en la misma llamada: el fallo de la
+    nube cuenta (breaker), pero el local (segundos de prompt-eval en CPU) ya no
+    se arranca para un turno que nadie va a oír."""
+    from crotolamo.core.streaming import LiveStreamer, TurnCancelled
+
+    vigente = {"ok": True}
+
+    class _NubeQueCae(_Fake):
+        def chat_stream(self, messages, tools=None, on_token=None):
+            vigente["ok"] = False          # el barge-in llega mientras se cae
+            return super().chat_stream(messages, tools, on_token)
+
+    nube = _NubeQueCae("glm", falla=True)
+    local = _Fake("ollama", tokens=_LOCAL)
+    llm = FallbackLLM(nube, local)
+    streamer = LiveStreamer([].append, hold_until_done=True,
+                            should_abort=lambda: not vigente["ok"])
+
+    with pytest.raises(TurnCancelled):
+        llm.chat_stream([], on_token=streamer)
+
+    assert local.llamadas == 0
+    assert llm.degraded
+
+
+def test_sin_should_abort_el_punto_de_control_no_cambia_nada():
+    """Por defecto (sin should_abort) consultar el punto de control no hace
+    nada: la nube cae con todo retenido, responde el local y se oye lo de
+    siempre, de una vez."""
+    from crotolamo.core.streaming import LiveStreamer
+
+    dichos: list[str] = []
+    nube = _ConsultaElControl("glm", tokens=("¡Claro que ", "sí, patrón!"), falla=True)
+    local = _ConsultaElControl("ollama", tokens=_LOCAL)
+    streamer = LiveStreamer(dichos.append, hold_until_done=True)
+
+    r = FallbackLLM(nube, local).chat_stream([], on_token=streamer)
+    streamer.flush_if_held("".join(_LOCAL))
+
+    assert r.content == "soy ollama"
+    assert (nube.llamadas, local.llamadas) == (1, 1)
+    assert dichos == ["".join(_LOCAL)]

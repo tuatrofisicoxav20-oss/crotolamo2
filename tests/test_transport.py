@@ -7,6 +7,7 @@ Ni un byte de red real: se inyecta un transporte falso en los clientes
 from __future__ import annotations
 
 import http.client
+import io
 import json
 
 import pytest
@@ -148,6 +149,295 @@ def test_transport_descarta_conexion_con_stream_a_medias(monkeypatch):
     t.post_json("/api/chat", {})   # debe abrir conexión nueva
     assert sucia.cerrada
     assert len(limpia.requests) == 1
+
+
+# --- HTTPTransport: fin LÓGICO avisado (finish) -> keep-alive reutilizable ---
+# Los parsers de stream se detienen en [DONE]/done:true, antes del chunk
+# terminal del cuerpo: sin aviso, la respuesta "a medias" tiraba el socket y
+# cada chat_stream pagaba TCP+TLS nuevos.
+
+class _StreamResp(_Resp):
+    """Stream cuyo parser ya vio el fin lógico: solo queda la cola del cuerpo."""
+
+    def __init__(self, cola=b"\r\n0\r\n\r\n", will_close=False, falla=None, sobra=False):
+        super().__init__(body=cola)
+        self.will_close = will_close
+        self.falla = falla      # excepción que lanza read() (p.ej. el timeout)
+        self.sobra = sobra      # True = la cola es más larga que el tope de drenaje
+        self.lecturas: list[int | None] = []
+
+    def read(self, amt=None):
+        self.lecturas.append(amt)
+        if self.falla is not None:
+            raise self.falla
+        if not self.sobra:
+            self._leido = True
+        return b"x" * (amt or 0) if self.sobra else super().read()
+
+    # El drenaje lee con read1 (una lectura del socket cada vez, para poder
+    # mirar el reloj entre una y otra); aquí da igual cuál se llame.
+    read1 = read
+
+
+class _FakeSock:
+    def __init__(self, timeout=60.0):
+        self.timeout = timeout
+        self.historial: list[float | None] = []
+
+    def gettimeout(self):
+        return self.timeout
+
+    def settimeout(self, value):
+        self.historial.append(value)
+        self.timeout = value
+
+
+def _transport_contando(monkeypatch, *conns):
+    t = HTTPTransport("http://localhost:11434", timeout=5)
+    pendientes = list(conns)
+    abiertas: list[_FakeConn] = []
+
+    def fabrica():
+        conn = pendientes.pop(0)
+        abiertas.append(conn)
+        return conn
+
+    monkeypatch.setattr(t, "_connect", fabrica)
+    return t, abiertas
+
+
+def test_transport_reutiliza_tras_finish(monkeypatch):
+    stream = _StreamResp()
+    conn = _FakeConn([stream, _Resp(body=b"{}")])
+    t, abiertas = _transport_contando(monkeypatch, conn)
+
+    resp = t.post_json("/api/chat", {"stream": True})
+    t.finish(resp)
+    # finish() solo ANOTA: el turno en curso no paga ni una lectura.
+    assert stream.lecturas == []
+    t.post_json("/api/chat", {})
+
+    assert abiertas == [conn]               # una sola conexión para las dos peticiones
+    assert len(conn.requests) == 2
+    assert not conn.cerrada
+    assert stream.lecturas == [HTTPTransport._DRAIN_BYTES]  # la cola se leyó, acotada
+
+
+def test_transport_sin_finish_sigue_descartando(monkeypatch):
+    """Sin el aviso del consumidor, una respuesta a medias se tira como siempre."""
+    stream = _StreamResp()
+    sucia, limpia = _FakeConn([stream]), _FakeConn([_Resp()])
+    t, abiertas = _transport_contando(monkeypatch, sucia, limpia)
+
+    t.post_json("/api/chat", {})
+    t.post_json("/api/chat", {})
+
+    assert abiertas == [sucia, limpia]
+    assert sucia.cerrada
+    assert stream.lecturas == []            # ni se intentó drenar
+
+
+def test_transport_drenaje_fallido_descarta(monkeypatch):
+    """La cola no llegó dentro del tope (el chunk terminal se retrasa): se
+    descarta como hoy y la petición sale por una conexión nueva."""
+    stream = _StreamResp(falla=TimeoutError("timed out"))
+    sucia, limpia = _FakeConn([stream]), _FakeConn([_Resp()])
+    t, abiertas = _transport_contando(monkeypatch, sucia, limpia)
+
+    t.finish(t.post_json("/api/chat", {}))
+    t.post_json("/api/chat", {})
+
+    assert abiertas == [sucia, limpia]
+    assert sucia.cerrada
+    assert len(limpia.requests) == 1
+
+
+def test_transport_cola_mas_larga_que_el_tope_descarta(monkeypatch):
+    stream = _StreamResp(sobra=True)
+    sucia, limpia = _FakeConn([stream]), _FakeConn([_Resp()])
+    t, abiertas = _transport_contando(monkeypatch, sucia, limpia)
+
+    t.finish(t.post_json("/api/chat", {}))
+    t.post_json("/api/chat", {})
+
+    assert stream.lecturas == [HTTPTransport._DRAIN_BYTES]  # nunca más que el tope
+    assert abiertas == [sucia, limpia]
+    assert sucia.cerrada
+
+
+def test_transport_will_close_no_drena(monkeypatch):
+    """`Connection: close`: el servidor no va a reutilizar ese socket; drenar
+    sería esperar para nada."""
+    stream = _StreamResp(will_close=True)
+    sucia, limpia = _FakeConn([stream]), _FakeConn([_Resp()])
+    t, abiertas = _transport_contando(monkeypatch, sucia, limpia)
+
+    t.finish(t.post_json("/api/chat", {}))
+    t.post_json("/api/chat", {})
+
+    assert stream.lecturas == []
+    assert abiertas == [sucia, limpia]
+    assert sucia.cerrada
+
+
+def _reloj_fijo(monkeypatch, t=1000.0):
+    """Reloj de mentiras del transporte (drenaje y edad del keep-alive)."""
+    from crotolamo.core import engine
+
+    reloj = {"t": t}
+    monkeypatch.setattr(engine, "_reloj", lambda: reloj["t"])
+    return reloj
+
+
+def test_transport_drenaje_acotado_en_tiempo_y_restaura_el_timeout(monkeypatch):
+    _reloj_fijo(monkeypatch, t=0.0)   # el tiempo no pasa: el tope entero, exacto
+    stream = _StreamResp()
+    conn = _FakeConn([stream, _Resp()])
+    conn.sock = _FakeSock(timeout=60.0)
+    t, _ = _transport_contando(monkeypatch, conn)
+
+    t.finish(t.post_json("/api/chat", {}))
+    t.post_json("/api/chat", {})
+
+    # Espera como mucho _DRAIN_TIMEOUT_S y deja el timeout de lectura como estaba.
+    assert conn.sock.historial == [HTTPTransport._DRAIN_TIMEOUT_S, 60.0]
+    assert conn.sock.timeout == 60.0
+
+
+def test_transport_drenaje_acotado_en_tiempo_total(monkeypatch):
+    """Un servidor que gotea la cola más rápido que el timeout de cada lectura
+    (y que nunca la termina): el tope de tiempo es del drenaje ENTERO. Antes,
+    resp.read(64 KiB) seguía leyendo mientras llegaran bytes: 655 s de goteo."""
+    reloj = _reloj_fijo(monkeypatch)
+
+    class _Goteo(_StreamResp):
+        def read1(self, amt=-1):
+            self.lecturas.append(amt)
+            reloj["t"] += 0.01      # un byte cada 10 ms
+            return b"x"
+
+        def read(self, amt=None):   # como http.client: junta lecturas hasta `amt`
+            return b"".join(self.read1(amt) for _ in range(amt or 0))
+
+    stream = _Goteo()
+    sucia, limpia = _FakeConn([stream]), _FakeConn([_Resp()])
+    t, abiertas = _transport_contando(monkeypatch, sucia, limpia)
+
+    t.finish(t.post_json("/api/chat", {}))
+    inicio = reloj["t"]
+    t.post_json("/api/chat", {})
+
+    assert reloj["t"] - inicio <= HTTPTransport._DRAIN_TIMEOUT_S + 0.011
+    assert abiertas == [sucia, limpia]
+    assert sucia.cerrada
+
+
+@pytest.mark.parametrize("quieta, reutiliza", [
+    (HTTPTransport._REUSE_MAX_IDLE_S - 1, True),
+    (HTTPTransport._REUSE_MAX_IDLE_S + 1, False),
+])
+def test_transport_no_reutiliza_un_stream_terminado_hace_rato(monkeypatch, quieta, reutiliza):
+    """Un keep-alive muerto en silencio (NAT, cambio de wifi) cuesta el timeout
+    de lectura entero y abre el breaker. Antes del paso 1 los streams nunca
+    reutilizaban (inmunes); ahora solo dentro de unos segundos: lo que separa
+    las llamadas de un turno con tools. Pasado eso, conexión nueva como antes."""
+    reloj = _reloj_fijo(monkeypatch)
+    stream = _StreamResp()
+    vieja, nueva = _FakeConn([stream, _Resp()]), _FakeConn([_Resp()])
+    t, abiertas = _transport_contando(monkeypatch, vieja, nueva)
+
+    t.finish(t.post_json("/api/chat", {"stream": True}))
+    reloj["t"] += quieta
+    t.post_json("/api/chat", {})
+
+    if reutiliza:
+        assert (abiertas, vieja.cerrada) == ([vieja], False)
+        assert stream.lecturas == [HTTPTransport._DRAIN_BYTES]
+    else:
+        assert (abiertas, vieja.cerrada) == ([vieja, nueva], True)
+        assert stream.lecturas == []        # ni se intenta drenar
+
+
+def test_el_reloj_del_keepalive_cuenta_la_suspension(monkeypatch):
+    """Tras suspender el portátil, monotonic() no avanzó lo que duró la
+    suspensión: un keep-alive de "hace 5 s" podía tener horas. En Linux se
+    usa CLOCK_BOOTTIME, que sí la cuenta."""
+    import time
+
+    from crotolamo.core import engine
+
+    if not hasattr(time, "CLOCK_BOOTTIME"):
+        pytest.skip("CLOCK_BOOTTIME solo existe en Linux")
+    pedidos: list[int] = []
+    real = time.clock_gettime
+    monkeypatch.setattr(time, "clock_gettime", lambda clk: pedidos.append(clk) or real(clk))
+
+    engine._reloj()
+
+    assert pedidos == [time.CLOCK_BOOTTIME]
+
+
+def test_transport_finish_de_otra_respuesta_no_cuenta(monkeypatch):
+    """Solo vale el aviso sobre la ÚLTIMA respuesta de ESTE hilo."""
+    import threading
+
+    stream = _StreamResp()
+    sucia, limpia = _FakeConn([stream]), _FakeConn([_Resp()])
+    t, abiertas = _transport_contando(monkeypatch, sucia, limpia)
+
+    resp = t.post_json("/api/chat", {})
+    t.finish(_StreamResp())                         # otra respuesta cualquiera
+    hilo = threading.Thread(target=t.finish, args=(resp,))
+    hilo.start()
+    hilo.join(timeout=10)                           # otro hilo no tiene esa respuesta
+    t.post_json("/api/chat", {})
+
+    assert stream.lecturas == []
+    assert abiertas == [sucia, limpia]
+
+
+def test_transport_close_olvida_el_finish(monkeypatch):
+    stream = _StreamResp()
+    primera, segunda = _FakeConn([stream]), _FakeConn([_Resp()])
+    t, abiertas = _transport_contando(monkeypatch, primera, segunda)
+
+    t.finish(t.post_json("/api/chat", {}))
+    t.close()
+    t.post_json("/api/chat", {})
+
+    assert stream.lecturas == []
+    assert abiertas == [primera, segunda]
+
+
+# --- HTTPTransport: un fallo a media petición cuelga el socket ---
+
+def test_transport_cierra_si_la_respuesta_no_llega_a_tiempo(monkeypatch):
+    """Timeout esperando la respuesta (Ollama generando un chat no-stream): antes
+    el socket quedaba abierto y el servidor seguía generando para nadie hasta
+    la siguiente petición de ese hilo."""
+    lenta = _FakeConn([TimeoutError("timed out")])
+    t, _ = _transport_contando(monkeypatch, lenta)
+
+    with pytest.raises(TimeoutError):
+        t.post_json("/api/chat", {})
+
+    assert lenta.cerrada
+    assert t._conn is None
+
+
+def test_transport_reintenta_un_keepalive_tls_muerto(monkeypatch):
+    """Python 3.11/3.12: escribir en un keep-alive TLS que el servidor ya cerró
+    lanza ssl.SSLEOFError (no ConnectionError). Es el mismo socket muerto que el
+    reintento único ya cubre; sin él, el turno caía al modelo local 60 s."""
+    import ssl
+
+    muerta = _FakeConn([ssl.SSLEOFError("EOF occurred in violation of protocol")])
+    sana = _FakeConn([_Resp(body=b"ok")])
+    t, abiertas = _transport_contando(monkeypatch, muerta, sana)
+
+    assert t.post_json("/chat/completions", {}).read() == b"ok"
+    assert abiertas == [muerta, sana]
+    assert muerta.cerrada
 
 
 # --- GLMClient: mapeo de status HTTP a errores en personaje ---
@@ -363,3 +653,226 @@ def test_build_primary_llm_cae_a_ollama_sin_key(monkeypatch):
     monkeypatch.setenv("CROTOLAMO_LLM_BACKEND", "glm")
 
     assert isinstance(build_primary_llm(get_settings()), LLMClient)
+
+
+# --- Clientes: cierran el ciclo de la respuesta en streaming ---
+# finish() al llegar el fin lógico (keep-alive reutilizable), close() si el
+# stream se corta, falla o el consumidor aborta (el servidor deja de generar),
+# y un aviso si el stream acaba limpio sin su marca de cierre.
+
+class _Zocalo:
+    """Socket de mentiras del que http.client lee una respuesta cruda."""
+
+    def __init__(self, crudo: bytes) -> None:
+        self._crudo = crudo
+
+    def makefile(self, mode):
+        return io.BufferedReader(io.BytesIO(self._crudo))
+
+
+def _real(crudo: bytes) -> http.client.HTTPResponse:
+    """HTTPResponse DE VERDAD: el framing chunked lo resuelve http.client."""
+    resp = http.client.HTTPResponse(_Zocalo(crudo))  # type: ignore[arg-type]
+    resp.begin()
+    return resp
+
+
+def _chunked(lineas: list[bytes], terminado: bool = True) -> http.client.HTTPResponse:
+    chunks = b"".join(f"{len(linea):x}\r\n".encode() + linea + b"\r\n" for linea in lineas)
+    return _real(
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" + chunks
+        + (b"0\r\n\r\n" if terminado else b"")
+    )
+
+
+_HOLA = {
+    "glm": b'data: {"choices":[{"delta":{"content":"Hola"}}]}\n\n',
+    "ollama": b'{"message":{"role":"assistant","content":"Hola"},"done":false}\n',
+}
+_FIN = {
+    "glm": b"data: [DONE]\n\n",
+    "ollama": b'{"message":{"role":"assistant","content":""},"done":true}\n',
+}
+_MOTORES = ["glm", "ollama"]
+
+
+class _CicloTransport(_FakeTransport):
+    """_FakeTransport que además cuenta los avisos de fin y los cuelgues."""
+
+    def __init__(self, responses):
+        super().__init__(responses)
+        self.finished: list[object] = []
+        self.closes = 0
+
+    def finish(self, resp):
+        self.finished.append(resp)
+
+    def close(self):
+        self.closes += 1
+
+
+def _cliente(motor, monkeypatch, responses):
+    if motor == "glm":
+        monkeypatch.setenv("CROTOLAMO_GLM_API_KEY", "secreta")
+        client = GLMClient(base_url="http://localhost:1/v4")
+    else:
+        client = LLMClient(host="http://localhost:1")
+    transport = _CicloTransport(responses)
+    client._transport = transport
+    return client, transport
+
+
+@pytest.mark.parametrize("motor", _MOTORES)
+def test_chat_stream_avisa_fin_logico(monkeypatch, motor):
+    resp = _chunked([_HOLA[motor], _FIN[motor]])
+    client, transport = _cliente(motor, monkeypatch, [resp])
+
+    assert client.chat_stream(MSGS, on_token=lambda t: None).content == "Hola"
+
+    assert transport.finished == [resp]   # una vez, sobre ESA respuesta
+    assert transport.closes == 0
+
+
+@pytest.mark.parametrize("motor", _MOTORES)
+def test_chat_stream_reutiliza_el_keepalive(monkeypatch, motor):
+    """De punta a punta con HTTPTransport real: N streams = 1 conexión (antes N,
+    cada una con su handshake TCP+TLS)."""
+    n = 4
+    conn = _FakeConn([_chunked([_HOLA[motor], _FIN[motor]]) for _ in range(n)])
+    client = (
+        GLMClient(api_key="k", base_url="http://localhost:1/v4") if motor == "glm"
+        else LLMClient(host="http://localhost:1")
+    )
+    abiertas: list[_FakeConn] = []
+    monkeypatch.setattr(client._transport, "_connect", lambda: abiertas.append(conn) or conn)
+
+    for _ in range(n):
+        assert client.chat_stream(MSGS, on_token=lambda t: None).content == "Hola"
+
+    assert len(abiertas) == 1
+    assert len(conn.requests) == n
+    assert not conn.cerrada
+
+
+@pytest.mark.parametrize("motor", _MOTORES)
+def test_chat_stream_cuelga_si_el_consumidor_aborta(monkeypatch, motor):
+    """on_token lanza (el patrón interrumpió): se cuelga YA, para que el motor
+    deje de generar, y la excepción del consumidor sale tal cual."""
+    client, transport = _cliente(motor, monkeypatch, [_chunked([_HOLA[motor], _FIN[motor]])])
+
+    class _Aborto(Exception):
+        pass
+
+    def on_token(texto):
+        raise _Aborto()
+
+    with pytest.raises(_Aborto):
+        client.chat_stream(MSGS, on_token=on_token)
+
+    assert transport.closes == 1
+    assert transport.finished == []
+
+
+@pytest.mark.parametrize("motor", _MOTORES)
+@pytest.mark.parametrize("fallo", [
+    TimeoutError("timed out"), ConnectionResetError("reset"), http.client.IncompleteRead(b""),
+], ids=["timeout", "reset", "incomplete"])
+def test_chat_stream_cuelga_si_la_lectura_falla(monkeypatch, motor, fallo):
+    class _Rota(_Resp):
+        def __iter__(self):
+            yield _HOLA[motor]
+            raise fallo
+
+    client, transport = _cliente(motor, monkeypatch, [_Rota()])
+
+    with pytest.raises(LLMError) as info:
+        client.chat_stream(MSGS, on_token=lambda t: None)
+
+    assert type(info.value).__name__ == "TransientLLMError"   # mismo error de siempre
+    assert transport.closes == 1
+    assert transport.finished == []
+
+
+@pytest.mark.parametrize("motor", _MOTORES)
+def test_chat_stream_cuelga_si_el_motor_avisa_un_error_dentro(monkeypatch, motor):
+    error = {
+        "glm": b'data: {"error": {"message": "too many requests"}}\n\n',
+        "ollama": b'{"error": "model runner has unexpectedly stopped"}\n',
+    }[motor]
+    client, transport = _cliente(motor, monkeypatch, [_chunked([error])])
+
+    with pytest.raises(LLMError):
+        client.chat_stream(MSGS)
+
+    assert transport.closes == 1
+    assert transport.finished == []
+
+
+@pytest.mark.parametrize("motor", _MOTORES)
+@pytest.mark.parametrize("terminado", [False, True], ids=["fin_entre_chunks", "chunked_cerrado"])
+def test_stream_truncado_avisa_y_no_marca_finish(monkeypatch, caplog, motor, terminado):
+    """Criterio híbrido: un stream que acaba LIMPIO sin su marca
+    ([DONE]/finish_reason, done:true) pero con texto se acepta, avisando en el
+    log de que puede venir truncado; esa conexión no se reutiliza."""
+    import logging
+
+    client, transport = _cliente(motor, monkeypatch, [_chunked([_HOLA[motor]], terminado)])
+    dichos: list[str] = []
+
+    logger = f"crotolamo.core.{'glm' if motor == 'glm' else 'llm'}"
+    with caplog.at_level(logging.WARNING, logger=logger):
+        respuesta = client.chat_stream(MSGS, on_token=dichos.append)
+
+    assert respuesta.content == "Hola"
+    assert dichos == ["Hola"]
+    avisos = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(avisos) == 1
+    assert ("GLM" if motor == "glm" else "Ollama") in avisos[0]
+    assert "truncada" in avisos[0]
+    assert transport.finished == []      # el transporte NO se entera de un "fin"
+    assert transport.closes == 1         # y ese socket no se reutiliza
+
+
+@pytest.mark.parametrize("motor", _MOTORES)
+@pytest.mark.parametrize("fallo", [
+    TimeoutError("timed out"), http.client.IncompleteRead(b"{", 40),
+], ids=["timeout", "incomplete"])
+def test_cuerpo_cortado_es_transitorio_y_cuelga(monkeypatch, motor, fallo):
+    """chat() no-stream: un cuerpo que no llega entero es disponibilidad
+    (TransientLLMError, con el texto de siempre) y el socket se cuelga."""
+    from crotolamo.core.llm import TransientLLMError
+
+    class _Cortada(_Resp):
+        def read(self):
+            raise fallo
+
+    client, transport = _cliente(motor, monkeypatch, [_Cortada()])
+    texto = "no respondió a tiempo" if isinstance(fallo, TimeoutError) else "a medias, patrón"
+
+    with pytest.raises(TransientLLMError, match=texto):
+        client.chat(MSGS)
+
+    assert transport.closes == 1
+
+
+def test_cuerpo_cortado_lo_contesta_el_local(monkeypatch):
+    from crotolamo.core.fallback import FallbackLLM
+    from crotolamo.core.llm import ChatResponse
+
+    class _Cortada(_Resp):
+        def read(self):
+            raise http.client.IncompleteRead(b"{", 40)
+
+    class _Local:
+        model = "local"
+        llamadas = 0
+
+        def chat(self, messages, tools=None):
+            self.llamadas += 1
+            return ChatResponse(content="soy el local")
+
+    nube, _ = _cliente("glm", monkeypatch, [_Cortada()])
+    local = _Local()
+
+    assert FallbackLLM(nube, local).chat(MSGS).content == "soy el local"
+    assert local.llamadas == 1

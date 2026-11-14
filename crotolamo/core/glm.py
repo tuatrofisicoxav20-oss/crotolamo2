@@ -30,7 +30,10 @@ from crotolamo.core.llm import (
     _read_body,
 )
 from crotolamo.core.openai_adapter import from_openai_message, to_openai_messages
-from crotolamo.core.sse import SSEError, SSETruncated, consume_sse
+from crotolamo.core.sse import SSEError, SSETruncated, parse_sse
+from crotolamo.logging_setup import get_logger
+
+log = get_logger("core.glm")
 
 _PROF = os.environ.get("CROTOLAMO_LLM_PROF") == "1"
 
@@ -209,12 +212,16 @@ class GLMClient:
         try:
             raw = json.loads(resp.read().decode("utf-8"))
         except (TimeoutError, OSError) as error:
+            # El cuerpo no llegó entero: el socket queda a medias. Se cuelga ya
+            # en vez de dejarlo abierto hasta la siguiente petición de este hilo.
+            self._transport.close()
             raise TransientLLMError(
                 f"GLM no respondió a tiempo, patrón. ({error})") from error
         except http.client.HTTPException as error:
             # Cuerpo cortado a medias (IncompleteRead): es HTTPException, NO
             # OSError. Sin esta rama salía cruda y FallbackLLM ni abría el
             # breaker ni probaba el modelo local (ver LLMClient.chat).
+            self._transport.close()
             raise TransientLLMError(
                 f"GLM me cortó la respuesta a medias, patrón. ({error})") from error
         except ValueError as error:
@@ -246,23 +253,50 @@ class GLMClient:
         tools: list[dict[str, Any]] | None = None,
         on_token=None,
     ) -> ChatResponse:
-        """Como chat() pero consumiendo el SSE de OpenAI (`data: {...}` por línea)."""
+        """Como chat() pero consumiendo el SSE de OpenAI (`data: {...}` por línea).
+
+        Cierra el ciclo de la respuesta: al llegar el fin lógico avisa al
+        transporte (`finish`) para reutilizar el keep-alive; ante un corte, un
+        fallo o un consumidor que aborta, cuelga el socket para que la nube
+        deje de generar para nadie.
+        """
         resp = self._send(self._payload(messages, tools, stream=True))
         try:
-            content, message = consume_sse(resp, on_token)
+            content, message, complete = parse_sse(resp, on_token)
         except (TimeoutError, OSError) as error:
+            self._transport.close()
             raise TransientLLMError(
                 f"GLM no respondió a tiempo, patrón. ({error})") from error
         except (http.client.HTTPException, SSETruncated) as error:
             # Stream cortado: a medio chunk (IncompleteRead, ver chat()) o entre
-            # dos chunks, que por HTTP parece un final normal (ver consume_sse).
+            # dos chunks sin dejar nada usable (ver parse_sse).
+            self._transport.close()
             raise TransientLLMError(
                 f"GLM me cortó la respuesta a medias, patrón. ({error})") from error
         except SSEError as error:
             # Transitorio: el 200 ya salió (la petición y la key pasaron), así que
             # lo que falla es el servicio: límite de ritmo, sobrecarga, inferencia.
+            self._transport.close()
             raise TransientLLMError(
                 f"GLM falló a media respuesta, patrón: {error}") from error
+        except BaseException:
+            # El consumidor abortó (on_token lanzó): colgar YA, o la nube sigue
+            # generando y el socket queda a medias hasta otro turno.
+            self._transport.close()
+            raise
+        if complete:
+            self._transport.finish(resp)  # la cola se drena en la próxima petición
+        else:
+            # Final limpio sin la marca: se acepta (ver parse_sse), pero queda
+            # dicho en el log. Esa conexión no se reutiliza: lo normal es que
+            # la cortara el servidor o un proxy, y reusarla solo costaría una
+            # escritura fallida más el reintento.
+            log.warning(
+                "GLM cerró el stream sin [DONE] ni finish_reason: respuesta "
+                "posiblemente truncada (%d caracteres, %d tool_calls)",
+                len(content), len(message.get("tool_calls") or []),
+            )
+            self._transport.close()
 
         return ChatResponse(
             content=content.strip(),
