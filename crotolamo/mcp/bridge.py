@@ -19,7 +19,7 @@ DECISIONES, y por qué:
   todas las tools del server y se cierra: un server colgado no debe volver a
   costar 20s por cada intento del modelo. Un éxito resetea los strikes. Un fallo
   de TRANSPORTE (proceso muerto, pipe rota) desregistra de inmediato: no hay
-  nada que reintentar.
+  nada que reintentar. También sin llamada en curso: el cliente avisa (on_dead).
 
 - **Confirmación por hints, con letra chica.** Bajo `confirm = "destructive"`
   una tool corre sin preguntar solo si el server la declara de solo lectura
@@ -134,16 +134,22 @@ def _positive_number(raw: Any, default: float, key: str, where: str) -> float:
 
 
 def _confirm_mode(raw: Any, default: str, where: str) -> str:
+    """`confirm` validado. Ausente => `default`; INVÁLIDO => "always".
+
+    Fail-closed a propósito: heredar el default ante un typo convertía un
+    `confirm = "allways"` (el patrón quería MÁS confirmación) bajo un global
+    "never" en un server que borra sin preguntar.
+    """
     if raw is None:
         return default
     mode = str(raw).strip().lower()
     if mode in CONFIRM_MODES:
         return mode
     log.warning(
-        "%s: confirm=%r desconocido (vale %s); uso %r",
-        where, raw, "/".join(CONFIRM_MODES), default,
+        "%s: confirm=%r desconocido (vale %s); uso 'always' (lo seguro ante un typo)",
+        where, raw, "/".join(CONFIRM_MODES),
     )
-    return default
+    return "always"
 
 
 def _parse_server(name: str, table: Any, defaults: MCPConfig) -> MCPServerConfig | None:
@@ -208,8 +214,9 @@ def load_mcp_config(settings: Any) -> MCPConfig:
     """Lee y valida `[mcp]`. Acepta el objeto Settings o directamente el dict.
 
     Nunca lanza por config mala: cada valor inválido se sustituye por su default
-    con un WARNING, y un server sin `command` válido se ignora. La config es del
-    patrón; un typo no debe tumbar el asistente.
+    con un WARNING (salvo `confirm`, que cae en "always": un typo no debe BAJAR
+    la confirmación), y un server sin `command` válido se ignora. La config es
+    del patrón; un typo no debe tumbar el asistente.
     """
     raw = settings if isinstance(settings, dict) else getattr(settings, "mcp", None)
     if not isinstance(raw, dict):
@@ -354,6 +361,10 @@ class _ServerState:
 
 _STATE: dict[str, _ServerState] = {}
 _STATE_LOCK = threading.RLock()
+# Clientes lanzados que aún no están en _STATE (handshake + tools/list, hasta
+# startup_timeout_s cada uno). Sin esto, un SIGTERM/Ctrl+C del arranque (npx
+# descargando...) no los veía terminate_all()/close_all(): huérfanos.
+_STARTING: set[StdioMCPClient] = set()
 _ATEXIT_REGISTERED = False
 
 
@@ -376,9 +387,66 @@ def _soft(server_name: str, text: str) -> str:
     return f"El server MCP '{server_name}' {text}"
 
 
+def _retire(state: _ServerState, registry: Registry, why: str | None = None) -> bool:
+    """Saca `state` de _STATE, retira sus tools y su grupo y cierra su proceso.
+
+    Pueden pedirlo a la vez el hilo del agente (la llamada que vio el transporte
+    roto) y el aviso del cliente (`on_dead`), así que todo lo que el agente ve
+    (estado, tools, grupo) se quita en UNA sección bajo _STATE_LOCK: el que
+    llega segundo no encuentra nada y nadie vuelve con las tools a medio
+    retirar. Y solo si `state` sigue siendo el conectado: un aviso tardío de un
+    cliente viejo no debe tumbar al que lo sustituyó con el mismo nombre.
+    """
+    name = state.config.name
+    with _STATE_LOCK:
+        if _STATE.get(name) is not state:
+            return False
+        del _STATE[name]
+        if why is not None:
+            log.warning("MCP '%s': %s; retiro sus %d tools", name, why, len(state.tools))
+        targets = [registry, state.registry, *state.registries]
+        for tool in state.tools:
+            seen: list[Registry] = []
+            for target in targets:
+                if any(target is s for s in seen):
+                    continue
+                seen.append(target)
+                target.unregister(tool.name)
+        router.unregister_group(state.group)
+    # Fuera del lock: cerrar puede tardar segundos (SIGTERM -> SIGKILL).
+    state.client.close()
+    log.info("MCP '%s': desconectado (%d tools retiradas)", name, len(state.tools))
+    return True
+
+
 def _drop(state: _ServerState, why: str) -> None:
-    log.warning("MCP '%s': %s; retiro sus %d tools", state.config.name, why, len(state.tools))
-    unregister_server(state.registry, state.config.name)
+    _retire(state, state.registry, why)
+
+
+def _why_dead(client: StdioMCPClient) -> str:
+    # La causa real (EOF, basura en stdout, pipe rota) la sabe el cliente; antes
+    # el log decía siempre "el proceso murió", aunque siguiera vivo.
+    reason = client.dead_reason
+    return f"transporte roto ({reason})" if reason else "el proceso murió"
+
+
+def _on_transport_dead(client: StdioMCPClient, reason: str) -> None:
+    """`on_dead` del cliente: su transporte murió SOLO (EOF, basura en stdout).
+
+    Desregistra ya, como promete el docstring del módulo, en vez de esperar a
+    que el modelo llame una tool muerta: hasta entonces seguían en el registry
+    (GLM recibía sus esquemas), ocupaban hueco en el router y, tras basura en
+    stdout, el proceso seguía vivo sin lector. En un hilo aparte porque el
+    retiro cierra el cliente y espera a su hilo lector, que es quien avisa.
+    """
+    with _STATE_LOCK:
+        state = _STATE.get(client.name)
+    if state is None or state.client is not client:
+        return  # en pleno handshake (lo ve _connect) o ya retirado/sustituido
+    threading.Thread(
+        target=_drop, args=(state, f"transporte roto ({reason})"),
+        name=f"mcp-{client.name}-retiro", daemon=True,
+    ).start()
 
 
 def _on_timeout(state: _ServerState) -> str:
@@ -405,7 +473,7 @@ def _make_caller(server_name: str, remote_name: str) -> Callable[..., str]:
         if state is None:
             return _soft(server_name, "ya no está conectado, patrón.")
         if not state.client.alive:
-            _drop(state, "el proceso murió")
+            _drop(state, _why_dead(state.client))
             return _soft(server_name, "se murió por su cuenta, patrón. Retiré sus tools.")
         try:
             text, is_error = state.client.call_tool(
@@ -469,33 +537,59 @@ def _remaining(deadline: float) -> float:
 
 
 def _connect(registry: Registry, server: MCPServerConfig) -> list[str]:
-    """Lanza un server, hace el handshake y registra sus tools. Nunca lanza."""
-    client = StdioMCPClient(server.name, server.command, server.env, server.cwd)
-    # startup_timeout_s es un PRESUPUESTO para handshake + tools/list juntos.
-    deadline = time.monotonic() + server.startup_timeout_s
-    try:
-        client.start()
-        client.initialize(timeout=_remaining(deadline))
-        raw_tools = client.list_tools(timeout=_remaining(deadline))
-    except Exception as error:  # noqa: BLE001 — un server caído no impide arrancar
-        log.warning("MCP '%s': no arrancó, lo salto (%s)", server.name, error)
-        client.close()
-        return []
-    if not raw_tools:
-        log.warning("MCP '%s': no ofrece ninguna tool; lo cierro", server.name)
-        client.close()
-        return []
-
-    tools = _build_tools(registry, server, raw_tools)
-    for tool in tools:
-        registry.register(tool)
-    group = f"mcp:{server.name}"
-    keywords = server.keywords or default_keywords(server, raw_tools)
-    router.register_group(group, [t.name for t in tools], keywords)
+    """Lanza un server, hace el handshake y registra sus tools. Nunca lanza
+    (salvo Ctrl+C/SystemExit, que se propagan tras cerrar el server)."""
+    client = StdioMCPClient(
+        server.name, server.command, server.env, server.cwd, on_dead=_on_transport_dead,
+    )
     with _STATE_LOCK:
-        _STATE[server.name] = _ServerState(
-            config=server, client=client, registry=registry, tools=tools, group=group,
-        )
+        _STARTING.add(client)
+    try:
+        # startup_timeout_s es un PRESUPUESTO para handshake + tools/list juntos.
+        deadline = time.monotonic() + server.startup_timeout_s
+        try:
+            client.start()
+            client.initialize(timeout=_remaining(deadline))
+            raw_tools = client.list_tools(timeout=_remaining(deadline))
+        except Exception as error:  # noqa: BLE001 — un server caído no impide arrancar
+            log.warning("MCP '%s': no arrancó, lo salto (%s)", server.name, error)
+            client.close()
+            return []
+        if not raw_tools:
+            log.warning("MCP '%s': no ofrece ninguna tool; lo cierro", server.name)
+            client.close()
+            return []
+
+        tools = _build_tools(registry, server, raw_tools)
+        group = f"mcp:{server.name}"
+        keywords = server.keywords or default_keywords(server, raw_tools)
+        # Comprobar que sigue vivo y publicarlo en UNA sección: si el transporte
+        # muere antes, su aviso (on_dead) no encuentra estado que retirar y el
+        # server quedaba registrado muerto; si muere después, el aviso espera al
+        # lock y lo encuentra.
+        with _STATE_LOCK:
+            alive = client.alive
+            if alive:
+                for tool in tools:
+                    registry.register(tool)
+                router.register_group(group, [t.name for t in tools], keywords)
+                _STATE[server.name] = _ServerState(
+                    config=server, client=client, registry=registry, tools=tools, group=group,
+                )
+                _STARTING.discard(client)
+        if not alive:
+            log.warning("MCP '%s': se cayó tras el handshake, lo salto (%s)",
+                        server.name, _why_dead(client))
+            client.close()
+            return []
+    except BaseException:
+        # Ctrl+C (KeyboardInterrupt no es Exception) o SystemExit a mitad del
+        # arranque: nadie más conoce este cliente; sin cerrarlo quedaba huérfano.
+        client.close()
+        raise
+    finally:
+        with _STATE_LOCK:
+            _STARTING.discard(client)
     log.info(
         "MCP '%s': %d tools registradas (%s)",
         server.name, len(tools), ", ".join(t.name for t in tools),
@@ -536,7 +630,7 @@ def register_mcp_tools(registry: Registry, settings: Any) -> list[str]:
                     existing.registries.append(registry)
                 registered.extend(t.name for t in existing.tools)
                 continue
-            _drop(existing, "el proceso murió")
+            _drop(existing, _why_dead(existing.client))
         registered.extend(_connect(registry, server))
     return registered
 
@@ -545,40 +639,33 @@ def unregister_server(registry: Registry, name: str) -> bool:
     """Quita las tools de un server del registry y del router y cierra su
     proceso. True si estaba conectado. Idempotente."""
     with _STATE_LOCK:
-        state = _STATE.pop(name, None)
+        state = _STATE.get(name)
     if state is None:
         return False
-    targets = [registry, state.registry, *state.registries]
-    for tool in state.tools:
-        seen: list[Registry] = []
-        for target in targets:
-            if any(target is s for s in seen):
-                continue
-            seen.append(target)
-            target.unregister(tool.name)
-    router.unregister_group(state.group)
-    state.client.close()
-    log.info("MCP '%s': desconectado (%d tools retiradas)", name, len(state.tools))
-    return True
+    return _retire(state, registry)
 
 
 def close_all() -> None:
-    """Cierra todos los servers conectados (atexit y tests)."""
+    """Cierra todos los servers conectados o arrancando (atexit y tests)."""
     with _STATE_LOCK:
         states = list(_STATE.values())
+        starting = list(_STARTING)
     for state in states:
         unregister_server(state.registry, state.config.name)
+    for client in starting:
+        client.close()  # su handshake falla y _connect lo da por no arrancado
 
 
 def terminate_all() -> None:
     """Para el apagado por SEÑAL del listener, que sale con os._exit y se salta
-    atexit: manda SIGTERM al grupo de cada server sin esperar a nadie. Sin
-    esto, un wrapper (npx, sh -c) o un server que ignora el EOF de stdin
-    quedaba huérfano al parar el servicio. Best-effort, nunca lanza."""
+    atexit: manda SIGTERM al grupo de cada server (también los que siguen en el
+    handshake) sin esperar a nadie. Sin esto, un wrapper (npx, sh -c) o un
+    server que ignora el EOF de stdin quedaba huérfano al parar el servicio.
+    Best-effort, nunca lanza."""
     with _STATE_LOCK:
-        states = list(_STATE.values())
-    for state in states:
+        clients = [state.client for state in _STATE.values()] + list(_STARTING)
+    for client in clients:
         try:
-            state.client.terminate_now()
+            client.terminate_now()
         except Exception:  # noqa: BLE001 - el proceso está saliendo
             pass

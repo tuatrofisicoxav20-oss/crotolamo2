@@ -488,7 +488,7 @@ def test_load_mcp_config_expande_y_valida(monkeypatch, caplog):
     assert ok.env == {"TOKEN": "secreto", "N": "3"}
     assert ok.cwd == str(Path("~").expanduser())
     assert ok.keywords == ["a"]
-    assert ok.confirm == "never"      # inválido => hereda el global
+    assert ok.confirm == "always"     # inválido => "always" (fail-closed), no el global
     assert ok.timeout_s == 7          # inválido => hereda el global
     assert ok.startup_timeout_s == 5  # inválido => hereda el global
     assert ok.prefix == "ok"

@@ -23,15 +23,31 @@ Tools (cada una prueba algo del bridge):
 
 Variables de entorno:
   FAKE_MCP_PAGE_SIZE   tamaño de página de tools/list (default 4).
+  FAKE_MCP_PAGE_DELAY  segundos que tarda CADA página de tools/list (default 0):
+                       un catálogo remoto lento, para el presupuesto de arranque.
   FAKE_MCP_GARBAGE=1   escribe una línea que NO es JSON en stdout al arrancar
                        (la spec exige stdout limpio: transporte roto).
+  FAKE_MCP_EOF_DELAY   segundos de "limpieza" tras ver EOF en stdin antes de
+                       salir con 0 (default 0): un server bien hecho que guarda
+                       su estado al cerrarse, para el cierre educado.
+  FAKE_MCP_LOG         ruta donde se apunta cada línea recibida por stdin (para
+                       ver qué mandó el cliente, p.ej. notifications/cancelled).
+  FAKE_MCP_ERROR_NULL=1  cada respuesta buena lleva también "error": null, como
+                       las librerías JSON-RPC laxas (o las de la 1.0).
+
+Señales:
+  SIGUSR1              escribe una línea que NO es JSON en stdout y sigue vivo:
+                       basura a mitad de sesión, con el server ocioso y sin
+                       ninguna llamada pendiente (el transporte muere "solo").
 """
 
 from __future__ import annotations
 
 import json
 import os
+import signal
 import sys
+import threading
 import time
 from typing import Any
 
@@ -138,7 +154,10 @@ def _write(message: dict[str, Any]) -> None:
 
 
 def _result(req_id: Any, result: Any) -> None:
-    _write({"jsonrpc": "2.0", "id": req_id, "result": result})
+    message = {"jsonrpc": "2.0", "id": req_id, "result": result}
+    if os.environ.get("FAKE_MCP_ERROR_NULL") == "1":
+        message["error"] = None
+    _write(message)
 
 
 def _error(req_id: Any, code: int, message: str) -> None:
@@ -185,6 +204,7 @@ def _call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
 
 def _tools_page(cursor: str | None) -> dict[str, Any]:
     page_size = int(os.environ.get("FAKE_MCP_PAGE_SIZE", "4"))
+    time.sleep(float(os.environ.get("FAKE_MCP_PAGE_DELAY", "0")))
     start = int(cursor) if cursor else 0
     page = TOOLS[start:start + page_size]
     out: dict[str, Any] = {"tools": page}
@@ -193,18 +213,41 @@ def _tools_page(cursor: str | None) -> dict[str, Any]:
     return out
 
 
+def _basura_por_sigusr1() -> None:
+    """SIGUSR1 -> una línea no-JSON en stdout, desde un hilo propio (sigwait).
+
+    No con un manejador de Python: corre solo en el hilo principal y entre
+    bytecodes, y si la señal caía justo antes del read() de stdin quedaba
+    aplazada hasta la siguiente línea de entrada (con el cliente ocioso, hasta
+    el EOF del cierre): ~2 de cada 100 tests de "muerte en ocioso" fallaban.
+    Cada línea es UN write: el lock del BufferedWriter no la intercala.
+    """
+    while True:
+        signal.sigwait({signal.SIGUSR1})
+        sys.stdout.buffer.write(b"basura a mitad de sesion\n")
+        sys.stdout.buffer.flush()
+
+
 def main() -> int:
     global _pong_recibido
+    # Bloqueada en el principal ANTES de crear el hilo (lo hereda): así solo
+    # la recoge el sigwait, nunca la acción por defecto (matar el proceso).
+    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR1})
+    threading.Thread(target=_basura_por_sigusr1, daemon=True).start()
     sys.stderr.write("fake-mcp: listo\n")
     sys.stderr.flush()
     if os.environ.get("FAKE_MCP_GARBAGE") == "1":
         sys.stdout.buffer.write(b"esto no es JSON\n")
         sys.stdout.buffer.flush()
 
+    log_path = os.environ.get("FAKE_MCP_LOG")
     for raw in sys.stdin.buffer:
         line = raw.strip()
         if not line:
             continue
+        if log_path:
+            with open(log_path, "ab") as log_file:
+                log_file.write(line + b"\n")
         message = json.loads(line)
         method = message.get("method")
         req_id = message.get("id")
@@ -243,6 +286,8 @@ def main() -> int:
                 _error(req_id, -32602, f"tool desconocida: {params.get('name')}")
         elif req_id is not None:
             _error(req_id, -32601, f"método no soportado: {method}")
+    # EOF en stdin: el cierre educado de la spec. Un SIGTERM aquí = limpieza perdida.
+    time.sleep(float(os.environ.get("FAKE_MCP_EOF_DELAY", "0")))
     return 0
 
 

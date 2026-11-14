@@ -91,8 +91,15 @@ def test_error_jsonrpc_lanza_mcperror(client):
 
 def test_cliente_contesta_el_ping_del_server_e_ignora_notificaciones(client):
     # El fake manda un `ping` (request) y una notificación justo tras initialize.
+    # El pong sale del hilo lector y este tools/call del principal: compiten por
+    # stdin y el fake puede leer antes la pregunta. Se reintenta con plazo.
+    fin = time.monotonic() + 3
     text, _ = client.call_tool("pong_recibido", {}, timeout=5)
+    while text != "si" and time.monotonic() < fin:
+        time.sleep(0.02)
+        text, _ = client.call_tool("pong_recibido", {}, timeout=5)
     assert text == "si"
+    assert client.alive  # la notificación del server no rompió nada
 
 
 def test_timeout_lanza_mcptimeout_y_el_cliente_sigue_vivo(client):
