@@ -25,8 +25,3 @@ def path_inside_roots(candidate, roots) -> bool:
         except (ValueError, OSError, RuntimeError):
             continue
     return False
-
-
-def path_inside_allowed_roots(candidate, allowed_roots) -> bool:
-    """Alias histórico de path_inside_roots (API original de M2)."""
-    return path_inside_roots(candidate, allowed_roots)

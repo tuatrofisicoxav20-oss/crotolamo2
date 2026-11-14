@@ -49,6 +49,9 @@ _BLOCKED_TERMS = [
     "hackear contraseña", "robar contraseña", "malware para",
     "ransomware", "exploit para romper", "bomba", "arma casera",
 ]
+# Normalizados UNA vez al importar: is_blocked_query los pasaba por
+# normalize_key (regex + NFKD) en cada búsqueda, para el mismo resultado.
+_BLOCKED_KEYS = tuple(normalize_key(term) for term in _BLOCKED_TERMS)
 
 _MAX_PAGE_CHARS = 6_000
 _MAX_RESULTS = 5
@@ -59,11 +62,13 @@ _BLOQUEO_RED_INTERNA = ("Esa dirección es de la red interna, patrón. No leo ah
 
 def is_blocked_query(text: str) -> bool:
     lower = normalize_key(text)
-    return any(normalize_key(term) in lower for term in _BLOCKED_TERMS)
+    return any(term in lower for term in _BLOCKED_KEYS)
 
 
 def build_search_url(engine: str, query: str) -> str:
-    key = normalize_key(engine)
+    # `or ""`: un `"engine": null` del modelo (o de un atajo guardado) es "sin
+    # motor", que ya cae en google como cualquier motor desconocido.
+    key = normalize_key(engine or "")
     if key not in SEARCH_ENGINES:
         key = "google"
     if key == "spotify":
@@ -142,7 +147,13 @@ def read_page(url: str) -> str:
     if "://" not in url:
         url = "https://" + url
 
-    scheme = urlparse(url).scheme.lower()
+    # urlparse lanza ValueError con una URL que ni se puede partir (un corchete
+    # de IPv6 sin cerrar, caracteres que NFKC convierte en separadores). Estaba
+    # fuera de todo try y la tool acababa en el "reventó" genérico.
+    try:
+        scheme = urlparse(url).scheme.lower()
+    except ValueError as error:
+        return f"Esa URL está mal escrita, patrón ({error}). No pude leerla."
     if scheme not in ("http", "https"):
         return f"Solo puedo leer páginas http o https, patrón, no '{scheme}://'."
 

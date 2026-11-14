@@ -1,8 +1,9 @@
 """Atajos aprendidos por el patrón. Migrado de C1::learn_shortcut, ahora en SQLite.
 
 El patrón enseña un alias ("mi música" -> spotify) y luego lo dispara. Se resuelve
-el destino a una acción (url/app/project/folder/search) y se ejecuta vía las tools
-de desktop/search ya existentes.
+el destino a una acción (url/app/folder/search) y se ejecuta vía las tools de
+desktop/search ya existentes. El tipo "project" de C1 no se migró: el nombre de
+un proyecto se guarda como búsqueda.
 """
 
 from __future__ import annotations

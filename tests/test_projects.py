@@ -37,7 +37,16 @@ def test_list_projects_includes_crotolamo(fake_project):
 
 def test_list_project_tree(fake_project):
     out = projects.list_project_tree("crotolamo")
-    assert "crotolamo" in out.lower()
+    # Antes solo se pedía "crotolamo" en la salida, y el nombre del proyecto
+    # sale también en los tres mensajes de error de la tool: el test pasaba
+    # aunque no listara nada. Se exige el árbol del fixture: carpetas antes que
+    # archivos, dos niveles (agent.py está en el tercero y no sale).
+    assert out.splitlines() == [
+        "crotolamo/",
+        "  📁 crotolamo",
+        "    📁 core",
+        "  📄 pyproject.toml",
+    ]
 
 
 # --- find_in_project: el patrón lo elige el LLM y no debe leerse como opción ---
