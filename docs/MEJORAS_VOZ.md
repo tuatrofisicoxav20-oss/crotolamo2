@@ -301,6 +301,10 @@ Verificado en esta máquina: `libspa-aec-webrtc.so` existe, el módulo carga, cr
        [voice]
        input_device = "crotolamo_aec_source"   # o el nombre/índice real
 
+   Y pon el sink del AEC como salida por defecto: `pactl set-default-sink crotolamo_aec_sink`.
+   Sin eso el AEC no tiene referencia (la voz de Crotolamo sale por otro sink) y el
+   source "limpio" trae el eco igual; `desktop/aec.sh status` y el doctor lo avisan.
+
    Comprueba que el eco muere: `.venv/bin/python scripts/wake_debug.py --threshold 0.3`
    mientras Crotolamo habla (o reproduces TTS de Piper). **Meta: 0 activaciones
    fantasma.** El script imprime qué micrófono abrió, para que no haya dudas.

@@ -57,7 +57,8 @@ Los servers son **tablas nombradas** (`[mcp.servers.<nombre>]`), no un array:
 dicts pero **no** sobre listas. Así el local puede retocar un server
 (`timeout_s`) o añadir otro sin repetir ni pisar los demás.
 
-Validación: un valor inválido cae a su default con `WARNING`; un server sin
+Validación: un valor inválido cae a su default con `WARNING` (salvo `confirm`,
+que cae en `"always"`: ver *Política de confirmación*); un server sin
 `command` (lista de strings no vacía) se ignora. Un server que **no arranca**
 (binario ausente, muere al lanzarse, no responde en `startup_timeout_s`) se
 salta con `WARNING`: **nunca impide que Crotolamo arranque**.
@@ -84,6 +85,9 @@ inventos del 3B sobre tools planas y mutilaría un esquema anidado).
 | `"always"`      | pide confirmación para TODAS las tools del server                              |
 | `"never"`       | nunca pregunta (solo para servers de solo lectura y de fiar)                    |
 
+Un valor de `confirm` desconocido (typo), global o por server, se trata como
+`"always"` y se avisa con un WARNING: un typo nunca baja la confirmación.
+
 > **ADVERTENCIA (léela).** Los `annotations` los declara **el server** y la
 > spec los define como *advisory*: son de buena fe, no una garantía. Bajo
 > `"destructive"`, un server mentiroso que marque una tool destructiva con
@@ -104,11 +108,21 @@ exención de "argumentos de contenido" (`content`, `texto`, `query`...) solo
 aplica al argumento de primer nivel; un string escondido en una lista o dict
 bajo esos nombres se inspecciona como cualquier otro.
 
+Un URI `file://` cuenta como ruta (se clasifica su ruta local, con los `%xx`
+decodificados) bajo cualquier nombre de argumento salvo esa exención de
+contenido, y los valores se miran también sin los espacios o saltos de línea de
+las puntas; si dos lecturas del mismo valor caen en zonas distintas, manda la
+más estricta. Sigue siendo una heurística: una ruta relativa sin prefijo bajo un
+nombre de argumento desconocido no se detecta.
+
 ## Timeouts y strikes
 
 - Cada `tools/call` corre bajo el `timeout_s` del server. Si expira, el LLM
   recibe un **soft-error en personaje** ("El server MCP 'x' tardó demasiado en
   responder, patrón...") — texto, no excepción — y el server acumula un strike.
+  Además se le manda `notifications/cancelled` con el id de la petición (la
+  spec: el emisor DEBERÍA avisar al dejar de esperar); un server que lo soporte
+  deja de trabajar en ella. El `initialize` nunca se cancela.
 - Al **2º timeout consecutivo** se desregistran TODAS sus tools del registry,
   se quita su grupo del router y se cierra el proceso (`WARNING` en el log). Un
   server colgado no debe costar 20 s por cada intento del modelo.
@@ -133,11 +147,29 @@ nombre del server, su prefijo y las palabras de los nombres/descripciones de
 sus tools (minúsculas, sin acentos, con tope). Como las descripciones suelen
 venir en inglés y el patrón habla español, lo que de verdad enruta es el nombre
 del server: **define `keywords` a mano** para cualquier server que uses en serio.
+Las keywords se comparan sin acentos ni mayúsculas y al INICIO de palabra: `eco`
+entra con "eco" y "ecos", no con "seco".
 
 Cuando varios grupos MCP matchean la misma frase, su orden relativo **rota en
 round-robin** entre llamadas, para que con el tope `max_tools` ninguno se muera
 de hambre. Los grupos estáticos conservan su orden por especificidad, y cuando
 **no** matchea ningún grupo MCP el routing es exactamente el de siempre.
+
+Dentro de un mismo server, las tools cuyo nombre contiene una de las keywords que
+matchearon la frase (las keywords derivadas salen de esos nombres) van primero; el
+resto sigue el orden de `tools/list`. Si el server trae más tools que `max_tools` y
+la frase no nombra ninguna, las que quedan tras el tope no se ofrecen con el motor
+local (con GLM se ven todas).
+
+**Límite conocido (hoy):** un grupo MCP compite por el tope `max_tools` con los
+grupos nativos, y en un empate de puntuación los nativos van primero. `files`
+tiene 8 tools (el tope entero) y sus disparadores incluyen "archivo", "carpeta",
+"documento", "lee", "lista", "borra", "mueve"...: un server de archivos como el
+del ejemplo de arriba **no** le llega al modelo local con frases naturales ("lee
+el archivo notas.txt" -> 0 tools MCP). Solo entra con una keyword propia que
+puntúe más que todo lo que matchee `files` (p. ej. `"busca en documentos"`, como
+en el ejemplo comentado de `config/crotolamo.toml`, y decir "busca en documentos
+la factura"). Con GLM no aplica: ve todas las tools.
 
 ## Cómo probarlo sin instalar nada
 

@@ -29,6 +29,8 @@ apagarlo** sin tocar la terminal. Se integra en Fedora como una app más del men
   - `half-duplex` (altavoces, seguro) → `--no-barge-in`
   - `barge-in` (auriculares, se puede interrumpir) → `--barge-in`
   - `simple` (a prueba de fallos) → `--simple`
+- Si el servicio no está instalado el panel lo dice («No instalado — ejecuta
+  desktop/install.sh»), y si `systemctl` falla, el motivo aparece bajo el estado.
 
 ## Instalar
 
@@ -59,6 +61,23 @@ instalador lo pise: `systemctl --user edit crotolamo.service`.
   `/usr/bin/python3 desktop/crotolamo_panel.py`
 - A mano: `systemctl --user start|stop|restart crotolamo.service`
 - Registro en vivo: `journalctl --user -u crotolamo.service -f`
+
+### Ventanas de Hyprland desde el servicio
+
+Las tools de ventanas (`list_windows`, `app_status`, `focus_window`, `close_window`)
+usan `hyprctl`, que necesita `HYPRLAND_INSTANCE_SIGNATURE`. `crotolamo.service`
+arranca con `default.target` y solo ve esa variable si la sesión la exporta a
+systemd: añade a `~/.config/hypr/hyprland.conf` la línea
+
+```
+exec-once = dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP HYPRLAND_INSTANCE_SIGNATURE
+```
+
+y reinicia el servicio (`systemctl --user restart crotolamo`): un proceso que ya
+corría no ve lo que se exporta después. Si falta, Crotolamo contesta «hyprctl se
+quejó, patrón: HYPRLAND_INSTANCE_SIGNATURE not set! (is hyprland running?)» y lo
+deja en el registro.
+(Receta sin validar todavía en la laptop.)
 
 ## Desinstalar
 

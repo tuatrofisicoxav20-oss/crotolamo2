@@ -124,7 +124,7 @@ sesión (mem0 + Chroma + fastembed, todo local salvo el LLM que extrae los hecho
 ```bash
 pip install -e ".[memoria]"          # versiones fijadas (validadas con ruedas cp314)
 # config/crotolamo.local.toml:  [memoria]  enabled = true
-python -m crotolamo memoria migrar   # copia los hechos SQLite existentes (una vez)
+python -m crotolamo memoria migrar   # copia los hechos SQLite a la memoria; se puede repetir, lo ya migrado no se duplica
 python -m crotolamo memoria listar   # qué recuerda; también buscar <q> | olvidar <q>
 python -m crotolamo memoria calibrar # mide los scores reales y sugiere el umbral
 ```
