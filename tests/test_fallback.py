@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from crotolamo.core.fallback import FallbackLLM
@@ -84,11 +86,30 @@ def test_tras_el_cooldown_reintenta_la_nube(monkeypatch):
     assert nube.llamadas == 2
 
 
-def test_recuperarse_limpia_el_breaker(monkeypatch):
-    nube, local = _Fake("glm"), _Fake("ollama")
-    llm = FallbackLLM(nube, local)
-    llm.chat([])
-    assert llm.active is nube
+def test_recuperarse_limpia_el_breaker(monkeypatch, caplog):
+    """Tras caerse y volver, el breaker queda como recién estrenado: la vuelta se
+    anota UNA vez y no en cada turno bueno que venga después.
+
+    (Antes este test nunca tiraba el breaker: la nube funcionaba desde la
+    primera llamada, y pasaba igual con `_recover` convertido en un no-op.)
+    """
+    nube, local = _Fake("glm", falla=True), _Fake("ollama")
+    llm = FallbackLLM(nube, local, cooldown_s=60)
+
+    reloj = {"t": 1000.0}
+    monkeypatch.setattr("crotolamo.core.fallback.time.monotonic", lambda: reloj["t"])
+
+    assert llm.chat([]).content == "soy ollama"   # trip
+    assert llm.degraded
+
+    reloj["t"] += 61                              # pasó el cooldown
+    nube.falla = False                            # volvió el wifi
+    with caplog.at_level(logging.INFO, logger="crotolamo.core.fallback"):
+        assert llm.chat([]).content == "soy glm"
+        assert llm.chat_stream([]).content == "soy glm"   # ya recuperado: no re-avisa
+
+    assert llm.active is nube and not llm.degraded
+    assert caplog.text.count("el motor principal volvió") == 1
 
 
 def test_streaming_cae_al_local_si_falla_ANTES_de_emitir():

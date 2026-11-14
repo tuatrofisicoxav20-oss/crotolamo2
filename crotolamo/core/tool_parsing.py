@@ -30,6 +30,33 @@ def parse_arguments(args: Any) -> dict[str, Any]:
     return {}
 
 
+_JSON_OPEN = re.compile(r"[{\[]")
+_DECODER = json.JSONDecoder()
+
+
+def _json_documents(text: str) -> list[Any]:
+    """Los documentos JSON que hay en `text`, uno tras otro y en orden.
+
+    Un modelo que pide dos tools las escribe como dos objetos seguidos: uno por
+    línea, o cada uno entre <tool_call></tool_call> (el formato de qwen). Eso no
+    es UN documento, y un `json.loads` del primer `{` al último `}` lo rechazaba
+    entero: no corría ninguna y al patrón le llegaba el JSON crudo.
+
+    Todo o nada: si un `{`/`[` no abre JSON válido, el texto no es una lista
+    limpia de llamadas (prosa con llaves, un objeto cortado a medias) y se
+    devuelve []. Nada de pescar el primer trozo que parsee dentro de otra cosa.
+    """
+    docs: list[Any] = []
+    pos = 0
+    while (opening := _JSON_OPEN.search(text, pos)) is not None:
+        try:
+            doc, pos = _DECODER.raw_decode(text, opening.start())
+        except json.JSONDecodeError:
+            return []
+        docs.append(doc)
+    return docs
+
+
 def coerce_text_tool_calls(content: str, known_names: set[str]) -> list[dict[str, Any]]:
     """Fallback: algunos modelos (qwen2.5-coder en Ollama) emiten el tool-call
     como JSON dentro de `content` en vez de en el campo nativo `tool_calls`.
@@ -46,25 +73,38 @@ def coerce_text_tool_calls(content: str, known_names: set[str]) -> list[dict[str
     if fence:
         text = fence.group(1).strip()
 
-    # Intentar el bloque {...} o [...] más externo.
+    # Del primer { o [ al último } o ]: un bloque, o varios seguidos.
     start = min((text.find(c) for c in "{[" if c in text), default=-1)
     end = max(text.rfind("}"), text.rfind("]"))
     if start == -1 or end <= start:
         return []
 
-    try:
-        parsed = json.loads(text[start:end + 1])
-    except json.JSONDecodeError:
-        return []
+    candidates: list[Any] = []
+    for doc in _json_documents(text[start:end + 1]):
+        candidates.extend(doc if isinstance(doc, list) else [doc])
 
-    candidates = parsed if isinstance(parsed, list) else [parsed]
     calls: list[dict[str, Any]] = []
     for item in candidates:
         if not isinstance(item, dict):
             continue
         name = item.get("name") or item.get("tool")
-        args = item.get("arguments", item.get("args", {}))
-        if name in known_names and isinstance(args, dict):
+        # "parameters" es como los nombra el formato de texto de Llama 3.x (el
+        # mismo que `strip_leaked_tool_json` ya trata como tool-call): sin
+        # leerlo, la llamada se ejecutaba con {} y la tool corría con defaults.
+        args = item.get("arguments", item.get("parameters", item.get("args", {})))
+        if isinstance(args, str):
+            # Contrato OpenAI: `arguments` como string JSON ("" = sin argumentos).
+            # Solo vale si trae un objeto. Un string ilegible NO se degrada a {}
+            # como hace `parse_arguments` con el campo nativo: aquí nada asegura
+            # que esto sea una llamada, y la tool correría con sus defaults.
+            try:
+                args = json.loads(args) if args.strip() else {}
+            except json.JSONDecodeError:
+                continue
+        # isinstance(name, str): un JSON de DATOS puede traer un dict o una lista
+        # bajo "name"/"tool", y buscarlo en el set lanzaba TypeError (unhashable)
+        # que salía cruda de handle_turn.
+        if isinstance(name, str) and name in known_names and isinstance(args, dict):
             calls.append({"name": name, "arguments": args})
     return calls
 

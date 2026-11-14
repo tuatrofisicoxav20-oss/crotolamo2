@@ -15,6 +15,8 @@ así que `ToolAgent` no se entera. Dos decisiones que no son obvias:
 2. **No reintentar si ya se habló.** En voz, `chat_stream` va soltando tokens al
    TTS. Si el primario revienta A MEDIA frase, reintentar con el respaldo haría que
    Crotolamo repitiera el principio. Si ya se emitió un token, el error se propaga.
+   "Emitido" es lo que SALIÓ: un token que el consumidor retuvo (on_token devolvió
+   False, ver `LiveStreamer.feed`) no sonó, y ahí sí se usa el respaldo.
 """
 
 from __future__ import annotations
@@ -53,8 +55,10 @@ class FallbackLLM:
         # engine.build_llm, que ni siquiera envuelve en FallbackLLM.
         self._auth_down: bool = False
 
-    # `model` (parte del contrato `LLMEngine`) lo leen el logging y el doctor;
-    # delegamos en el cliente activo en este momento.
+    # `model` es parte del contrato `LLMEngine`: los clientes concretos lo traen
+    # como atributo y aquí se delega en el que respondería ahora mismo. Hoy solo
+    # lo consultan los tests; el log de arranque lee el de cada cliente y el
+    # doctor saca el nombre de la config.
     @property
     def model(self) -> str:
         return self.active.model
@@ -126,9 +130,13 @@ class FallbackLLM:
 
             def _marcar(chunk: str) -> None:
                 nonlocal hablo
-                hablo = True
-                if on_token is not None:
-                    on_token(chunk)
+                # "Habló" = algo SALIÓ hacia el patrón, no "se llamó a on_token".
+                # Quien retiene el trozo lo avisa devolviendo False (LiveStreamer
+                # con tools a la vista: nada suena hasta acabar la llamada), y sin
+                # on_token no escucha nadie. Un callback cualquiera devuelve None:
+                # se asume que habló, como siempre.
+                if on_token is not None and on_token(chunk) is not False:
+                    hablo = True
 
             try:
                 response = self.primary.chat_stream(messages, tools=tools, on_token=_marcar)

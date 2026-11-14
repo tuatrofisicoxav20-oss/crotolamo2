@@ -29,14 +29,8 @@ from crotolamo.core.llm import (
     _parse_tool_calls,
     _read_body,
 )
-from crotolamo.core.openai_adapter import (  # noqa: F401 - re-export (compat)
-    from_openai_message,
-    to_openai_messages,
-)
-from crotolamo.core.sse import consume_sse
-
-# Alias de compatibilidad: el nombre histórico cuando esto vivía en glm.py.
-_from_openai_message = from_openai_message
+from crotolamo.core.openai_adapter import from_openai_message, to_openai_messages
+from crotolamo.core.sse import SSEError, SSETruncated, consume_sse
 
 _PROF = os.environ.get("CROTOLAMO_LLM_PROF") == "1"
 
@@ -150,7 +144,14 @@ class GLMClient:
             payload["thinking"] = {"type": "disabled"}
         return payload
 
-    def _raise_http(self, status: int, body: str) -> NoReturn:
+    def _raise_http(self, status: int, body: str, location: str | None = None) -> NoReturn:
+        if status < 400:
+            # Permanente, como un 400: es la config y no una caída. Esperar 60s
+            # con el modelo local no cambia a dónde apunta base_url.
+            raise LLMError(
+                f"GLM me mandó a otra dirección ({status}) en vez de responder, patrón. "
+                f"Revisa [llm.glm].base_url; me redirige a {location or 'no sé dónde'}."
+            )
         if status in (401, 403):
             raise GLMAuthError(
                 f"GLM me rechazó la credencial ({status}), patrón. "
@@ -191,8 +192,11 @@ class GLMClient:
                 _read_body(resp)  # drenar para poder reutilizar la conexión
                 time.sleep(wait)
                 resp = self._post(payload)
-        if resp.status >= 400:
-            self._raise_http(resp.status, _read_body(resp))
+        # >= 300 y no >= 400: http.client NO sigue redirecciones, así que el 301
+        # de un base_url con http:// (o con la ruta vieja) pasaba por respuesta
+        # y su cuerpo vacío, por una contestación en blanco.
+        if resp.status >= 300:
+            self._raise_http(resp.status, _read_body(resp), resp.getheader("Location"))
         return resp
 
     def chat(
@@ -207,7 +211,14 @@ class GLMClient:
         except (TimeoutError, OSError) as error:
             raise TransientLLMError(
                 f"GLM no respondió a tiempo, patrón. ({error})") from error
-        except json.JSONDecodeError as error:
+        except http.client.HTTPException as error:
+            # Cuerpo cortado a medias (IncompleteRead): es HTTPException, NO
+            # OSError. Sin esta rama salía cruda y FallbackLLM ni abría el
+            # breaker ni probaba el modelo local (ver LLMClient.chat).
+            raise TransientLLMError(
+                f"GLM me cortó la respuesta a medias, patrón. ({error})") from error
+        except ValueError as error:
+            # JSONDecodeError o UnicodeDecodeError (cuerpo no-UTF-8): ambas ValueError.
             raise LLMError("GLM me devolvió basura no-JSON, patrón.") from error
 
         if _PROF:
@@ -242,12 +253,19 @@ class GLMClient:
         except (TimeoutError, OSError) as error:
             raise TransientLLMError(
                 f"GLM no respondió a tiempo, patrón. ({error})") from error
+        except (http.client.HTTPException, SSETruncated) as error:
+            # Stream cortado: a medio chunk (IncompleteRead, ver chat()) o entre
+            # dos chunks, que por HTTP parece un final normal (ver consume_sse).
+            raise TransientLLMError(
+                f"GLM me cortó la respuesta a medias, patrón. ({error})") from error
+        except SSEError as error:
+            # Transitorio: el 200 ya salió (la petición y la key pasaron), así que
+            # lo que falla es el servicio: límite de ritmo, sobrecarga, inferencia.
+            raise TransientLLMError(
+                f"GLM falló a media respuesta, patrón: {error}") from error
 
         return ChatResponse(
             content=content.strip(),
             tool_calls=_parse_tool_calls(message),
             raw_message=message,
         )
-
-    # Alias de compatibilidad: el parseo SSE vive ahora en `crotolamo.core.sse`.
-    _consume_sse = staticmethod(consume_sse)

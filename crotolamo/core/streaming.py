@@ -28,21 +28,31 @@ class LiveStreamer:
         self._buf: list[str] = []
         self._decision: str | None = "hold" if hold_until_done else None
 
-    def feed(self, chunk: str) -> None:
+    def feed(self, chunk: str) -> bool:
+        """Recibe un delta. Devuelve False SOLO si quedó retenido (no salió ni
+        saldrá por su cuenta: lo único que se emite luego es `flush_if_held`).
+
+        Lo consulta `FallbackLLM` para su regla de "no reintentar si ya se habló":
+        contar llamadas a on_token daba por hablado lo que aquí seguía retenido,
+        y un corte de la nube a media respuesta ya no probaba el modelo local.
+        """
         self._buf.append(chunk)
         if self._decision == "stream":
             self._on_token(chunk)
-            return
+            return True
         if self._decision == "hold":
-            return
+            return False
         head = "".join(self._buf).lstrip()
         if len(head) < 2:
-            return  # aún no hay suficiente para decidir
+            # Aún no hay suficiente para decidir. Cuenta como hablado: sigue en
+            # el buffer y saldría pegado al principio de lo que venga después.
+            return True
         if head[0] in "{[" or head.startswith("```"):
             self._decision = "hold"
-        else:
-            self._decision = "stream"
-            self._on_token(head)  # soltamos lo acumulado de golpe y seguimos en vivo
+            return False
+        self._decision = "stream"
+        self._on_token(head)  # soltamos lo acumulado de golpe y seguimos en vivo
+        return True
 
     def flush_if_held(self, final_text: str) -> None:
         """Si retuvimos pero resultó ser texto final, lo emitimos completo."""

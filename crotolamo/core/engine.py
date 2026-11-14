@@ -42,7 +42,7 @@ class LLMEngine(Protocol):
 
     @property
     def model(self) -> str:
-        """Nombre del modelo activo (lo leen el logging y el doctor)."""
+        """Nombre del modelo que respondería ahora mismo."""
         ...
 
     def chat(
@@ -56,7 +56,9 @@ class LLMEngine(Protocol):
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
-        on_token: Callable[[str], None] | None = None,
+        # El motor ignora lo que devuelva on_token; solo FallbackLLM lo mira
+        # (False = "retenido, no sonó"), por eso no se exige `-> None`.
+        on_token: Callable[[str], object] | None = None,
     ) -> "ChatResponse":
         ...
 
@@ -143,7 +145,13 @@ class HTTPTransport:
         `.read()` completo o la itera línea a línea (streaming). No lanza por
         status >= 400; eso lo mapea cada cliente a sus mensajes en personaje.
         """
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        # errors="replace": el historial puede traer sustitutos sueltos (el
+        # nombre de un archivo con bytes no-UTF-8 que listó una tool, un
+        # "\ud83d" suelto de un JSON ajeno). Con el codec estricto eso lanzaba
+        # UnicodeEncodeError aquí, en ESTE turno y en todos los siguientes
+        # mientras el mensaje siguiera en el historial. Lo irrepresentable sale
+        # como "?"; el texto normal se codifica byte a byte igual que antes.
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8", errors="replace")
         hdrs = {"Content-Type": "application/json", **(headers or {})}
 
         # Si la respuesta anterior quedó a medias (p.ej. un stream que cortó en

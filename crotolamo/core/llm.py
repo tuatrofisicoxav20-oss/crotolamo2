@@ -45,10 +45,6 @@ class ChatResponse:
     # El mensaje crudo del asistente (para reinyectar al historial tal cual).
     raw_message: dict[str, Any] = field(default_factory=dict)
 
-    @property
-    def wants_tools(self) -> bool:
-        return bool(self.tool_calls)
-
 
 def _parse_tool_calls(message: dict[str, Any]) -> list[dict[str, Any]]:
     calls = []
@@ -131,12 +127,18 @@ class LLMClient:
             payload["tools"] = tools
         return payload
 
-    def _raise_http(self, status: int, body: str) -> NoReturn:
-        """Mapea un status HTTP >= 400 de Ollama a un LLMError útil.
+    def _raise_http(self, status: int, body: str, location: str | None = None) -> NoReturn:
+        """Mapea un status HTTP >= 300 de Ollama a un LLMError útil.
 
         Antes un 404/500 caía en la rama genérica de "¿Está vivo el servicio?",
         que despista: el servicio SÍ está vivo, es la petición la que falló.
         """
+        if status < 400:
+            # Permanente: [llm].host apunta a algo que no es Ollama (un proxy).
+            raise LLMError(
+                f"Ollama me mandó a otra dirección ({status}) en vez de responder, patrón. "
+                f"Revisa [llm].host; me redirige a {location or 'no sé dónde'}."
+            )
         if status == 404:
             # Permanente: el modelo no existe; reintentar no lo instala.
             raise LLMError(
@@ -162,8 +164,10 @@ class LLMClient:
                 f"No pude hablar con Ollama en {self.host}, patrón. "
                 f"¿Está vivo el servicio? ({error})"
             ) from error
-        if resp.status >= 400:
-            self._raise_http(resp.status, _read_body(resp))
+        # >= 300 y no >= 400: http.client NO sigue redirecciones; un 3xx pasaba
+        # por respuesta y su cuerpo vacío, por una contestación en blanco.
+        if resp.status >= 300:
+            self._raise_http(resp.status, _read_body(resp), resp.getheader("Location"))
         return resp
 
     def chat(
@@ -179,7 +183,18 @@ class LLMClient:
             raise TransientLLMError(
                 f"Ollama no respondió a tiempo, patrón. ({error})"
             ) from error
-        except json.JSONDecodeError as error:
+        except http.client.HTTPException as error:
+            # Cuerpo cortado a medias (IncompleteRead: el servidor o un proxy
+            # cerraron antes de mandar lo prometido). Es HTTPException, NO
+            # OSError: sin esta rama salía cruda de handle_turn (traceback) y
+            # sin abrir el breaker de FallbackLLM, aunque es pura disponibilidad.
+            raise TransientLLMError(
+                f"Ollama me cortó la respuesta a medias, patrón. ({error})"
+            ) from error
+        except ValueError as error:
+            # JSONDecodeError y también UnicodeDecodeError (cuerpo que ni es
+            # UTF-8: la página en latin-1 de un portal cautivo). Las dos son
+            # ValueError; atrapando solo la primera, la segunda salía cruda.
             raise LLMError("Ollama me devolvió basura no-JSON, patrón.") from error
 
         if _PROF:
@@ -206,44 +221,84 @@ class LLMClient:
     ) -> ChatResponse:
         """Como chat() pero con stream=True: invoca on_token(chunk) por cada delta.
 
-        Acumula el contenido y captura tool_calls del último mensaje. Útil para
+        Acumula el contenido y los tool_calls de todo el stream. Útil para
         respuesta token-a-token (Fase 6). Funciona mejor con GPU o modelos que usan
         el campo nativo tool_calls.
         """
         resp = self._send(self._payload(messages, tools, stream=True))
         try:
-            content, last_message = self._consume_stream(resp, on_token)
+            content, message = self._consume_stream(resp, on_token)
         except (TimeoutError, OSError) as error:
             raise TransientLLMError(
                 f"Ollama no respondió a tiempo, patrón. ({error})") from error
+        except http.client.HTTPException as error:  # stream cortado: ver chat()
+            raise TransientLLMError(
+                f"Ollama me cortó la respuesta a medias, patrón. ({error})") from error
 
         return ChatResponse(
             content=content.strip(),
-            tool_calls=_parse_tool_calls(last_message),
-            raw_message=last_message,
+            tool_calls=_parse_tool_calls(message),
+            raw_message=message,
         )
 
     @staticmethod
     def _consume_stream(resp, on_token) -> tuple[str, dict[str, Any]]:
-        """Parsea el JSONL de /api/chat?stream=true. Reusable y testeable."""
+        """Parsea el JSONL de /api/chat?stream=true. Reusable y testeable.
+
+        Devuelve (contenido, mensaje del turno ENTERO). Los tool_calls llegan
+        completos (no fragmentados como en el SSE de OpenAI) pero en un chunk
+        con done=false, y el stream SIEMPRE cierra con un chunk done=true cuyo
+        message viene vacío. Quedarse con el último message (lo que se hacía)
+        borraba la llamada: la tool no corría y el turno se cerraba en falso.
+
+        Lanza TransientLLMError si Ollama avisa de un fallo dentro del stream
+        (una línea {"error": ...}, ya con el 200 dado) o si el stream se acaba
+        sin su done=true. Antes las dos cosas pasaban por una respuesta buena:
+        vacía, cortada a media frase, o con un tool_call de un turno sin cerrar.
+        """
         parts: list[str] = []
-        last_message: dict[str, Any] = {}
+        calls: list[Any] = []
+        # Que el HTTP no se queje no basta: un FIN entre dos chunks acaba la
+        # iteración por líneas sin error. El cierre de verdad es done=true.
+        complete = False
         for raw_line in resp:
-            line = raw_line.decode("utf-8").strip() if isinstance(raw_line, bytes) else raw_line.strip()
+            # "replace": una línea que ni es UTF-8 es basura como cualquier otra
+            # y la descarta el filtro de abajo; con el codec estricto reventaba
+            # aquí con un UnicodeDecodeError crudo antes de llegar a él.
+            line = raw_line.decode("utf-8", "replace") if isinstance(raw_line, bytes) else raw_line
+            line = line.strip()
             if not line:
                 continue
             try:
                 obj = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(obj, dict):
+                continue  # JSON válido que no es un chunk (null, una lista): basura
+            if obj.get("error"):
+                # Transitorio, como el 500 que Ollama da si falla ANTES de
+                # empezar a responder: se le cayó el runner, se quedó sin RAM.
+                raise TransientLLMError(
+                    f"Ollama tropezó a media respuesta, patrón: {str(obj['error'])[:300]}"
+                )
             msg = obj.get("message", {}) or {}
-            if msg:
-                last_message = msg
+            # Varias llamadas pueden venir en un chunk o repartidas en varios.
+            calls.extend(msg.get("tool_calls") or [])
             delta = msg.get("content") or ""
             if delta:
                 parts.append(delta)
                 if on_token:
                     on_token(delta)
             if obj.get("done"):
+                complete = True
                 break
-        return "".join(parts), last_message
+        if not complete:
+            raise TransientLLMError(
+                "Ollama me cortó la respuesta a medias, patrón. (el stream acabó sin done)"
+            )
+        content = "".join(parts)
+        # Misma forma que devuelve `consume_sse`: `tool_calls` solo si hubo.
+        message: dict[str, Any] = {"role": "assistant", "content": content}
+        if calls:
+            message["tool_calls"] = calls
+        return content, message
