@@ -1,7 +1,7 @@
 """Adapters reales de audio del loop de voz (extraídos de loop.py).
 
 Solo se usan en hardware; los tests inyectan fakes. Imports pesados (numpy,
-torch, sounddevice) perezosos y CACHEADOS: el hot path corre ~31 veces por
+sounddevice) perezosos y CACHEADOS: el hot path corre ~31 veces por
 segundo, así que resolver los módulos en cada frame (aunque el import cacheado
 sea "barato") es costo puro sin motivo.
 """
@@ -111,13 +111,15 @@ class _RealMic:
 class _SileroVad:
     """Adapter de Silero VAD (M2) como vad_fn(chunk) -> prob.
 
-    Si silero-vad o torch no están instalados, cae a un VAD por energía RMS que
-    devuelve 0.0 o 1.0 (escalado para ser comparable con el umbral 0-1 del loop).
-    El fallback se activa UNA sola vez (no reintenta el import cada chunk) y se
-    reporta en el log UNA vez para no inundar.
+    Si silero-vad u onnxruntime no están instalados, cae a un VAD por energía RMS
+    que devuelve 0.0 o 1.0 (escalado para ser comparable con el umbral 0-1 del
+    loop). El fallback se activa UNA sola vez (no reintenta el import cada chunk) y
+    se reporta en el log UNA vez para no inundar.
 
-    Rendimiento: numpy/torch se resuelven UNA vez (lazy, en el primer frame) y se
-    cachean en self._np/self._torch; antes el import corría en cada chunk (~31/s).
+    Rendimiento: numpy se resuelve UNA vez (lazy, en el primer frame) y se cachea
+    en self._np; antes el import corría en cada chunk (~31/s). El modelo recibe el
+    chunk como numpy (runtime.SileroOnnx): torch ya no se importa, y con él se
+    fueron ~218 MB y ~950 módulos que el primer chunk cargaba EN el hilo del oído.
     """
 
     _ENERGY_FLOOR = 0.01  # RMS mínimo para considerar voz en modo fallback
@@ -127,7 +129,6 @@ class _SileroVad:
         self._model: Any = None
         self._fallback: bool = False  # True = usar energía RMS
         self._np: Any = None     # numpy cacheado (lazy, primer frame)
-        self._torch: Any = None  # torch cacheado (lazy, primer frame)
 
     def reset(self) -> None:
         """Limpia el estado oculto de la RNN. Silero acumula contexto entre chunks:
@@ -145,19 +146,17 @@ class _SileroVad:
             if self._model is None:
                 # Lazy y UNA sola vez: imports pesados fuera del hot path.
                 import numpy
-                import torch
 
                 # Comparte la instancia cacheada de stt: antes cada uno cargaba su
                 # propia copia del ONNX, duplicando el modelo en RAM sin motivo.
                 from crotolamo.voice.stt import _get_silero_vad
 
                 self._np = numpy
-                self._torch = torch
                 self._model = _get_silero_vad()
             # ascontiguousarray evita la copia extra que hacía .copy(): solo copia
             # si el chunk no es ya un array float32 contiguo.
             arr = self._np.ascontiguousarray(chunk, dtype=self._np.float32)
-            return float(self._model(self._torch.from_numpy(arr), self.sample_rate))
+            return float(self._model(arr, self.sample_rate))
         except (ImportError, ModuleNotFoundError) as exc:
             log.warning(
                 "silero-vad no disponible (%s); cayendo a VAD por energía. "

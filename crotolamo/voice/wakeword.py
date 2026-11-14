@@ -17,10 +17,12 @@ from __future__ import annotations
 
 import glob
 import os
+import threading
 import time
 from typing import TYPE_CHECKING, Any
 
 from crotolamo.logging_setup import get_logger
+from crotolamo.voice import runtime
 from crotolamo.voice.stt import VoiceUnavailable, _require
 
 if TYPE_CHECKING:
@@ -47,6 +49,10 @@ class WakeWordDetector:
         # stdout para calibrar el umbral viendo qué da la voz real vs el ruido.
         self.debug = debug
         self._model = None  # se carga una sola vez
+        # Lock de carga (doble comprobación en _get_model): WarmVoice puede estar
+        # cargándolo cuando el oído pide su primer score; sin lock cada uno
+        # construía su propio modelo y uno se tiraba.
+        self._load_lock = threading.Lock()
         self._np: Any = None  # numpy cacheado: score() corre en CADA chunk (~31/s)
         # Buffers del preprocessor recién cargado (openwakeword < 0.6): reset()
         # los restaura de esta copia en vez de recalcular ~200 ms de embeddings.
@@ -101,14 +107,13 @@ class WakeWordDetector:
         if own is not None:
             return own
         try:
-            import openwakeword
-
-            base = os.path.join(
-                os.path.dirname(openwakeword.__file__), "resources", "models"
-            )
-            matches = sorted(glob.glob(os.path.join(base, f"{self.model_name}*.onnx")))
-            if matches:
-                return matches[0]
+            # La carpeta SIN ejecutar el __init__ del paquete (que arrastra sklearn
+            # y scipy): runtime.package_file la localiza con find_spec.
+            base = runtime.package_file("openwakeword", "resources", "models")
+            if base is not None:
+                matches = sorted(glob.glob(os.path.join(base, f"{self.model_name}*.onnx")))
+                if matches:
+                    return matches[0]
         except Exception as error:  # noqa: BLE001 - sin resolver, el nombre crudo
             log.debug("no pude resolver la ruta del modelo '%s': %s",
                       self.model_name, error)
@@ -146,9 +151,22 @@ class WakeWordDetector:
         """
         if self._np is None:
             self._np = _require("numpy")
+        # Camino caliente sin lock: con el modelo ya cargado es leer un atributo.
         if self._model is not None:
             return self._model
+        with self._load_lock:
+            # Doble comprobación: otro hilo pudo cargarlo mientras esperábamos. Se
+            # publica ya listo (estado en blanco copiado, arena soltado): nadie
+            # puntúa con un modelo a medio preparar.
+            if self._model is None:
+                self._model = self._load_model()
+        return self._model
+
+    def _load_model(self):
         try:
+            # Sin el módulo de ENTRENAMIENTO del paquete (sklearn + scipy: +87 MB y
+            # +3 hilos de OpenBLAS para nada); ver runtime.import_openwakeword.
+            runtime.import_openwakeword()
             from openwakeword.model import Model
         except ImportError as error:
             raise VoiceUnavailable(
@@ -171,18 +189,15 @@ class WakeWordDetector:
 
         # La firma del constructor cambia entre versiones de openWakeWord: unas aceptan
         # el NOMBRE (wakeword_models) y/o inference_framework; otras solo la RUTA al
-        # .onnx (wakeword_model_paths) y son ONNX puro. Probamos en orden y nos
-        # quedamos con la primera variante que cargue.
-        attempts = (
-            {"wakeword_models": [own or self.model_name], "inference_framework": "onnx"},
-            {"wakeword_model_paths": [path], "inference_framework": "onnx"},
-            {"wakeword_model_paths": [path]},
-            {"wakeword_models": [path]},
-        )
+        # .onnx (wakeword_model_paths) y son ONNX puro. Va primero la variante que
+        # declara la firma instalada (en 0.4 los intentos a ciegas construían 6
+        # sesiones ONNX que se tiraban) y detrás la lista de siempre, en orden; nos
+        # quedamos con la primera que cargue.
+        attempts = runtime.oww_constructor_kwargs(Model, own or self.model_name, path)
         cause: Exception | None = None
         for kwargs in attempts:
             try:
-                self._model = Model(**kwargs)
+                model = Model(**kwargs)
             except Exception as error:  # noqa: BLE001 - TypeError o NoSuchFile, etc.
                 # Un TypeError es una firma que no es de ESTA versión: se informa
                 # el primer error que no lo sea (archivo inexistente, pesos que
@@ -192,19 +207,22 @@ class WakeWordDetector:
                                      and not isinstance(error, TypeError)):
                     cause = error
                 continue
-            self._remember_blank_state()
-            return self._model
+            self._remember_blank_state(model)
+            # El calentamiento de AudioFeatures (10 s de ceros) deja su pico en el
+            # arena de ORT para siempre (~200 MB): se devuelve. No cambia scores.
+            runtime.release_oww_warmup_arena(model)
+            return model
         raise VoiceUnavailable(
             f"No pude cargar el wake word '{self.model_name}', patrón: {cause}"
         )
 
-    def _remember_blank_state(self) -> None:
+    def _remember_blank_state(self, model) -> None:
         """Copia los buffers del preprocessor recién cargado (antes de oír nada).
 
         Solo hace falta en openwakeword < 0.6, donde Model.reset() no toca el
         preprocessor; en 0.6+ el preprocessor trae su propio reset().
         """
-        pre = getattr(self._model, "preprocessor", None)
+        pre = getattr(model, "preprocessor", None)
         if pre is None or callable(getattr(pre, "reset", None)):
             return
         self._blank_state = {
@@ -254,7 +272,10 @@ class WakeWordDetector:
           difuso), que no usa openWakeWord.
         """
         try:
-            import openwakeword  # noqa: F401
+            # Sin sklearn/scipy (runtime.import_openwakeword): esta decisión de modo
+            # corre en el hilo principal al arrancar y costaba ~2 s y +87 MB.
+            # sounddevice sí se importa de verdad: su OSError es lo que se diagnostica.
+            runtime.import_openwakeword()
             import sounddevice  # noqa: F401
 
             return True

@@ -3,7 +3,7 @@
 1. Cooldown anti-eco del EarThread: al volver a IDLE tras un turno, el wake se
    IGNORA durante _post_speak_grace_s (el eco del TTS Piper dispara falsos wakes
    porque el modelo se entrenó con voz Piper); pasado el período, se acepta.
-2. Fallback Silero -> energía en _SileroVad: si torch/numpy o _get_silero_vad
+2. Fallback Silero -> energía en _SileroVad: si onnxruntime/numpy o _get_silero_vad
    fallan, _fallback se activa y el VAD de energía distingue voz de silencio.
 """
 
@@ -179,17 +179,25 @@ def test_silero_vad_cae_a_energia_si_la_carga_revienta(monkeypatch):
 
 
 def test_silero_vad_cae_a_energia_si_falla_el_import_de_torch(monkeypatch):
-    """Si torch/numpy no importan dentro de __call__, cae a energía igual."""
+    """Si las dependencias del modelo no importan al cargarlo, cae a energía igual.
+
+    El VAD ya no usa torch (voice/runtime.py corre el ONNX con numpy +
+    onnxruntime): se bloquean los dos y se vacía la caché de stt, para que la
+    carga ocurra DE VERDAD dentro de __call__ y falle en el import."""
     import builtins
+
+    import crotolamo.voice.stt as stt_mod
 
     real_import = builtins.__import__
 
     def _sin_torch(name, *args, **kwargs):
-        if name == "torch":
-            raise ModuleNotFoundError("No module named 'torch'")
+        if name in ("torch", "onnxruntime"):
+            raise ModuleNotFoundError(f"No module named '{name}'")
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", _sin_torch)
+    monkeypatch.setattr(stt_mod, "_silero_vad", None)
+    monkeypatch.setattr(stt_mod, "_silero_load_error", None)
     vad = _SileroVad()
     assert vad(_VOZ) == 1.0
     assert vad._fallback is True

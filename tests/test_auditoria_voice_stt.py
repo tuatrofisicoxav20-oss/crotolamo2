@@ -49,9 +49,14 @@ class _SlowWhisper:
         with _SlowWhisper._guard:
             _SlowWhisper.built.append(model_size)
             fail = _SlowWhisper.fail_next
-            _SlowWhisper.fail_next = False
+            # Solo la llamada SIN local_files_only descarga (la de la caché local
+            # va antes, ver runtime.load_whisper): un modelo cuya descarga se cortó
+            # tampoco está en la caché.
+            if not kwargs.get("local_files_only"):
+                _SlowWhisper.fail_next = False
         if fail:
-            raise RuntimeError("descarga cortada")
+            raise RuntimeError("no está en la caché" if kwargs.get("local_files_only")
+                               else "descarga cortada")
         gate = _SlowWhisper.gates.get(model_size)
         if gate is not None:
             gate.wait(5)
@@ -147,7 +152,8 @@ def test_carga_fallida_no_envenena_la_siguiente(slow_whisper):
     t.join(5)
     assert not t.is_alive()
     assert done and stt_mod._models["_aud_a_"] is done[0]
-    assert slow_whisper.built == ["_aud_a_", "_aud_a_"]
+    # 1a carga: caché local + descarga cortada; 2a: vuelve a construir.
+    assert slow_whisper.built == ["_aud_a_", "_aud_a_", "_aud_a_"]
 
 
 def test_modelo_ya_cacheado_no_toca_faster_whisper(monkeypatch):
@@ -332,8 +338,11 @@ def test_get_silero_vad_no_reintenta_una_carga_fallida(silero_falso):
 def test_get_silero_vad_sigue_cacheando_la_carga_buena(silero_falso):
     modelo = object()
     silero_falso["carga"] = lambda: modelo
-    assert stt_mod._get_silero_vad() is modelo
-    assert stt_mod._get_silero_vad() is modelo
+    cargado = stt_mod._get_silero_vad()
+    # Este silero_vad falso no trae data/silero_vad.onnx: el modelo del vendor
+    # llega envuelto en el adaptador numpy -> float de voice/runtime.py.
+    assert cargado._model is modelo
+    assert stt_mod._get_silero_vad() is cargado
     assert silero_falso["intentos"] == 1
 
 

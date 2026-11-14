@@ -45,11 +45,13 @@ try:
     from crotolamo.core.engine import GLM, resolve_backend
     from crotolamo.core.glm import API_KEY_ENVS, DEFAULT_BASE_URL, DEFAULT_MODEL
     from crotolamo.settings import LOCAL_CONFIG, Settings, load_settings
+    from crotolamo.voice import runtime as voice_runtime
 except ModuleNotFoundError:  # ejecutado como script suelto
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from crotolamo.core.engine import GLM, resolve_backend
     from crotolamo.core.glm import API_KEY_ENVS, DEFAULT_BASE_URL, DEFAULT_MODEL
     from crotolamo.settings import LOCAL_CONFIG, Settings, load_settings
+    from crotolamo.voice import runtime as voice_runtime
 
 # Timeouts cortos: el doctor se corre a mano y debe contestar en segundos aunque
 # la red esté caída o PipeWire colgado.
@@ -716,7 +718,14 @@ def _check_portaudio(ctx: _Ctx) -> list[Check]:
 
 
 def _check_oww(ctx: _Ctx) -> list[Check]:
-    error = _import_error("openwakeword")
+    # El MISMO import que hace el demonio (voice_runtime.import_openwakeword): sin
+    # el módulo de entrenamiento, que arrastraba sklearn y scipy solo para decir
+    # "importable".
+    error: str | None = None
+    try:
+        voice_runtime.import_openwakeword()
+    except Exception as exc:  # noqa: BLE001 - igual que _try_import
+        error = f"{type(exc).__name__}: {exc}"
     if error:
         return [Check("voz-oww", False,
                       "falta openwakeword (sin él, solo modo simple/difuso está disponible)",
@@ -724,8 +733,29 @@ def _check_oww(ctx: _Ctx) -> list[Check]:
     return [Check("voz-oww", True, "openwakeword importable (modo concurrente OK)")]
 
 
+def _silero_error() -> str | None:
+    """Lo que hace voice_runtime.load_silero, sin importar torch para verlo.
+
+    Con el ONNX que trae silero_vad, que abra con numpy + onnxruntime es lo que el
+    VAD necesita (antes se importaba el paquete entero, torch incluido: ~280 MB y
+    varios segundos para escribir "importable"). Sin ese archivo, o si no abre por
+    otra causa que un import, el demonio usa el cargador de silero_vad: se
+    comprueba como siempre, importándolo.
+    """
+    path = voice_runtime.package_file("silero_vad", "data", "silero_vad.onnx")
+    if path is not None and os.path.isfile(path):
+        try:
+            voice_runtime.SileroOnnx(path)
+            return None
+        except ImportError as error:  # sin numpy/onnxruntime: el demonio usa energía
+            return f"{type(error).__name__}: {error}"
+        except Exception:  # noqa: BLE001 - el demonio cae al cargador del vendor
+            pass
+    return _import_error("silero_vad")
+
+
 def _check_silero(ctx: _Ctx) -> list[Check]:
-    error = _import_error("silero_vad")
+    error = _silero_error()
     if error:
         return [Check("voz-silero", False,
                       "falta silero-vad (el modo concurrente usará VAD por energía como fallback)",

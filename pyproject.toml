@@ -17,12 +17,25 @@ dependencies = []
 
 [project.optional-dependencies]
 # Voz (Fase 5). Se instala con: pip install -e ".[voice]"
+# crotolamo/voice/runtime.py carga los modelos sin los wrappers del vendor y se apoya
+# en detalles internos de estos paquetes; si una versión los cambia, cae SOLA al
+# camino de siempre (más RAM, mismo resultado):
+#   - silero-vad: data/silero_vad.onnx y sus entradas input/state/sr
+#     -> si no, load_silero_vad(onnx=True), que importa torch.
+#   - openwakeword: openwakeword.custom_verifier_model (se sustituye por un stub
+#     para no importar sklearn/scipy), la firma de Model(...) y resources/models,
+#     y preprocessor.melspec_model/embedding_model -> si no, el import completo, la
+#     lista de firmas de siempre y el arena sin soltar.
+#   - faster-whisper: WhisperModel(local_files_only=True) -> si no, la llamada de
+#     siempre (consulta el Hub).
+#   - piper-tts: voice.session (InferenceSession) -> si no, la sesión tal cual.
 voice = [
     "faster-whisper",
     "sounddevice",
     "numpy",
     "scipy",
     "piper-tts",
+    "onnxruntime",   # lo usa runtime.py directo (ya venía con openwakeword y piper-tts)
     "openwakeword",  # wake word ligero dedicado (M1)
     "silero-vad",    # VAD neuronal + buffer de pre-activación (M2)
 ]

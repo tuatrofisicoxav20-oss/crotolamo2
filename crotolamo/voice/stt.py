@@ -16,6 +16,7 @@ import wave
 from pathlib import Path
 
 from crotolamo.logging_setup import get_logger
+from crotolamo.voice import runtime
 from crotolamo.voice.normalize import normalize_text
 
 log = get_logger("voice.stt")
@@ -50,6 +51,11 @@ def _model_lock(model_size: str) -> threading.Lock:
 # estado de RNN se limpia con reset_states() en cada uso.
 _silero_vad: object | None = None
 
+# Lock de carga de Silero. Igual que con Whisper: WarmVoice y el primer uso real
+# (el oído o una grabación del modo simple) podían ver la caché vacía a la vez y
+# construir cada uno su sesión ONNX, tirando una.
+_silero_lock = threading.Lock()
+
 # Motivo por el que CARGAR Silero falló (falta silero-vad u onnxruntime, ONNX
 # corrupto), o None. Ese fallo es permanente en el proceso: antes cada grabación
 # del modo simple reintentaba el import/carga y escribía un WARNING — uno cada
@@ -66,16 +72,22 @@ def _get_silero_vad():
     vez, hay que dar una instancia por hilo o el estado se pisará.
     """
     global _silero_vad, _silero_load_error
-    if _silero_vad is None:
-        if _silero_load_error is not None:
-            raise RuntimeError(f"Silero no cargó: {_silero_load_error}")
-        try:
-            from silero_vad import load_silero_vad
-
-            _silero_vad = load_silero_vad(onnx=True)
-        except Exception as error:
-            _silero_load_error = f"{type(error).__name__}: {error}"
-            raise
+    # Camino caliente sin lock: con el modelo ya cargado es leer un global.
+    if _silero_vad is not None:
+        return _silero_vad
+    with _silero_lock:
+        # Doble comprobación: otro hilo pudo cargarlo (o fallar) mientras esperábamos.
+        if _silero_vad is None:
+            if _silero_load_error is not None:
+                raise RuntimeError(f"Silero no cargó: {_silero_load_error}")
+            try:
+                # Sin torch: el mismo silero_vad.onnx con numpy + onnxruntime, mismas
+                # probabilidades (ver runtime.SileroOnnx). Antes load_silero_vad()
+                # importaba torch (+218 MB) solo como contenedor de tensores.
+                _silero_vad = runtime.load_silero()
+            except Exception as error:
+                _silero_load_error = f"{type(error).__name__}: {error}"
+                raise
     return _silero_vad
 
 
@@ -101,6 +113,20 @@ def _voice_cfg() -> dict:
     except Exception as error:  # noqa: BLE001 — sin config usable, defaults
         log.debug("no pude cargar la config de voz (%s); uso defaults", error)
         return {}
+
+
+def _whisper_cpu_threads() -> int:
+    """[voice].whisper_cpu_threads: hilos de CTranslate2 por modelo Whisper.
+
+    0 (o ausente) = el default de faster-whisper, el comportamiento de siempre.
+    Un valor inválido no impide cargar: se avisa y se usa el default.
+    """
+    value = _voice_cfg().get("whisper_cpu_threads", 0)
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    log.warning("[voice].whisper_cpu_threads=%r no es un entero >= 0; uso el default de "
+                "faster-whisper", value)
+    return 0
 
 
 class STT:
@@ -136,8 +162,12 @@ class STT:
                     faster_whisper = _require("faster_whisper")
                     log.info("Cargando Whisper '%s' (la primera vez tarda)",
                              self.model_size)
-                    _models[self.model_size] = faster_whisper.WhisperModel(
-                        self.model_size, device="cpu", compute_type="int8"
+                    # Primero de la caché local (sin preguntar al Hub en cada
+                    # arranque) y sin el hilo monitor de tqdm; si no está en caché,
+                    # la llamada de siempre, que lo descarga (ver runtime.load_whisper).
+                    _models[self.model_size] = runtime.load_whisper(
+                        faster_whisper, self.model_size,
+                        cpu_threads=_whisper_cpu_threads(),
                     )
         return _models[self.model_size]
 
@@ -289,7 +319,6 @@ class STT:
         """
         np = _require("numpy")
         sd = _require("sounddevice")
-        torch = _require("torch")
         from collections import deque
 
         from crotolamo.voice.vad import is_voice, resolve_neg_threshold
@@ -321,11 +350,11 @@ class STT:
                 block, _ = stream.read(chunk)
                 block = np.squeeze(np.asarray(block, dtype=np.float32))
                 # ascontiguousarray evita la copia extra que hacía .copy(): solo
-                # copia si el bloque no es ya un array float32 contiguo.
-                prob = float(model(
-                    torch.from_numpy(np.ascontiguousarray(block, dtype=np.float32)),
-                    self.sample_rate,
-                ))
+                # copia si el bloque no es ya un array float32 contiguo. El modelo
+                # recibe numpy: ya no hace falta torch (antes, sin torch, esto
+                # lanzaba VoiceUnavailable y el servicio salía en bucle).
+                prob = float(model(np.ascontiguousarray(block, dtype=np.float32),
+                                   self.sample_rate))
 
                 if not speaking:
                     pre_buffer.append(block)

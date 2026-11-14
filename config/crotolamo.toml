@@ -8,9 +8,16 @@
 [paths]
 # ~ se expande al home del usuario que corre el proceso.
 home       = "~"
+# documentos: base de search_files y la carpeta que abre "abre documentos".
+# descargas: la carpeta que abre "abre descargas".
+# open_folder también acepta aquí escritorio, imagenes, musica y videos si tus
+# carpetas XDG tienen otro nombre (p. ej. imagenes = "~/Pictures").
+# Rutas absolutas o con ~.
 documentos = "~/Documentos"
 descargas  = "~/Descargas"
 # Voz Piper (Fase 5). Apunta a donde tengas el modelo .onnx.
+# Si clonaste el repo en otra carpeta, cámbialo en crotolamo.local.toml
+# (desktop/install.sh ya apunta los servicios a la ruta real).
 voces      = "~/Documentos/crotolamo2/voices"
 # Base de datos de memoria persistente (Fase 4).
 db         = "~/.crotolamo/crotolamo.sqlite"
@@ -19,6 +26,9 @@ notas      = "~/Documentos/crotolamo_notas"
 
 # Allowlist de raíces donde las tools de archivo pueden operar (Fase 3).
 # El guard rechaza cualquier ruta fuera de estas raíces.
+# Solo rutas absolutas o que empiecen por ~ (vale $VARIABLE si está definida): con
+# una relativa Crotolamo no arranca, porque dependería de desde dónde se lance.
+# Lo mismo vale para confirm_roots.
 allowed_roots = [
     "~/Documentos",
     "~/Descargas",
@@ -79,10 +89,11 @@ level = "INFO"
 # = no hay archivo que comprobar (faster-whisper descarga y cachea el suyo).
 stt_module = "faster_whisper"
 stt_model  = ""
-# TTS principal. tts_model vacío = Piper: se comprueba [paths].voces/[voice].piper_voice
-# (y su .onnx.json al lado). Con tts_model (p.ej. Kokoro) se comprueba ese archivo;
-# tts_voices = archivo de voces (.bin/.npz de numpy o .json) y tts_voice = la voz
-# que debe contener. Vacíos = no se comprueban.
+# TTS principal. tts_model vacío = Piper: se comprueba que el módulo `piper` importe
+# y que exista [paths].voces/[voice].piper_voice (y su .onnx.json al lado). Con
+# tts_model (p.ej. Kokoro) se comprueba ese archivo; tts_voices = archivo de voces
+# (.bin/.npz de numpy o .json) y tts_voice = la voz que debe contener. Vacíos = no
+# se comprueban.
 tts_model  = ""
 tts_voices = ""
 tts_voice  = ""
@@ -182,6 +193,11 @@ timeout  = 60
 # Un "hola" con thinking gasta ~460 tokens de reasoning para nada. En voz, esos 5s
 # de más se sienten. Ponlo en true si prefieres que razone preguntas difíciles.
 thinking = false
+# Tope de tokens de SALIDA por respuesta de la nube. Sin esta clave (lo normal) no se
+# manda y decide el tope del propio modelo. Sirve para acotar respuestas largas en voz
+# o cuidar la cuota del tier gratuito. Ojo: si el tope corta, la frase queda a medias
+# (y un tool-call con argumentos largos, incompleto).
+# max_tokens = 512
 # Respaldo local: si GLM falla en caliente (se cayó el wifi, la key caducó, un 429),
 # Crotolamo usa el modelo de Ollama de arriba durante estos segundos antes de volver
 # a intentar la nube. Sin esto, cada frase esperaría el timeout para nada. Es lo que
@@ -214,6 +230,9 @@ enabled = false
 umbral = 0.03
 # Recuerdos que se inyectan por turno al contexto del LLM (pocos: son tokens y ruido).
 top_k = 3
+# El modelo de embeddings (~240 MB) se guarda en <ruta>/modelos, no en /tmp (en Fedora
+# es tmpfs: ocupaba RAM y se volvía a bajar en cada arranque). Si exportas
+# FASTEMBED_CACHE_PATH, manda esa.
 ruta = "~/.local/share/crotolamo/memoria"
 # Tope de espera de la recuperación por turno: si la memoria tarda más, la
 # respuesta sale sin recuerdos (WARNING). La voz nunca espera a la memoria.
@@ -240,6 +259,11 @@ usuario = "patron"
 # (Hyprland): clave = lista de argumentos del comando. El 'terminal' se AUTODETECTA
 # (kitty/foot/alacritty/...) si no lo defines aquí; el explorador de archivos también
 # puedes cablearlo en 'archivos'.
+# Si defines `terminal` (p. ej. terminal = ["ptyxis"]) lo usan tanto "abre terminal"
+# como launch_project. Para ejecutar un comando se conoce la sintaxis de kitty, foot,
+# gnome-terminal, ptyxis y wezterm; a cualquier otro terminal se le pasa con `-e` (la
+# convención de xterm).
+# Las apps de aquí también valen como destino de un atajo aprendido (learn_shortcut).
 [apps]
 opera         = ["flatpak", "run", "com.opera.opera-gx"]
 "opera gx"    = ["flatpak", "run", "com.opera.opera-gx"]
@@ -257,13 +281,18 @@ whisper_model      = "base"
 # Modelo barato solo para detectar la palabra de activación (wake).
 wake_whisper_model = "tiny"
 piper_voice        = "es_MX-ald-medium.onnx"
+# Hoy solo vale 16000: Whisper, Silero y openWakeWord trabajan a 16 kHz y el audio
+# capturado NO se remuestrea (PipeWire ya entrega 16 kHz de cualquier micrófono). Con
+# otro valor las órdenes salen vacías o mal transcritas.
 sample_rate        = 16000
 # Micrófono que abre Crotolamo. Comentado = el default del sistema (comportamiento
 # histórico). Tras activar la cancelación de eco (`desktop/aec.sh on`), apúntalo al
 # source limpio: así SOLO Crotolamo usa el AEC y no cambias el default global (que
 # afectaría a Discord, el navegador, etc.). El AEC es lo que permite usar openWakeWord
 # (`[wake].use_oww = true`) con altavoces sin que el asistente se autodispare con su
-# propia voz.
+# propia voz. La SALIDA sí cambia: el AEC solo resta lo que suena por
+# crotolamo_aec_sink, así que ese debe ser el sink por defecto
+# (`pactl set-default-sink crotolamo_aec_sink`; `desktop/aec.sh status` lo comprueba).
 # input_device = "crotolamo_aec_source"
 # VAD (M2, de GLaDOS): 'silero' (neuronal) o 'energy' (fallback sin modelo).
 vad_backend          = "silero"
@@ -279,6 +308,9 @@ vad_threshold        = 0.8
 vad_neg_threshold  = 0.35
 # Buffer de pre-activación: ms de audio previos que se anteponen para no perder
 # las primeras sílabas.
+# En el loop concurrente (use_oww = true) también es lo que se antepone a la orden
+# cuando el patrón hace una pausa tras la palabra de activación: la orden se espera
+# hasta 4 s (como en el modo simple) y el silencio no cuenta hasta la primera voz.
 vad_preactivation_ms = 800
 # Silencio sostenido que cierra la grabación del comando. Historia: 640 -> 900
 # (toleraba la pausa tras "crotolamo") -> 600 (misión velocidad): ahora el
@@ -314,11 +346,20 @@ followup_s = 6.0
 # de ct2 está mejor optimizado que el greedy). Se queda en 5: máxima precisión
 # gratis. El knob existe por si otra build/equipo se comporta distinto.
 beam_size = 5
+# Hilos de CPU de CADA modelo Whisper (órdenes y wake difuso). 0 = el default de
+# faster-whisper, lo de siempre. Solo pesa cuando las etapas se solapan (Whisper
+# transcribe mientras Piper sintetiza): menos hilos dejan núcleos libres a cambio de
+# transcribir algo más lento. Mídelo en tu equipo antes de cambiarlo.
+whisper_cpu_threads = 0
 # Acuse tras el wake: "beep" = bip instantáneo NO bloqueante (puedes hablar ya),
 # "voz" = "Te escucho, patrón" hablado (~1s de espera), "off" = solo el HUD.
 ack = "beep"
 # Hablar cada frase EN CUANTO el LLM la genera (streaming), en vez de esperar
 # la respuesta completa: la primera palabra suena varios segundos antes.
+# OJO: con backend="glm" el modelo ve tools en todos los turnos y la respuesta se
+# retiene hasta el final (para no hablar el preámbulo de un tool-call, "voy a pausar
+# la música..."); el adelanto de la primera palabra solo aplica a la charla del motor
+# local (turnos sin tools).
 stream_speak = true
 # Ventanas del WAKE: silencio de corte chico (400ms detecta "crotolamo" solo
 # casi al instante), pero tope AMPLIO para que "crotolamo pausa la música"
@@ -374,6 +415,10 @@ threshold = 0.72
 use_oww = true
 # M1: wake word dedicado con openWakeWord. 'crotolamo' no tiene modelo pre-entrenado,
 # así que se usa un modelo PUENTE soportado hasta entrenar uno propio.
+# Nombre de un modelo pre-entrenado (hey_jarvis, alexa...) o ruta a un .onnx propio.
+# La ruta admite ~ y $VARIABLES; si es relativa se busca desde el directorio actual y,
+# si ahí no está, desde la raíz del repo
+# (p.ej. "wakeword_training/my_custom_model/crotolamo.onnx").
 oww_model     = "hey_jarvis"
 oww_threshold = 0.5
 # Umbral de openWakeWord mientras suena música (mismo sondeo que
@@ -417,6 +462,8 @@ startup_timeout_s = 15
 #                   los que no confíes, usa "always".
 #   "always"      = pregunta siempre.
 #   "never"       = nunca pregunta (solo para servers de solo lectura y de fiar).
+#   Un valor desconocido (p.ej. el typo "allways") se trata como "always", con un
+#   WARNING en el log: un typo nunca BAJA la confirmación.
 confirm = "destructive"
 
 # Cada server es una TABLA NOMBRADA [mcp.servers.<nombre>] (no un array): así
@@ -425,8 +472,13 @@ confirm = "destructive"
 # (tabla opcional que se SUMA al entorno), cwd, timeout_s, startup_timeout_s,
 # confirm (mismos valores que arriba; pisa el global), keywords (lista para el
 # routing local; default: nombre del server + palabras de sus tools) y prefix
-# (default: el nombre del server).
+# (default: el nombre del server). Las keywords se comparan sin acentos ni mayúsculas
+# y al INICIO de palabra: "eco" entra con "eco" y "ecos", no con "seco".
 #
+# OJO (routing local): "archivo", "carpeta" y "documento" ya disparan el grupo nativo
+# `files` (8 tools = todo max_tools), que va primero en un empate: con Ollama estas
+# tools solo entran con una frase propia como "busca en documentos". Con GLM arriba
+# se ven siempre.
 # Ejemplo: el server de filesystem oficial, limitado a ~/Documentos.
 # [mcp.servers.archivos]
 # command  = ["npx", "-y", "@modelcontextprotocol/server-filesystem", "~/Documentos"]
