@@ -20,9 +20,15 @@ import time
 import wave
 from pathlib import Path
 
-from crotolamo.settings import get_settings
-from crotolamo.voice.stt import STT, VoiceUnavailable
-from crotolamo.voice.tts import TTS
+try:
+    from crotolamo.settings import get_settings
+    from crotolamo.voice.stt import STT, VoiceUnavailable
+    from crotolamo.voice.tts import TTS
+except ModuleNotFoundError:  # ejecutado como script suelto (launch.sh sin .venv)
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from crotolamo.settings import get_settings
+    from crotolamo.voice.stt import STT, VoiceUnavailable
+    from crotolamo.voice.tts import TTS
 
 FRASE = "crotolamo prueba uno dos tres"
 
@@ -44,27 +50,37 @@ def circular() -> int:
         print("FALLO: no encuentro la voz .onnx en", tts.voice_model)
         return 1
 
-    import numpy as np
-    from scipy.signal import resample_poly
+    # Lo que suelta la cadena sin ser un bug del smoke: un módulo que falta
+    # (piper, scipy -> ImportError; faster-whisper -> VoiceUnavailable) o un
+    # modelo que no carga/descarga (OSError). Antes salía traceback en vez de
+    # "FALLO: ...".
+    try:
+        import numpy as np
+        from scipy.signal import resample_poly
 
-    t0 = time.perf_counter()
-    pcm, src_rate = tts.synthesize_pcm(FRASE)
-    t_tts = time.perf_counter() - t0
-    if pcm.size == 0:
-        print("FALLO: Piper no produjo audio")
+        t0 = time.perf_counter()
+        pcm, src_rate = tts.synthesize_pcm(FRASE)
+        t_tts = time.perf_counter() - t0
+        if pcm.size == 0:
+            print("FALLO: Piper no produjo audio")
+            return 1
+
+        # Resamplea de la tasa de Piper (22050) a los 16 kHz que espera Whisper.
+        pcm16 = resample_poly(pcm.astype(np.float32), 16000, src_rate).astype(np.int16)
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as t:
+            wav_path = Path(t.name)
+        try:
+            _write_wav_16k(wav_path, pcm16)
+            t1 = time.perf_counter()
+            texto = stt.transcribe(wav_path)
+            t_stt = time.perf_counter() - t1
+        finally:
+            # También si el STT falla: el WAV temporal no se queda huérfano en /tmp.
+            wav_path.unlink(missing_ok=True)
+    except (VoiceUnavailable, ImportError, OSError) as error:
+        print("FALLO:", error)
         return 1
-
-    # Resamplea de la tasa de Piper (22050) a los 16 kHz que espera Whisper.
-    pcm16 = resample_poly(pcm.astype(np.float32), 16000, src_rate).astype(np.int16)
-
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as t:
-        wav_path = Path(t.name)
-    _write_wav_16k(wav_path, pcm16)
-
-    t1 = time.perf_counter()
-    texto = stt.transcribe(wav_path)
-    t_stt = time.perf_counter() - t1
-    wav_path.unlink(missing_ok=True)
 
     print(f"TTS dijo:      '{FRASE}'")
     print(f"STT devolvió:  '{texto}'")
@@ -80,10 +96,18 @@ def circular() -> int:
 def with_mic() -> int:
     settings = get_settings()
     stt = STT.from_settings(settings)
+    # sounddevice se importa aquí para poder NOMBRAR PortAudioError (sin
+    # micrófono o con [voice].input_device inválido), que no hereda de OSError:
+    # antes salía como traceback igual que el OSError de un libportaudio ausente.
+    try:
+        import sounddevice as sd
+    except (ImportError, OSError) as error:
+        print("FALLO: no puedo usar el micrófono:", error)
+        return 1
     print("Habla ahora, patrón (grabo hasta el silencio)...")
     try:
         texto = stt.listen_once(max_seconds=5)
-    except VoiceUnavailable as error:
+    except (VoiceUnavailable, ImportError, OSError, sd.PortAudioError) as error:
         print("FALLO:", error)
         return 1
     print(f"STT (micrófono) devolvió: '{texto}'")

@@ -22,6 +22,11 @@ import sys
 import wave
 from pathlib import Path
 
+try:
+    import crotolamo  # noqa: F401 — solo ubica el paquete; lo pesado se importa en cada comando
+except ModuleNotFoundError:  # ejecutado como script suelto (python3 sin `pip install -e`)
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 # Orden de tamaño para el veredicto: gana el MÁS chico que cumpla la regla.
 _SIZE_ORDER = ["tiny", "base", "small", "medium", "large-v3"]
 
@@ -109,20 +114,29 @@ def _bench_model(model_size: str, entries: list[dict], base_dir: Path) -> dict:
     import time
 
     from crotolamo.core.router import select_tool_names
+    from crotolamo.settings import get_settings
     from crotolamo.voice.stt import STT
     from crotolamo.voice.wake import strip_wake_word
 
-    # Idéntico a producción: language e initial_prompt por defecto.
-    stt = STT(model_size=model_size, sample_rate=16000)
+    # Idéntico a producción: el STT de la config (beam_size, sample_rate de
+    # [voice]; language e initial_prompt por defecto) con SOLO el modelo
+    # cambiado, y los hotwords que el listener pasa en cada comando. Sin ellos se
+    # medía otro decoder, justo en los nombres propios (Tletl, Huevonitis) que
+    # los hotwords existen para arreglar. model_size se lee al cargar el modelo
+    # (_get_model), así que cambiarlo antes del primer transcribe es seguro.
+    settings = get_settings()
+    stt = STT.from_settings(settings)
+    stt.model_size = model_size
+    hotwords = settings.voice.get("hotwords") or None
 
     # Warmup: carga el modelo y calienta int8 sin contaminar las mediciones.
-    stt.transcribe(base_dir / entries[0]["wav"])
+    stt.transcribe(base_dir / entries[0]["wav"], hotwords=hotwords)
 
     rows: list[dict] = []
     for entry in entries:
         wav_path = base_dir / entry["wav"]
         t0 = time.perf_counter()
-        texto = stt.transcribe(wav_path)
+        texto = stt.transcribe(wav_path, hotwords=hotwords)
         latency = time.perf_counter() - t0
 
         cmd = strip_wake_word(texto)

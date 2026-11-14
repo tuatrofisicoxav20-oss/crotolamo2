@@ -151,7 +151,11 @@ def _show_history(conversation: Conversation) -> None:
         tag = {"user": "Patrón", "assistant": "Crotolamo", "tool": "tool"}.get(msg.role, msg.role)
         content = msg.content
         if msg.role == "assistant" and msg.tool_calls and not content:
-            names = ", ".join(c.get("name", "?") for c in msg.tool_calls)
+            # ToolAgent guarda los tool_calls en formato Ollama (GLM se normaliza
+            # a lo mismo): el nombre va DENTRO de "function", no arriba.
+            names = ", ".join(
+                (c.get("function") or {}).get("name") or "?" for c in msg.tool_calls
+            )
             content = f"[pide tools: {names}]"
         print(f"  {tag}: {content}")
 
@@ -200,4 +204,12 @@ def run_shell(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(run_shell())
+    import sys
+
+    from crotolamo.logging_setup import setup_logging
+
+    # Como script (`python interfaces/shell.py --stream`) no se pasa por
+    # crotolamo.__main__: run_shell() a secas ignoraba --stream, y sin
+    # setup_logging los INFO se perdían y los WARNING salían sin formato.
+    setup_logging()
+    raise SystemExit(run_shell(sys.argv[1:]))

@@ -28,10 +28,17 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from pathlib import Path
 
-from crotolamo.settings import get_settings
-from crotolamo.voice.stt import VoiceUnavailable
-from crotolamo.voice.wakeword import _FRAME, _SAMPLE_RATE, WakeWordDetector
+try:
+    from crotolamo.settings import get_settings
+    from crotolamo.voice.stt import VoiceUnavailable
+    from crotolamo.voice.wakeword import _FRAME, _SAMPLE_RATE, WakeWordDetector
+except ModuleNotFoundError:  # ejecutado como script suelto (python3 sin `pip install -e`)
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from crotolamo.settings import get_settings
+    from crotolamo.voice.stt import VoiceUnavailable
+    from crotolamo.voice.wakeword import _FRAME, _SAMPLE_RATE, WakeWordDetector
 
 # Piso de reporte: por debajo de esto el score es silencio y no aporta a la
 # calibración (solo inundaría la terminal en la sesión de 10 min de §2).
@@ -57,7 +64,8 @@ def run(threshold: float | None, verbose: bool) -> int:
         sd = __import__("sounddevice")
         np = __import__("numpy")
         detector._get_model()  # carga aquí, para fallar ANTES de abrir el mic
-    except VoiceUnavailable as error:
+    except (VoiceUnavailable, ImportError, OSError) as error:
+        # ImportError: falta sounddevice/numpy; OSError: sounddevice sin libportaudio.
         print("FALLO:", error)
         return 1
 
@@ -134,6 +142,11 @@ def run(threshold: float | None, verbose: bool) -> int:
                     window_max = 0.0
     except KeyboardInterrupt:
         pass
+    except sd.PortAudioError as error:
+        # Sin micrófono o con [voice].input_device inválido. No hereda de OSError
+        # y salía como traceback en vez del "FALLO: ..." de los demás errores.
+        print("FALLO: el micrófono no respondió:", error)
+        return 1
 
     if in_activation:  # Ctrl+C a media activación
         activations.append(peak)

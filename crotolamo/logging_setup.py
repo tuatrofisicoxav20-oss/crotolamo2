@@ -34,9 +34,20 @@ def setup_logging(level: str | None = None) -> None:
     global _CONFIGURED
     if _CONFIGURED:
         return
-    lvl = (level or _resolve_level())
+    lvl = (level or _resolve_level()).upper()
+    # Solo NOMBRES de nivel de verdad. Con getattr(logging, lvl, INFO) un typo
+    # (CROTOLAMO_LOG=trace, `level = 10` en el toml) caía a INFO sin decir nada:
+    # el patrón pedía DEBUG y no había pista de por qué no salía. Y un nombre que
+    # sí es atributo de logging pero no un nivel (BASIC_FORMAT) llegaba tal cual
+    # a basicConfig, que reventaba al arrancar.
+    numeric = logging.getLevelNamesMapping().get(lvl)
     logging.basicConfig(
-        level=getattr(logging, lvl, logging.INFO),
+        level=logging.INFO if numeric is None else numeric,
         format="%(asctime)s %(name)s %(levelname)s: %(message)s",
     )
     _CONFIGURED = True
+    if numeric is None:
+        get_logger("logging").warning(
+            "nivel de log desconocido %r (CROTOLAMO_LOG o [logging].level); uso INFO. "
+            "Valen DEBUG, INFO, WARNING y ERROR.", lvl,
+        )

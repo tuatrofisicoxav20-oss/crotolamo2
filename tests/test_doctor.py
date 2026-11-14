@@ -96,7 +96,9 @@ def mundo(monkeypatch, tmp_path):
             raise resultado
         return _Resp(resultado)
 
-    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    # El doctor sondea con su propio opener SIN proxy (_urlopen), no con el
+    # urlopen global: es ESE el que hay que sustituir para no tocar la red.
+    monkeypatch.setattr(doctor, "_urlopen", urlopen)
 
     def pw_dump():
         if isinstance(m.pw, BaseException):
@@ -441,7 +443,9 @@ def test_stt_parakeet_con_modelo_en_disco(mundo, monkeypatch, tmp_path):
     assert _checks()["stt"].ok
 
 
-def test_tts_piper_ausente_presente_y_sin_json(mundo, tmp_path):
+def test_tts_piper_ausente_presente_y_sin_json(mundo, monkeypatch, tmp_path):
+    # El módulo instalado: aquí se prueba solo la voz en disco (sin él, `tts` es ❌).
+    monkeypatch.setitem(sys.modules, "piper", types.ModuleType("piper"))
     assert not _checks()["tts"].ok and "falta la voz Piper" in _checks()["tts"].detail
     onnx = tmp_path / "voices" / "es_MX-ald-medium.onnx"
     onnx.write_bytes(b"onnx")

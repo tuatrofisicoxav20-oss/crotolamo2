@@ -155,14 +155,38 @@ def _import_error(module: str) -> str | None:
     return _try_import(module)[1]
 
 
+def _urlopen(req: urllib.request.Request | str, timeout: float) -> Any:
+    """`urlopen` SIN proxy: la sonda va por el mismo camino de red que Crotolamo.
+
+    `urllib.request.urlopen` usa el opener global, que trae el ProxyHandler por
+    defecto (lee http_proxy/https_proxy del entorno). El runtime habla con la
+    nube y con Ollama por HTTPTransport (http.client), que va DIRECTO: con una
+    variable de proxy en el entorno los veredictos divergían (nube u Ollama en
+    rojo con Crotolamo conectando bien, o en verde cuando el runtime no sale).
+    ProxyHandler({}) lo sustituye por uno vacío, igual que _hass/_frigate.
+    Sustituible en tests.
+    """
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return opener.open(req, timeout=timeout)
+
+
 def _ollama_tags(host: str, timeout: float = NET_TIMEOUT_S) -> list[str] | None:
     """Devuelve la lista de modelos instalados, o None si Ollama no responde."""
     try:
-        with urllib.request.urlopen(f"{host}/api/tags", timeout=timeout) as resp:
+        with _urlopen(f"{host}/api/tags", timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         return [m.get("name", "") for m in data.get("models", [])]
     except (urllib.error.URLError, OSError, json.JSONDecodeError, TimeoutError):
         return None
+
+
+def _ollama_ref(model: str) -> str:
+    """Nombre de modelo tal como lo lista /api/tags: sin tag, Ollama usa `:latest`.
+
+    El tag es lo que sigue al último ':' del ÚLTIMO segmento: los ':' de antes
+    son el puerto de un registry (`localhost:5000/patron/modelo`), no un tag.
+    """
+    return model if ":" in model.rsplit("/", 1)[-1] else f"{model}:latest"
 
 
 def _model_ids(body: bytes) -> list[str] | None:
@@ -188,7 +212,7 @@ def _probe_cloud(base_url: str, model: str, key: str,
     url = f"{base_url.rstrip('/')}/models"
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}"})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _urlopen(req, timeout=timeout) as resp:
             body = resp.read()
     except urllib.error.HTTPError as error:
         if error.code in (401, 403):
@@ -419,7 +443,17 @@ def _check_stt(ctx: _Ctx) -> list[Check]:
 def _check_tts(ctx: _Ctx) -> list[Check]:
     model = str(ctx.doctor.get("tts_model") or "")
     if not model:
-        return [_piper_model_status(ctx.settings)]  # Piper es el TTS principal
+        # Piper es el TTS principal: además de la voz en disco, el módulo debe
+        # importar (igual que `stt` con el suyo). Sin piper-tts, TTS.speak falla
+        # en CADA frase y el asistente queda mudo; con solo mirar el .onnx este
+        # check requerido salía verde y el doctor decía "todo en orden".
+        piper = _piper_model_status(ctx.settings)
+        error = _import_error("piper") if piper.ok else None
+        if error:
+            fixes = [piper.fix, "pip install piper-tts  (o pip install -e '.[voice]')"]
+            return [Check("tts", False, f"{piper.detail}, pero no puedo importar piper: {error}",
+                          " | ".join(fix for fix in fixes if fix))]
+        return [piper]
 
     path = _ruta(model)
     if not path.exists():
@@ -530,7 +564,10 @@ def _check_ollama(ctx: _Ctx) -> list[Check]:
     if tags is None:
         return [Check("ollama", False, f"no responde en {host} ({rol})",
                       "Arranca el servicio: `ollama serve` (o systemctl start ollama).")]
-    has_model = any(t == model or t.split(":")[0] == model.split(":")[0] for t in tags)
+    # Nombre COMPLETO, con su tag: comparar solo la base daba por instalado
+    # `qwen2.5-coder:7b` teniendo `qwen2.5-coder:1.5b`, y /api/chat respondía 404
+    # en cada turno con este check (requerido si Ollama es el motor) en verde.
+    has_model = _ollama_ref(model) in {_ollama_ref(t) for t in tags}
     return [
         Check("ollama", True, f"responde en {host} ({rol})"),
         Check("modelo", has_model,
