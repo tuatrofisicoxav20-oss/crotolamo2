@@ -246,12 +246,35 @@ def test_modulos_puros_sin_gi():
 
 
 def test_rutas_ipc_compartidas():
-    # una sola fuente de verdad para las rutas del contrato
+    # nombres del contrato en el lado desktop/ (HUD y panel comparten ipc.py);
+    # que coincidan con los del loop lo fija tests/test_auditoria_desktop_py.py
     assert ipc.HUD_STATE_FILE.name == "hud_state.json"
     assert ipc.CONTROL_FILE.name == "control.json"
     assert ipc.HUD_STATE_FILE.parent == ipc.CONTROL_FILE.parent
 
 
-def test_os_replace_disponible():
-    # write_listening_enabled depende de os.replace atómico
-    assert callable(os.replace)
+def test_write_listening_enabled_reemplaza_con_os_replace(tmp_path, monkeypatch):
+    # Atómico DE VERDAD: el control solo cambia con os.replace desde un temporal
+    # ya completo del mismo directorio (el loop nunca lee un archivo a medias).
+    control = tmp_path / "control.json"
+    monkeypatch.setattr(ipc, "CONTROL_FILE", control)
+    config.write_listening_enabled(True)
+
+    vistos = []
+    real_replace = os.replace
+
+    def espiando(src, dst):
+        vistos.append((Path(src), Path(dst), json.loads(Path(src).read_text()),
+                       json.loads(control.read_text())))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", espiando)
+    config.write_listening_enabled(False)
+
+    assert len(vistos) == 1
+    src, dst, en_el_temporal, en_el_destino = vistos[0]
+    assert dst == control
+    assert src != control and src.parent == control.parent
+    assert en_el_temporal == {"listening_enabled": False}
+    assert en_el_destino == {"listening_enabled": True}  # intacto hasta el replace
+    assert json.loads(control.read_text()) == {"listening_enabled": False}

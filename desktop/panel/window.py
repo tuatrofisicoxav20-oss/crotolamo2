@@ -2,8 +2,10 @@
 
 Rendimiento: query_state() (subprocess systemctl, hasta 8 s de timeout) corre
 en un hilo daemon y entrega el resultado con GLib.idle_add — el hilo GTK nunca
-se bloquea. El tick periódico se suspende cuando la ventana está desmapeada
-(señales map/unmap) y se reanuda al mostrarse.
+se bloquea; igual las acciones (systemd._do_async) y el journalctl de respaldo.
+El tick periódico vive entre las señales map/unmap (ocultar o destruir la
+ventana lo para; minimizarla NO, GTK3 no desmapea al minimizar) y un tick con el
+mismo estado no repinta nada.
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ from __future__ import annotations
 import logging
 import subprocess
 import threading
+import time
 
 import gi
 
@@ -28,12 +31,30 @@ from .config import (  # noqa: E402
     write_listening_enabled,
     write_mode_args,
 )
-from .systemd import SERVICE, _do_async, _uptime_text, query_state, run  # noqa: E402
+from .systemd import (  # noqa: E402
+    QUERY_ERROR,
+    SERVICE,
+    _do_async,
+    _first_line,
+    _uptime_text,
+    query_state,
+    run,
+)
 from .terminal import _find_terminal  # noqa: E402
 
 log = logging.getLogger("crotolamo.desktop.panel")
 
 POLL_MS = 1500
+
+# Lo que el patrón acaba de pedir con un switch se sostiene hasta que el estado
+# publicado lo confirme o pasen HOLD_S segundos. El loop sondea control.json
+# cada ~0.3 s (y `systemctl enable` también tarda): un tick, o una consulta ya
+# en vuelo, que caía antes repintaba el valor viejo y el switch rebotaba ~1.5 s.
+# Pasado el plazo manda lo publicado: el switch nunca miente por mucho tiempo.
+HOLD_S = 3.0
+
+# (valor pedido, plazo monotónico; None = sin plazo: su systemctl aún corre)
+_Hold = tuple[bool, float | None]
 
 CSS = b"""
 .crot-card { padding: 14px 18px 18px 18px; }
@@ -80,6 +101,26 @@ _HALO_CLASSES = ("state-on", "state-wait", "state-off", "state-fail")
 _BIG_CLASSES = ("go", "stop")
 
 
+def _state_key(st: dict[str, str]) -> tuple[str, ...]:
+    """Lo que identifica un estado del servicio (sin el uptime, que avanza solo)."""
+    return tuple(st.get(k, "") for k in
+                 ("LoadState", "ActiveState", "SubState", "UnitFileState", QUERY_ERROR))
+
+
+def _resolve_hold(hold: _Hold | None, real: bool) -> tuple[bool, _Hold | None]:
+    """(lo que muestra el switch, hold que sigue) dado el valor real publicado."""
+    if hold is None:
+        return real, None
+    wanted, deadline = hold
+    if deadline is None:
+        # su systemctl aún corre: ni un estado que «ya coincide» vale (ON y OFF
+        # seguidos: el `enable` en vuelo todavía puede cambiarlo)
+        return wanted, hold
+    if wanted == real or time.monotonic() >= deadline:
+        return real, None
+    return wanted, hold
+
+
 class Panel(Gtk.ApplicationWindow):
     def __init__(self, app: Gtk.Application) -> None:
         super().__init__(application=app, title="Crotolamo")
@@ -97,6 +138,19 @@ class Panel(Gtk.ApplicationWindow):
         # último estado conocido del servicio; los callbacks de botones lo usan
         # en vez de consultar systemctl de forma síncrona en el hilo GTK.
         self._last_state: dict[str, str] = {}
+        # Fallo de la última acción (start/enable…): (estado en que falló, motivo).
+        # Se ve en el subtítulo hasta otra acción o hasta que el estado cambie.
+        self._action_error: tuple[tuple[str, ...], str] | None = None
+        # Lo último que el patrón pidió con cada switch, hasta que se confirme
+        # (ver HOLD_S y _resolve_hold).
+        self._listen_hold: _Hold | None = None
+        self._autostart_hold: _Hold | None = None
+        self._log_inflight = False
+        # Lo último pintado en halo/icono y botón grande: repintar lo mismo cada
+        # tick no es gratis (swap_class reestiliza, set_from_icon_name recarga el
+        # icono y Button.set_label rehace su etiqueta hija; todo pide relayout).
+        self._visual: tuple[str, str] | None = None
+        self._big_look: tuple[str, str] | None = None
 
         # --- barra de titulo minimalista (nativa GNOME) ---
         header = Gtk.HeaderBar(title="Crotolamo")
@@ -132,6 +186,11 @@ class Panel(Gtk.ApplicationWindow):
 
         self.sub = Gtk.Label(label="")
         self.sub.get_style_context().add_class("crot-sub")
+        # el motivo de un fallo de systemctl es una línea larga: que parta en
+        # varias en vez de ensanchar la ventana
+        self.sub.set_line_wrap(True)
+        self.sub.set_max_width_chars(44)
+        self.sub.set_justify(Gtk.Justification.CENTER)
         box.pack_start(self.sub, False, False, 0)
 
         # boton grande encender/apagar
@@ -199,8 +258,8 @@ class Panel(Gtk.ApplicationWindow):
 
         apply_css(self.get_screen(), CSS)
 
-        # el tick vive atado a la visibilidad real de la ventana: mientras esté
-        # desmapeada (cerrada/minimizada a nada) no se consulta systemctl.
+        # el tick vive atado al mapeo de la ventana: oculta o destruida no se
+        # consulta systemctl (minimizar no desmapea en GTK3: ahí sigue).
         self.connect("map", self._on_map)
         self.connect("unmap", self._on_unmap)
         self.show_all()
@@ -241,59 +300,126 @@ class Panel(Gtk.ApplicationWindow):
 
     # --- pintado del estado -----------------------------------------------------
     def _set_visual(self, halo_class: str, icon_name: str) -> None:
+        if self._visual == (halo_class, icon_name):
+            return  # igual que el tick anterior (ver __init__)
+        self._visual = (halo_class, icon_name)
         swap_class(self.halo.get_style_context(), _HALO_CLASSES, halo_class)
         self.icon.set_from_icon_name(icon_name, Gtk.IconSize.DIALOG)
         self.icon.set_pixel_size(64)
 
     def _set_big(self, label: str, cls: str) -> None:
+        if self._big_look == (label, cls):
+            return
+        self._big_look = (label, cls)
         swap_class(self.big.get_style_context(), _BIG_CLASSES, cls)
         self.big.set_label(label)
+
+    @staticmethod
+    def _set_text(label: Gtk.Label, text: str) -> None:
+        """set_label solo si cambia: en GTK3 cada set_label rehace el layout.
+
+        Compara con lo que la etiqueta muestra DE VERDAD (no con una caché): así
+        lo que escriben los clics («Arrancando…») se corrige en el siguiente tick.
+        """
+        if label.get_label() != text:
+            label.set_label(text)
 
     def _apply_state(self, st: dict[str, str]) -> None:
         active = st.get("ActiveState", "unknown")
         sub = st.get("SubState", "")
         unit_state = st.get("UnitFileState", "")
+        query_error = st.get(QUERY_ERROR)
 
         # interruptor "iniciar con la sesion" sin disparar el callback
         self._syncing = True
-        self.autostart.set_active(unit_state == "enabled")
+        if query_error is None:
+            # sin respuesta de systemd no se adivina «no arranca con la sesión»
+            shown, self._autostart_hold = _resolve_hold(self._autostart_hold,
+                                                        unit_state == "enabled")
+            self.autostart.set_active(shown)
         # reflejar el modo guardado en el env file (lectura cacheada por mtime)
         cur_key = KEY_BY_ARGS.get(read_mode_args(), "half")
         if self.mode.get_active_id() != cur_key:
             self.mode.set_active_id(cur_key)
         # reflejar el estado REAL de la escucha (lo que publica el loop), no lo
         # que el panel cree; así el switch no miente si cambia desde otro lado.
-        self.listen_sw.set_active(read_listening_enabled())
+        # Salvo un clic recién hecho que el loop aún no recogió (HOLD_S).
+        shown, self._listen_hold = _resolve_hold(self._listen_hold,
+                                                 read_listening_enabled())
+        self.listen_sw.set_active(shown)
         self._syncing = False
         # Pausar la escucha solo tiene sentido con el servicio corriendo.
         self.listen_sw.set_sensitive(active == "active")
 
-        if active == "active":
+        if query_error is not None:
+            # systemctl no contestó (sin bus de usuario, timeout): NO es «Apagado»
+            self._set_visual("state-fail", "microphone-hardware-disabled-symbolic")
+            status, subtitle = "Desconocido", f"no pude consultar systemd: {query_error}"
+            self._set_big("…", "stop")
+            big_ok = False
+        elif active == "active":
             self._set_visual("state-on", "microphone-sensitivity-high-symbolic")
-            self.status.set_label("Escuchando")
-            self.sub.set_label(_uptime_text(st))
+            status, subtitle = "Escuchando", _uptime_text(st)
             self._set_big("⏻   APAGAR", "stop")
-            self.big.set_sensitive(True)
+            big_ok = True
         elif active in ("activating", "reloading", "deactivating"):
             self._set_visual("state-wait", "microphone-sensitivity-medium-symbolic")
-            self.status.set_label("Arrancando…" if active == "activating" else "Cambiando…")
-            self.sub.set_label("cargando modelos de voz")
+            status = "Arrancando…" if active == "activating" else "Cambiando…"
+            subtitle = "cargando modelos de voz"
             self._set_big("…", "stop")
-            self.big.set_sensitive(False)
+            big_ok = False
         elif active == "failed" or sub == "failed":
             self._set_visual("state-fail", "microphone-hardware-disabled-symbolic")
-            self.status.set_label("Error")
-            self.sub.set_label("revisa «Ver registro»")
+            status, subtitle = "Error", "revisa «Ver registro»"
             self._set_big("⏻   ENCENDER", "go")
-            self.big.set_sensitive(True)
+            big_ok = True
+        elif st.get("LoadState") == "not-found":
+            # systemd no conoce la unit (panel abierto antes de install.sh o tras
+            # desinstalar): salía «Apagado» y ENCENDER no hacía nada
+            self._set_visual("state-off", "microphone-disabled-symbolic")
+            status, subtitle = "No instalado", "ejecuta desktop/install.sh"
+            self._set_big("⏻   ENCENDER", "go")
+            big_ok = False
         else:  # inactive / dead / unknown
             self._set_visual("state-off", "microphone-disabled-symbolic")
-            self.status.set_label("Apagado")
-            self.sub.set_label("Crotolamo no está escuchando")
+            status, subtitle = "Apagado", "Crotolamo no está escuchando"
             self._set_big("⏻   ENCENDER", "go")
-            self.big.set_sensitive(True)
+            big_ok = True
+
+        if self._action_error is not None:
+            if self._action_error[0] == _state_key(st):
+                subtitle = self._action_error[1]
+            else:
+                self._action_error = None  # el servicio cambió: el aviso ya no aplica
+        self._set_text(self.status, status)
+        self._set_text(self.sub, subtitle)
+        self.big.set_sensitive(big_ok)
 
     # --- acciones -------------------------------------------------------------
+    def _systemctl(self, *args: str) -> None:
+        """Lanza `systemctl --user <args>` en un hilo; si falla, el panel lo dice."""
+        self._action_error = None
+        _do_async(*args,
+                  on_done=lambda res: GLib.idle_add(self._on_action_done, args, res))
+
+    def _on_action_done(self, args: tuple[str, ...],
+                        res: subprocess.CompletedProcess) -> bool:
+        hold = self._autostart_hold
+        if (args[0] in ("enable", "disable") and hold is not None
+                and hold[0] == (args[0] == "enable")):
+            # el resultado de la acción vigente (no de una ya superada): si
+            # falló, el switch vuelve ya a la verdad; si no, se sostiene hasta
+            # que una consulta posterior lo confirme o venza el plazo
+            self._autostart_hold = ((hold[0], time.monotonic() + HOLD_S)
+                                    if res.returncode == 0 else None)
+        if res.returncode != 0:
+            reason = (_first_line(res.stderr)
+                      or f"systemctl {args[0]} falló (código {res.returncode})")
+            self._action_error = (_state_key(self._last_state), reason)
+            # repintar ya: devuelve el estado real (no «Arrancando…») con el motivo
+            self._apply_state(self._last_state)
+        return False  # idle-callback de un solo uso
+
     def _soon_refresh(self) -> None:
         GLib.timeout_add(600, self._refresh_once)
 
@@ -304,16 +430,16 @@ class Panel(Gtk.ApplicationWindow):
     def on_toggle(self, _btn: Gtk.Button) -> None:
         # usa el último estado conocido: nada de systemctl síncrono en el clic
         if self._last_state.get("ActiveState", "") == "active":
-            _do_async("stop", SERVICE)
+            self._systemctl("stop", SERVICE)
             self.status.set_label("Apagando…")
         else:
-            _do_async("start", SERVICE)
+            self._systemctl("start", SERVICE)
             self.status.set_label("Arrancando…")
             self.big.set_sensitive(False)
         self._soon_refresh()
 
     def on_restart(self, _btn: Gtk.Button) -> None:
-        _do_async("restart", SERVICE)
+        self._systemctl("restart", SERVICE)
         self.status.set_label("Reiniciando…")
         self.big.set_sensitive(False)
         self._soon_refresh()
@@ -327,24 +453,30 @@ class Panel(Gtk.ApplicationWindow):
         write_mode_args(ARGS_BY_KEY[key])
         # si está escuchando, reiniciar para aplicar el nuevo modo
         if self._last_state.get("ActiveState") == "active":
-            _do_async("restart", SERVICE)
+            self._systemctl("restart", SERVICE)
             self.status.set_label("Aplicando modo…")
             self._soon_refresh()
 
     def on_autostart(self, switch: Gtk.Switch, _param) -> None:
         if self._syncing:
             return
+        # sin plazo mientras su systemctl corre (`enable` puede tardar segundos;
+        # run() lo corta a los 8 s y _on_action_done llega siempre)
+        self._autostart_hold = (switch.get_active(), None)
         if switch.get_active():
-            _do_async("enable", SERVICE)
+            self._systemctl("enable", SERVICE)
         else:
-            _do_async("disable", SERVICE)
+            self._systemctl("disable", SERVICE)
 
     def on_listen_toggle(self, switch: Gtk.Switch, _param) -> None:
         if self._syncing:
             return
-        # Escribe el flag; el loop lo sondea (~3x/s) y el próximo refresh lee de
-        # vuelta el estado real publicado, así que no forzamos nada aquí.
-        write_listening_enabled(switch.get_active())
+        # Escribe el flag; el loop lo sondea (~3x/s) y publica el estado real,
+        # que los refresh leen de vuelta. Hasta que llegue, el switch se queda
+        # donde lo puso el patrón (si no se pudo escribir, nada que sostener).
+        enabled = switch.get_active()
+        self._listen_hold = ((enabled, time.monotonic() + HOLD_S)
+                             if write_listening_enabled(enabled) else None)
 
     def on_log(self, _btn: Gtk.Button) -> None:
         cmd = ["journalctl", "--user", "-u", SERVICE, "-n", "200", "-f"]
@@ -355,9 +487,21 @@ class Panel(Gtk.ApplicationWindow):
                 return
             except Exception as exc:  # noqa: BLE001
                 log.warning("No se pudo abrir la terminal %s: %s", term, exc)
-        # sin terminal: mostrar las ultimas lineas en un dialogo
+        # sin terminal: las últimas líneas en un diálogo. journalctl (hasta 8 s de
+        # timeout) va en un hilo: en el hilo GTK congelaba la ventana mientras.
+        if self._log_inflight:
+            return  # doble clic: un solo journalctl y un solo diálogo
+        self._log_inflight = True
+        threading.Thread(target=self._log_worker, daemon=True).start()
+
+    def _log_worker(self) -> None:
         res = run(["journalctl", "--user", "-u", SERVICE, "-n", "200", "--no-pager"])
-        self._show_text("Registro de Crotolamo", res.stdout or res.stderr or "(vacío)")
+        GLib.idle_add(self._on_log_ready, res.stdout or res.stderr or "(vacío)")
+
+    def _on_log_ready(self, text: str) -> bool:
+        self._log_inflight = False
+        self._show_text("Registro de Crotolamo", text)
+        return False  # idle-callback de un solo uso
 
     def _show_text(self, title: str, text: str) -> None:
         dlg = Gtk.Dialog(title=title, transient_for=self, modal=True)

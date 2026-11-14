@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import stat
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,44 @@ MODES: list[tuple[str, str, str]] = [
 ]
 ARGS_BY_KEY = {k: a for k, _, a in MODES}
 KEY_BY_ARGS = {a: k for k, _, a in MODES}
+
+# Prefijo de la línea del modo en ENV_FILE (lectura y escritura usan el mismo).
+_MODE_KEY = "CROTOLAMO_LISTEN_ARGS="
+
+
+def _is_mode_line(line: str) -> bool:
+    return line.strip().startswith(_MODE_KEY)
+
+
+def _replace_atomically(path: Path, data: bytes) -> None:
+    """Escribe `data` en `path` de forma ATÓMICA (temporal del mismo dir + os.replace).
+
+    Quien lea (el loop, o systemd al arrancar el servicio) ve el archivo viejo o
+    el nuevo entero, nunca uno vacío o a medias. Si `path` ya existía conserva sus
+    permisos (mkstemp crea con 0600). Si algo falla no queda temporal huérfano y
+    el error se propaga: quien llama lo registra.
+    """
+    if path.is_symlink():
+        # dotfiles con stow/chezmoi: se reemplaza el DESTINO; os.replace sobre el
+        # enlace lo cambiaría por un archivo suelto y rompería el enlace
+        path = path.resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        try:
+            os.chmod(tmp, stat.S_IMODE(path.stat().st_mode))
+        except FileNotFoundError:
+            pass
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError as exc:
+            log.debug("No se pudo borrar el temporal %s: %s", tmp, exc)
+        raise
+
 
 # --- caché por mtime: releer solo si el archivo cambió -------------------------
 
@@ -61,8 +100,7 @@ def _read_cached(path: Path, reader) -> Any:
 def _parse_mode_args(path: Path) -> str:
     try:
         for line in path.read_text().splitlines():
-            line = line.strip()
-            if line.startswith("CROTOLAMO_LISTEN_ARGS="):
+            if _is_mode_line(line):
                 return line.split("=", 1)[1].strip().strip('"').strip("'")
     except FileNotFoundError:
         pass
@@ -78,11 +116,37 @@ def read_mode_args() -> str:
 
 
 def write_mode_args(args: str) -> None:
+    """Guarda el modo en ENV_FILE tocando SOLO la línea CROTOLAMO_LISTEN_ARGS.
+
+    El servicio carga el archivo ENTERO (EnvironmentFile=): cualquier otra línea
+    (CROTOLAMO_LOG=DEBUG, un comentario) es del usuario y antes se perdía al
+    elegir modo. Sin la línea, se añade al final. Si el archivo existe pero no se
+    puede leer, no se pisa a ciegas: solo se registra.
+    """
+    path = ENV_FILE
     try:
-        ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
-        ENV_FILE.write_text(f"CROTOLAMO_LISTEN_ARGS={args}\n")
+        try:
+            # bytes + surrogateescape: lo que no sea UTF-8 vuelve al disco tal cual
+            old = path.read_bytes().decode("utf-8", "surrogateescape")
+        except FileNotFoundError:
+            old = ""
+        if old and not old.endswith("\n"):
+            old += "\n"
+        lines = old.split("\n")[:-1]
+        new_line = f"{_MODE_KEY}{args}"
+        found = False
+        for i, line in enumerate(lines):
+            if _is_mode_line(line):
+                # systemd se queda con la ÚLTIMA asignación y el panel lee la
+                # PRIMERA: todas llevan el valor nuevo para que digan lo mismo
+                lines[i] = new_line + ("\r" if line.endswith("\r") else "")
+                found = True
+        if not found:
+            lines.append(new_line)
+        data = "".join(f"{line}\n" for line in lines)
+        _replace_atomically(path, data.encode("utf-8", "surrogateescape"))
     except Exception as exc:  # noqa: BLE001
-        log.warning("No se pudo escribir %s: %s", ENV_FILE, exc)
+        log.warning("No se pudo escribir %s: %s", path, exc)
 
 
 # --- helpers del canal de pausa de escucha (panel <-> loop) -------------------
@@ -104,25 +168,18 @@ def read_listening_enabled() -> bool:
     return _read_cached(path, lambda: _parse_listening_enabled(path))
 
 
-def write_listening_enabled(enabled: bool) -> None:
+def write_listening_enabled(enabled: bool) -> bool:
     """Escribe el flag de control de forma ATÓMICA (tmp + os.replace).
 
     El loop nunca debe leer un archivo a medias; cualquier error de E/S solo se
-    registra (no revienta la UI).
+    registra (no revienta la UI). Devuelve si quedó escrito: el panel solo
+    sostiene el switch en lo pedido si el loop de verdad lo va a leer.
     """
     control = ipc.CONTROL_FILE
     try:
-        control.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=control.parent, suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump({"listening_enabled": enabled}, f)
-        except Exception:  # noqa: BLE001
-            try:
-                os.unlink(tmp)
-            except OSError as exc:
-                log.debug("No se pudo borrar el temporal %s: %s", tmp, exc)
-            raise
-        os.replace(tmp, control)
+        data = json.dumps({"listening_enabled": enabled}).encode("utf-8")
+        _replace_atomically(control, data)
     except Exception as exc:  # noqa: BLE001
         log.warning("No se pudo escribir %s: %s", control, exc)
+        return False
+    return True

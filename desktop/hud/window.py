@@ -16,12 +16,13 @@ import gi
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
-from gi.repository import Gdk, Gio, GLib, Gtk  # noqa: E402
+gi.require_version("Pango", "1.0")
+from gi.repository import Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
 
 from common.gtk_util import apply_css, swap_class  # noqa: E402
 from common.ipc import HUD_STATE_FILE  # noqa: E402
 
-from .state import extract_mode, extract_text, read_hud_file  # noqa: E402
+from .state import extract_mode, extract_text, publisher_alive, read_hud_file  # noqa: E402
 from .style import CSS, MODE_ICONS, MODE_LABELS  # noqa: E402
 
 log = logging.getLogger("crotolamo.desktop.hud")
@@ -45,6 +46,7 @@ BACKUP_POLL_MS = 2000  # poll de respaldo lento cuando el FileMonitor funciona
 FADE_STEPS = 12        # pasos del fade-in/out
 FADE_STEP_MS = 25      # ms entre pasos → fade total ~300 ms
 HIDE_AFTER_IDLE_MS = 1500  # ms visibles tras volver a idle
+TEXT_MAX_LINES = 3     # líneas del texto; lo que no cabe se corta con "…"
 
 DEMO_CYCLE_MODES = ["listening", "thinking", "speaking", "idle"]
 DEMO_STEP_MS = 2500    # ms entre modos en --demo
@@ -191,6 +193,11 @@ class HUDWindow(Gtk.Window):
         self._text_label.set_halign(Gtk.Align.CENTER)
         self._text_label.set_line_wrap(True)
         self._text_label.set_max_width_chars(40)
+        # Tope de líneas: el loop publica la respuesta ENTERA del LLM y, sin
+        # tope, una respuesta larga era un bloque siempre-encima de media
+        # pantalla mientras se hablaba. set_lines solo actúa con wrap + ellipsize.
+        self._text_label.set_lines(TEXT_MAX_LINES)
+        self._text_label.set_ellipsize(Pango.EllipsizeMode.END)
         self._text_label.set_justify(Gtk.Justification.CENTER)
         self._card.pack_start(self._text_label, False, False, 0)
 
@@ -339,7 +346,12 @@ class HUDWindow(Gtk.Window):
         if mode != "idle":
             # convocado: cancelar hide pendiente y aparecer con fade-in
             self._cancel_hide_timer()
-            if self.get_opacity() < 0.99:
+            # Un fade-out YA ARMADO también cuenta: entre _start_fade_out() y su
+            # primer paso (FADE_STEP_MS) la opacidad sigue en 1.0 y, mirando
+            # solo la opacidad, nadie lo cancelaba: el HUD se desvanecía y
+            # quedaba oculto con el loop en pleno "escuchando".
+            fading_out = self._fade_timer_id is not None and not self._fading_in
+            if fading_out or self.get_opacity() < 0.99:
                 self._start_fade_in()
         else:
             # volvió a reposo: programar ocultamiento en 1.5 s
@@ -399,7 +411,13 @@ class HUDWindow(Gtk.Window):
     def _read_state_once(self) -> bool:
         """Lee hud_state.json y aplica la transición; usable como idle-callback."""
         data = read_hud_file(HUD_STATE_FILE)
-        self._transition_to(extract_mode(data), extract_text(data))
+        mode = extract_mode(data)
+        # Solo un modo activo pregunta por el pid (idle no necesita probar nada).
+        # Si el loop murió sin su idle final, se aplica el idle que no llegó a
+        # escribir; con el HUD visible el poll de respaldo lo nota en <=2 s.
+        if mode != "idle" and not publisher_alive(data):
+            mode, data = "idle", {}
+        self._transition_to(mode, extract_text(data))
         return False  # no repetir (para GLib.idle_add)
 
     def _poll_tick(self) -> bool:

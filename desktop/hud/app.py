@@ -8,14 +8,21 @@ import sys
 import gi
 
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gtk  # noqa: E402
+from gi.repository import Gio, Gtk  # noqa: E402
 
 from .window import HUDWindow  # noqa: E402
 
 
 class HUDApp(Gtk.Application):
     def __init__(self, demo: bool = False) -> None:
-        super().__init__(application_id="org.crotolamo.HUD")
+        kwargs = {"application_id": "org.crotolamo.HUD"}
+        if demo:
+            # --demo NO negocia instancia única: con el HUD del servicio ya
+            # corriendo (mismo id en el bus de sesión) el segundo proceso solo
+            # le reenviaba `activate` al primero —que no hace nada— y salía con
+            # 0 sin mostrar el demo. El HUD normal sigue siendo instancia única.
+            kwargs["flags"] = Gio.ApplicationFlags.NON_UNIQUE
+        super().__init__(**kwargs)
         self._demo = demo
         self._win: HUDWindow | None = None
 
