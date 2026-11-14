@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from time import monotonic as _monotonic
 from typing import Any, Callable
@@ -41,6 +42,7 @@ from crotolamo.voice.state import (
     read_control_enabled,
 )
 from crotolamo.voice.stt import STT, VoiceUnavailable, warm_vad
+from crotolamo.voice.threads import WakePreconnect
 from crotolamo.voice.tts import TTS, StreamSpeaker, _AvisoEnFraseAparte
 from crotolamo.voice.vad import DEFAULTS
 from crotolamo.voice.wakeword import WakeWordDetector
@@ -515,6 +517,15 @@ class _Reintentos:
         return primero, nuevo, espera
 
 
+def _avisar_wake(on_wake: Callable[[], None]) -> None:
+    """El aviso del wake (on_wake de _run_simple_loop) desde la grabación de la
+    orden: un fallo suyo no toca la orden, queda en DEBUG."""
+    try:
+        on_wake()
+    except Exception as error:  # noqa: BLE001 - es una optimización
+        log.debug("el aviso del wake falló: %s", error)
+
+
 def _log_heard(heard: str, threshold: float, variants: Any, activated: bool) -> None:
     """Diagnóstico del wake difuso sin volcar al journal lo que se habla en casa.
 
@@ -552,6 +563,7 @@ def _run_simple_loop(
     ducker: Ducker | None = None,
     pregate: _PreFiltro | None = None,
     mic: MicSession | None = None,
+    on_wake: Callable[[], None] | None = None,
 ) -> int:
     """Bucle secuencial clásico (--simple o sin openWakeWord): espera el wake,
     graba la orden, la atiende y vuelve a esperar. Extraído de run_listen para
@@ -572,9 +584,21 @@ def _run_simple_loop(
     decodificando el wake o la primera parte de una orden, el atenuado de la
     música); lo que el stream cerrado tampoco oía a propósito (Crotolamo
     hablando, la guarda tras responder, la pausa del panel) se tira o se cierra.
+
+    on_wake (el WakePreconnect del agente, ver _listen_with_warmer): se llama con
+    la 1ª voz de la orden que viene DETRÁS de un wake aceptado (no pegada al wake,
+    ni en la ventana de followup): el motor pre-conecta mientras el patrón la
+    dice. Un falso wake (el wake y silencio) no avisa. Debe volver al instante; su
+    dueño es quien lo pasa. None = nada, lo de siempre.
     """
     # Sin sesión, las grabaciones reciben exactamente los argumentos de siempre.
     fuente: dict[str, Any] = {} if mic is None else {"source": mic}
+    # El aviso del wake viaja con la grabación de la orden (on_voice del STT) y
+    # sale con su 1ª voz: antes salía con el wake y cada falso wake abría con la
+    # nube una conexión (TCP+TLS, vivo 30 s) que ninguna petición usaba. Mismo
+    # criterio que el oído concurrente (EarThread). Sin aviso, nada cambia.
+    voz_de_la_orden: dict[str, Any] = {} if on_wake is None else {
+        "on_voice": partial(_avisar_wake, on_wake)}
 
     def descartar_captura() -> None:
         """Lo capturado hasta aquí no es del patrón (la voz de Crotolamo, la
@@ -582,20 +606,23 @@ def _run_simple_loop(
         if mic is not None:
             mic.flush()
 
-    def listen_command(start_timeout_s: float = cfg.command_start_timeout_s) -> str:
+    def listen_command(start_timeout_s: float = cfg.command_start_timeout_s,
+                       **aviso: Any) -> str:
         # min_audio_s: si nadie habló, NO se transcribe el silencio (Whisper
         # paddea a 30s; eso costaba ~1s de mic sordo por ventana vacía).
+        # aviso: voz_de_la_orden, solo en la orden tras el wake.
         if cfg.smart_endpoint:
             return stt.listen_smart(
                 silence_ms=cfg.silence_ms, start_timeout_s=start_timeout_s,
                 rounds=cfg.endpoint_rounds, continue_timeout_s=cfg.endpoint_continue_s,
-                hotwords=cfg.hotwords, min_audio_s=cfg.min_audio_s, **fuente,
+                hotwords=cfg.hotwords, min_audio_s=cfg.min_audio_s, **fuente, **aviso,
             )
         # hotwords también aquí: sin endpointing inteligente la orden sigue
         # siendo un COMANDO (post-wake) y lleva el mismo sesgo que en la rama
         # smart y en el loop concurrente.
         return stt.listen_once(silence_ms=cfg.silence_ms, start_timeout_s=start_timeout_s,
-                               hotwords=cfg.hotwords, min_audio_s=cfg.min_audio_s, **fuente)
+                               hotwords=cfg.hotwords, min_audio_s=cfg.min_audio_s, **fuente,
+                               **aviso)
 
     def atender(command: str, on_token: Callable[[str], None] | None = None) -> tuple[str, bool]:
         """agent.handle_turn que no propaga: devuelve (respuesta, reventó).
@@ -756,7 +783,10 @@ def _run_simple_loop(
                     elif cfg.ack != "off":
                         tts.beep()
                         print("Te escucho, patrón.", flush=True)
-                    command = listen_command()
+                    # La orden viene detrás: mientras se dice, el handshake con la
+                    # nube sale del turno (voz_de_la_orden). Con la orden pegada al
+                    # wake el turno empieza ya: no hay rato que aprovechar.
+                    command = listen_command(**voz_de_la_orden)
 
                 if not command.strip():
                     say("No te escuché claro, patrón.")
@@ -1443,6 +1473,13 @@ def _listen_with_warmer(settings: Any, cfg: ListenerConfig, tts: TTS, warmer: _W
     if sesion is not None:
         sesion_mic.append(sesion)
         con_sesion = {"mic": sesion}
+    # El aviso del wake: con un motor que sabe pre-conectar (GLM), el handshake con
+    # la nube se paga mientras el patrón dice la orden. Este bloque es su dueño: al
+    # salir espera, acotado, a la pre-conexión que siga en curso. Sin un motor así,
+    # el loop recibe los argumentos de siempre.
+    preconexion = WakePreconnect.del_agente(agent)
+    if preconexion is not None:
+        con_sesion["on_wake"] = preconexion
 
     try:
         return _run_simple_loop(
@@ -1452,6 +1489,8 @@ def _listen_with_warmer(settings: Any, cfg: ListenerConfig, tts: TTS, warmer: _W
             **con_sesion,
         )
     finally:
+        if preconexion is not None:
+            preconexion.join()
         stop_control_watch()
         if sesion is not None:
             sesion.close()

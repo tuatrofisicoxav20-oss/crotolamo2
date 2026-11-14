@@ -255,8 +255,9 @@ class FakeMic:
 
 def _ear(mic, state, *, allow_barge_in=False, silence_ms=64, tts=None,
          wake_label="wake", voice_label="voice",
-         grace_ms=0, margin=0.0, min_chunks=1):
+         grace_ms=0, margin=0.0, min_chunks=1, **extra):
     # Por defecto, gracia=0/min=1: barge-in de un solo chunk (conducta base M3.6).
+    # extra: argumentos opcionales del oído (on_wake, plazos), solo si el test los da.
     stt_q: queue.Queue = queue.Queue()
     tts_q: queue.Queue = queue.Queue()
     shutdown = threading.Event()
@@ -269,7 +270,7 @@ def _ear(mic, state, *, allow_barge_in=False, silence_ms=64, tts=None,
         stt_queue=stt_q, tts_queue=tts_q, state=state, shutdown=shutdown,
         silence_ms=silence_ms, allow_barge_in=allow_barge_in,
         barge_in_grace_ms=grace_ms, barge_in_threshold_margin=margin,
-        barge_in_min_chunks=min_chunks,
+        barge_in_min_chunks=min_chunks, **extra,
     )
     return ear, stt_q, tts_q, shutdown
 
@@ -640,3 +641,249 @@ def test_brain_por_defecto_no_pasa_on_token_y_el_voiceloop_tampoco():
     vl = VoiceLoop(agente, SimpleNamespace(), SimpleNamespace(), None, stream_speak=True,
                    **comunes)
     assert vl.threads[2].stream is True
+
+
+# --- Causa raíz "el turno del LLM es una llamada atómica y bloqueante" -------------
+# Pasos 7-8 (parte B, el cableado de la voz). on_wake: el oído avisa con la 1ª voz
+# de una orden (wake o barge-in) y VoiceLoop pre-conecta ahí el motor del agente.
+# cancel_on_barge_in ([voice].barge_in_cancel, apagada): el BrainThread le da al
+# agente un should_abort que sigue al turno. Las pruebas de punta a punta (sockets
+# reales, ToolAgent real) están en test_perf_llm_turn_is_one_atomic_blocking_call.py.
+
+def test_ear_avisa_on_wake_y_no_propaga_errores(caplog):
+    import logging
+
+    # Wake: UN aviso, ya con el turno nuevo, y la orden llega al Stt como siempre.
+    state = SharedState()
+    avisos: list[int] = []
+    mic = FakeMic(["wake", "voice", "sil", "sil"])
+    ear, stt_q, _tts_q, shutdown = _ear(mic, state, on_wake=lambda: avisos.append(state.turn_id))
+    ear.start()
+    try:
+        assert _wait(lambda: not stt_q.empty())
+        assert stt_q.get()[1] == 1
+        assert mic.agotado.wait(2.0)
+        assert avisos == [1]
+    finally:
+        shutdown.set()
+        ear.join(timeout=2.0)
+
+    # Barge-in: también empieza una orden, también avisa.
+    state = _speaking_state()
+    avisos.clear()
+    ear, _stt_q, _tts_q, shutdown = _ear(FakeMic(["voice"]), state, allow_barge_in=True,
+                                         on_wake=lambda: avisos.append(state.turn_id))
+    ear.start()
+    try:
+        assert _wait(lambda: state.get_mode() is Mode.LISTENING)
+        assert _wait(lambda: avisos == [2])
+    finally:
+        shutdown.set()
+        ear.join(timeout=2.0)
+
+    # Un aviso que revienta no toca al oído: la orden sale igual y queda en DEBUG.
+    def revienta() -> None:
+        raise RuntimeError("sin red")
+
+    state = SharedState()
+    mic = FakeMic(["wake", "voice", "sil", "sil", "wake"])
+    ear, stt_q, _tts_q, shutdown = _ear(mic, state, on_wake=revienta)
+    with caplog.at_level(logging.DEBUG, logger="crotolamo.voice.loop"):
+        ear.start()
+        try:
+            assert _wait(lambda: not stt_q.empty())
+            assert stt_q.get()[1] == 1
+            assert mic.agotado.wait(2.0)
+            assert ear.is_alive()
+        finally:
+            shutdown.set()
+            ear.join(timeout=2.0)
+    fallos = [r for r in caplog.records if "sin red" in r.getMessage()]
+    assert fallos and all(r.levelno == logging.DEBUG for r in fallos)
+
+
+class _MicQueCuenta(FakeMic):
+    """FakeMic que cuenta los chunks entregados: `leidos` es el número (desde 1)
+    del chunk que el oído está procesando."""
+
+    def __init__(self, chunks):
+        super().__init__(chunks)
+        self.leidos = 0
+
+    def read(self):
+        chunk = super().read()
+        if chunk is not None:
+            self.leidos += 1
+        return chunk
+
+
+def test_ear_el_aviso_del_wake_espera_a_la_voz_de_la_orden():
+    """El aviso llega con el PRIMER chunk con voz de la orden, no con el wake: un
+    falso wake (el wake y silencio hasta el plazo, SIN_VOZ) no avisa, así que no
+    abre una conexión a la nube que ninguna petición usa. Antes avisaba en cada
+    wake. El barge-in ya trae voz: avisa al instante (test de arriba)."""
+    state = SharedState()
+    avisos: list[tuple[int, int]] = []
+    # start_timeout_s=0.1: 3 chunks sin voz tras el wake -> SIN_VOZ, a reposo.
+    mic = _MicQueCuenta(["wake", "sil", "sil", "sil",
+                         "wake", "sil", "voice", "sil", "sil"])
+    ear, stt_q, _tts_q, shutdown = _ear(
+        mic, state, start_timeout_s=0.1, post_speak_grace_s=0.0,
+        on_wake=lambda: avisos.append((state.turn_id, mic.leidos)))
+    ear.start()
+    try:
+        assert _wait(lambda: not stt_q.empty())
+        assert stt_q.get()[1] == 2 and stt_q.empty()   # el falso wake no fue a Whisper
+        assert mic.agotado.wait(2.0)
+        # Un solo aviso: el de la orden con voz (turno 2), con su 1er chunk con
+        # voz (el 7º del guion), ni con su wake (5º) ni con el falso wake (1º).
+        assert avisos == [(2, 7)]
+    finally:
+        shutdown.set()
+        ear.join(timeout=2.0)
+
+
+def test_ear_sin_barge_in_no_avisa_con_voz_mientras_habla():
+    state = _speaking_state()
+    avisos: list[int] = []
+    mic = FakeMic(["voice", "voice", "voice"])
+    ear, _stt_q, _tts_q, shutdown = _ear(mic, state, on_wake=lambda: avisos.append(1))
+    ear.start()
+    try:
+        assert mic.agotado.wait(2.0)
+        assert avisos == [] and state.get_mode() is Mode.SPEAKING
+    finally:
+        shutdown.set()
+        ear.join(timeout=2.0)
+
+
+class _AgenteQueAnota:
+    """handle_turn con la firma de ToolAgent: anota lo que recibe y, mientras
+    piensa la PRIMERA orden, lo que su should_abort dice antes y después de un
+    barge-in; las siguientes, solo lo que dice."""
+
+    def __init__(self, state=None, reply="Hola. Mundo."):
+        self.state = state
+        self.reply = reply
+        self.llamadas: list[dict] = []
+        self.aborta: list[bool] = []
+
+    def handle_turn(self, command, on_token=None, should_abort=None):
+        self.llamadas.append({"command": command, "on_token": on_token,
+                              "should_abort": should_abort})
+        if should_abort is not None:
+            self.aborta.append(should_abort())
+            if len(self.llamadas) == 1:
+                self.state.new_turn()      # barge-in mientras piensa
+                self.aborta.append(should_abort())
+        return self.reply
+
+
+def test_brain_por_defecto_no_pasa_kwargs():
+    """Sin la clave (y con la clave pero sin --barge-in, ver el VoiceLoop), la
+    llamada de siempre: handle_turn(command), aunque el agente acepte más."""
+    agente = _AgenteQueAnota()
+    brain, _state, tts_q, shutdown = _brain(agente, stream=False)
+    try:
+        assert _wait(lambda: _vaciar(tts_q)[-1:] == [END])
+        assert _vaciar(tts_q) == ["Hola.", "Mundo.", END]
+        assert agente.llamadas == [{"command": "saluda", "on_token": None,
+                                    "should_abort": None}]
+        assert brain.cancel_on_barge_in is False
+    finally:
+        _parar(brain, shutdown)
+
+
+def test_brain_opt_in_con_agente_sin_should_abort_no_revienta(caplog):
+    """Un agente de una sola orden (los de mentiras) recibe la llamada de siempre."""
+    state = SharedState()
+    turno = state.new_turn()
+    cmd_q: queue.Queue = queue.Queue()
+    tts_q: queue.Queue = queue.Queue()
+    shutdown = threading.Event()
+    brain = BrainThread(FakeAgent("Hola. Mundo."), cmd_q, tts_q, state, shutdown,
+                        cancel_on_barge_in=True)
+    brain.start()
+    try:
+        cmd_q.put(("saluda", turno))
+        assert _wait(lambda: _vaciar(tts_q)[-1:] == [END])
+        assert _vaciar(tts_q) == ["Hola.", "Mundo.", END]
+    finally:
+        _parar(brain, shutdown)
+
+
+def test_brain_opt_in_le_da_al_agente_un_should_abort_que_sigue_al_turno():
+    """cancel_on_barge_in: should_abort es False mientras el turno es el vigente y
+    True en cuanto un barge-in lo invalida. Sin streaming, un on_token que no
+    habla nada (fuerza el stream: cada línea es un punto de control); lo que se
+    habla sale de lo que devuelve, y de un turno abortado no sale nada."""
+    state = SharedState()
+    turno = state.new_turn()
+    agente = _AgenteQueAnota(state)
+    cmd_q: queue.Queue = queue.Queue()
+    tts_q: queue.Queue = queue.Queue()
+    shutdown = threading.Event()
+    brain = BrainThread(agente, cmd_q, tts_q, state, shutdown, cancel_on_barge_in=True)
+    brain.start()
+    try:
+        cmd_q.put(("saluda", turno))
+        assert _wait(lambda: agente.aborta == [False, True])
+        # La orden del barge-in sale detrás (FIFO): cuando su END llega, el
+        # turno viejo ya se procesó sin encolar nada.
+        cmd_q.put(("otra", state.turn_id))
+        assert _wait(lambda: _vaciar(tts_q)[-1:] == [END])
+        assert agente.aborta == [False, True, False]
+        assert [u.turn_id for u in list(tts_q.queue)[:-1]] == [2, 2]
+        on_token = agente.llamadas[0]["on_token"]
+        assert callable(on_token) and on_token("Hola, patrón.") is False   # "no salió"
+    finally:
+        _parar(brain, shutdown)
+
+
+def test_brain_opt_in_en_streaming_usa_el_mismo_feeder():
+    """Con stream_speak_concurrent el on_token es el de siempre (la SentenceFeeder
+    con el aviso aparte): ningún segundo mecanismo de streaming."""
+    from crotolamo.voice.tts import _AvisoEnFraseAparte
+
+    state = SharedState()
+    turno = state.new_turn()
+    agente = _AgenteQueAnota(state)
+    cmd_q: queue.Queue = queue.Queue()
+    tts_q: queue.Queue = queue.Queue()
+    shutdown = threading.Event()
+    brain = BrainThread(agente, cmd_q, tts_q, state, shutdown, stream=True,
+                        cancel_on_barge_in=True)
+    brain.start()
+    try:
+        cmd_q.put(("saluda", turno))
+        assert _wait(lambda: agente.aborta == [False, True])
+        cmd_q.put(("otra", state.turn_id))
+        assert _wait(lambda: _vaciar(tts_q)[-1:] == [END])
+        assert isinstance(agente.llamadas[0]["on_token"], _AvisoEnFraseAparte)
+        assert isinstance(agente.llamadas[1]["on_token"], _AvisoEnFraseAparte)
+        # El agente de mentiras no habla por on_token: se encola lo que devuelve.
+        assert [u.turn_id for u in list(tts_q.queue)[:-1]] == [2, 2]
+    finally:
+        _parar(brain, shutdown)
+
+
+def test_voiceloop_barge_in_cancel_solo_con_barge_in(monkeypatch):
+    """[voice].barge_in_cancel (false de fábrica) solo actúa junto a --barge-in."""
+    import crotolamo.settings as settings_mod
+
+    class _Mic:
+        def read(self):
+            return None
+
+    comunes = dict(mic=_Mic(), wake_fn=lambda c: False, vad_fn=lambda c: 0.0,
+                   to_wav=lambda f: f)
+    vistos = []
+    for voz, barge_in in [({}, True), ({"barge_in_cancel": True}, False),
+                          ({"barge_in_cancel": False}, True),
+                          ({"barge_in_cancel": True}, True)]:
+        monkeypatch.setattr(settings_mod, "get_settings",
+                            lambda v=voz: SimpleNamespace(voice=v))
+        vl = VoiceLoop(_AgenteQueAnota(), SimpleNamespace(), SimpleNamespace(), None,
+                       allow_barge_in=barge_in, **comunes)
+        vistos.append(vl.threads[2].cancel_on_barge_in)
+    assert vistos == [False, False, False, True]

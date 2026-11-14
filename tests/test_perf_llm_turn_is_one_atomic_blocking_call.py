@@ -22,7 +22,7 @@ Pasos 4-6 (parte 2): la respuesta en vuelo tiene UN dueño (LiveStreamer).
 - FallbackLLM reinicia el streamer antes de pasar al local (lo retenido de la
   nube nunca se mezcla con la respuesta local); ver test_fallback.py.
 
-Pasos 7-8 (parte A, el núcleo; el cableado del wake y del barge-in va aparte):
+Pasos 7-8 (parte A, el núcleo):
 - `HTTPTransport.preconnect` abre UN repuesto desde otro hilo y se lo lleva la
   primera petición (cero handshakes en el turno, y releva al keep-alive propio:
   nunca quedan dos sockets ociosos); uno caducado o caído se tira sin escribir y el
@@ -31,6 +31,17 @@ Pasos 7-8 (parte A, el núcleo; el cableado del wake y del barge-in va aparte):
 - Un wake renueva el repuesto al que le quedan menos de 15 s (la orden llega después)
   y el que nadie pide (un wake sin turno LLM) lo cierra su segador a los 30 s.
 - `build_agent` pasa [voice].stream_release al agente ("final" de fábrica).
+
+Pasos 7-8 (parte B, el cableado de la voz):
+- El aviso del wake (WakePreconnect): el oído del loop concurrente avisa con la 1ª
+  voz de cada orden (un falso wake sin voz no pre-conecta; el barge-in ya trae voz)
+  y el loop simple con la 1ª voz de la orden que viene detrás del wake (on_voice de
+  la grabación del STT); el motor pre-conecta mientras el patrón habla. Misma petición, misma respuesta, cero handshakes en el
+  turno; un preconnect que falla o se cuelga no toca el turno.
+- [voice].barge_in_cancel (con --barge-in; apagada de fábrica): el BrainThread le da
+  al agente un should_abort que sigue al turno; el turno interrumpido no hace ni una
+  llamada ni una tool más. Su precio en el respaldo (la nube que se cae tras soltar
+  texto al on_token mudo) está medido y documentado.
 
 Aquí van las pruebas de punta a punta (contra sockets reales de loopback y con
 el agente real); las unitarias están en test_transport.py, test_glm.py,
@@ -111,6 +122,7 @@ class _Handler(BaseHTTPRequestHandler):
         srv = self.server
         self.rfile.read(int(self.headers.get("Content-Length", 0)))
         srv.usadas.add(self.connection)
+        srv.peticiones.append(self.path)
         glm = self.path.endswith("/chat/completions")
         if srv.mode == "entero":         # sin stream (BrainThread): JSON entero de GLM
             cuerpo = json.dumps({"choices": [{"message": {"content": "".join(TOKENS)}}]})
@@ -169,6 +181,7 @@ class _Server(ThreadingHTTPServer):
         self._esquema = "https" if contexto is not None else "http"
         self.aceptadas: list[socket.socket] = []
         self.usadas: set[socket.socket] = set()   # conexiones que trajeron alguna petición
+        self.peticiones: list[str] = []           # una por POST recibido
         self.mode = mode
         self.conexiones = 0
         # Avisa de cada conexión anotada: el hilo del servidor la anota DESPUÉS del
@@ -1259,3 +1272,1087 @@ def test_config_de_fabrica_documenta_stream_release_y_retiene():
     explicacion = " ".join(comentario)
     for dato in ('"sentence"', "preámbulo", "1.7", "0.6", "habría hablado", "INFO"):
         assert dato in explicacion, dato
+
+
+# --- Pasos 7-8 (parte B): el cableado de la voz ------------------------------------
+# El aviso del wake (WakePreconnect) en los dos loops y [voice].barge_in_cancel en el
+# BrainThread, de punta a punta: VoiceLoop con oído, Stt, Brain y Boca reales (fakes
+# solo en el micrófono, el VAD, Whisper y Piper) y el ToolAgent de verdad.
+
+_ORDEN = "abre youtube"
+
+
+class _MicDeGuion:
+    """Micrófono del oído: entrega el guion y, agotado, None. Un (chunk, evento)
+    entrega el chunk cuando el evento se enciende (la pre-conexión ya terminó)."""
+
+    def __init__(self, guion) -> None:
+        self._guion = iter(guion)
+        self.agotado = threading.Event()
+
+    def read(self):
+        try:
+            chunk = next(self._guion)
+        except StopIteration:
+            self.agotado.set()
+            return None
+        if isinstance(chunk, tuple):
+            chunk, listo = chunk
+            assert listo.wait(5), "la pre-conexión no terminó"
+        return chunk
+
+
+class _Boca:
+    """El TTS del loop: anota lo que se dice y avisa con cada frase."""
+
+    def __init__(self) -> None:
+        self.dichos: list[str] = []
+        self.hablo = threading.Event()
+
+    def speak(self, texto: str) -> None:
+        self.dichos.append(texto)
+        self.hablo.set()
+
+    def stop(self) -> None:
+        pass
+
+
+class _AgenteDeUnaLlamada:
+    """Lo justo de un agente con motor: handle_turn(orden) -> llm.chat."""
+
+    def __init__(self, llm) -> None:
+        self.llm = llm
+        self.ordenes: list[str] = []
+
+    def handle_turn(self, command):
+        self.ordenes.append(command)
+        return self.llm.chat([{"role": "user", "content": command}]).content
+
+
+class _SinPreconnect:
+    """El mismo motor sin `preconnect`: lo que había antes del aviso del wake."""
+
+    def __init__(self, llm) -> None:
+        self._llm = llm
+
+    def chat(self, messages, tools=None):
+        return self._llm.chat(messages, tools=tools)
+
+
+def _voz(agente, guion):
+    """VoiceLoop con el oído de verdad sobre `guion`; devuelve (loop, boca)."""
+    from crotolamo.voice.loop import VoiceLoop
+
+    boca = _Boca()
+    stt = type("Stt", (), {"transcribe": lambda self, audio, hotwords=None: _ORDEN})()
+    vl = VoiceLoop(agente, stt, boca, None, mic=_MicDeGuion(guion),
+                   wake_fn=lambda c: c == "wake",
+                   vad_fn=lambda c: 0.9 if c == "voice" else 0.0,
+                   to_wav=lambda frames: frames, silence_ms=64)
+    return vl, boca
+
+
+def _turno_de_voz(agente, guion) -> list[str]:
+    """Un wake y una orden por el loop concurrente; lo que se dijo."""
+    vl, boca = _voz(agente, guion)
+    vl.start()
+    try:
+        assert boca.hablo.wait(5), "no se habló la respuesta"
+    finally:
+        vl.stop()
+    return boca.dichos
+
+
+def test_voz_el_wake_preconecta_y_el_turno_hace_la_misma_peticion(servidor, monkeypatch):
+    """Loop concurrente con GLMClient y sockets de verdad. Con el aviso del wake: la
+    misma orden, UNA petición, la misma respuesta dicha, y el turno no conecta nada
+    (el handshake lo hizo el hilo Preconnect mientras el patrón hablaba). Sin él
+    (un motor sin preconnect): lo de siempre, el hilo del turno conecta."""
+    vistos = {}
+    for con_aviso in (False, True):
+        srv = servidor("entero")
+        client = _cliente("glm", srv)
+        por_hilo = _contando_conexiones(monkeypatch, client._transport)
+        listo = threading.Event()
+        guion = ["wake", "voice", "sil", "sil"]
+        if con_aviso:
+            original = client.preconnect
+
+            def preconectar(original=original, listo=listo):
+                try:
+                    return original()
+                finally:
+                    listo.set()
+
+            monkeypatch.setattr(client, "preconnect", preconectar)
+            # El aviso sale con la 1ª voz de la orden: lo que sigue a esa voz espera
+            # a que ya conectara.
+            guion[2] = ("sil", listo)
+            agente = _AgenteDeUnaLlamada(client)
+        else:
+            agente = _AgenteDeUnaLlamada(_SinPreconnect(client))
+        dichos = _turno_de_voz(agente, guion)
+        vistos[con_aviso] = (agente.ordenes, dichos, list(srv.peticiones), srv.conexiones)
+        assert por_hilo == ({"Preconnect": 1} if con_aviso else {"Brain": 1})
+
+    assert vistos[True] == vistos[False] == (
+        [_ORDEN], ["Hola, patrón."], ["/api/paas/v4/chat/completions"], 1)
+
+
+class _MotorQueAnota:
+    """Motor de mentiras con preconnect: `pre` decide qué hace la pre-conexión."""
+
+    model = "mentira"
+
+    def __init__(self, pre) -> None:
+        self._pre = pre
+        self.chats = 0
+        self.preconexiones = 0
+
+    def preconnect(self) -> bool:
+        self.preconexiones += 1
+        return self._pre()
+
+    def chat(self, messages, tools=None):
+        self.chats += 1
+        return ChatResponse(content="Hola, patrón.")
+
+
+def test_voz_un_preconnect_que_revienta_no_toca_el_turno(caplog):
+    def revienta() -> bool:
+        raise OSError("sin red")
+
+    motor = _MotorQueAnota(revienta)
+    agente = _AgenteDeUnaLlamada(motor)
+    with caplog.at_level(logging.DEBUG):
+        dichos = _turno_de_voz(agente, ["wake", "voice", "sil", "sil"])
+
+    assert dichos == ["Hola, patrón."] and agente.ordenes == [_ORDEN]
+    assert (motor.preconexiones, motor.chats) == (1, 1)
+    assert [r for r in caplog.records if "preconnect en segundo plano falló" in r.getMessage()]
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_voz_un_preconnect_colgado_no_retrasa_el_turno_y_el_apagado_tiene_tope():
+    """El turno no espera a la pre-conexión; stop() la espera, pero acotado
+    (WakePreconnect.join) y el hilo, daemon, queda colgado sin retener nada."""
+    from crotolamo.voice.threads import _PRECONNECT_JOIN_S
+
+    soltar = threading.Event()
+    motor = _MotorQueAnota(lambda: soltar.wait(10))
+    agente = _AgenteDeUnaLlamada(motor)
+    vl, boca = _voz(agente, ["wake", "voice", "sil", "sil"])
+    vl.start()
+    try:
+        assert boca.hablo.wait(5)                     # contestó con el preconnect colgado
+        assert boca.dichos == ["Hola, patrón."] and motor.chats == 1
+        colgados = list(vl._preconexion._hilos)       # los de ESTE loop
+        assert len(colgados) == 1 and colgados[0].is_alive()
+        t0 = time.monotonic()
+        vl.stop()
+        espera = time.monotonic() - t0
+        # La esperó (su tope), pero no los 10 s que sigue colgada: margen de máquina cargada.
+        assert _PRECONNECT_JOIN_S * 0.8 <= espera < _PRECONNECT_JOIN_S + 3.0
+        assert colgados[0].is_alive() and colgados[0].daemon
+    finally:
+        soltar.set()
+        vl.stop()
+    for hilo in colgados:
+        hilo.join(5)
+        assert not hilo.is_alive()
+
+
+def test_voz_sin_motor_que_preconecte_no_hay_aviso():
+    """Agentes de mentiras (sin llm, motor sin preconnect o con uno que no se puede
+    llamar): el oído recibe on_wake=None y nadie arranca hilos."""
+    from types import SimpleNamespace
+
+    from crotolamo.voice.threads import WakePreconnect
+
+    agentes = [SimpleNamespace(handle_turn=lambda c: "ok"),
+               SimpleNamespace(handle_turn=lambda c: "ok", llm=None),
+               SimpleNamespace(handle_turn=lambda c: "ok", llm=SimpleNamespace(preconnect=True)),
+               _AgenteDeUnaLlamada(_SinPreconnect(None))]
+    for agente in agentes:
+        assert WakePreconnect.del_agente(agente) is None
+        vl, _boca = _voz(agente, [])
+        assert vl._ear.on_wake is None
+    vl, _boca = _voz(_AgenteDeUnaLlamada(_MotorQueAnota(lambda: True)), [])
+    assert isinstance(vl._ear.on_wake, WakePreconnect)
+
+
+def test_voz_el_barge_in_tambien_preconecta():
+    """Una orden por barge-in (con --barge-in) también avisa: un aviso por orden."""
+    from crotolamo.voice.state import Mode
+
+    motor = _MotorQueAnota(lambda: True)
+    vl, _boca = _voz(_AgenteDeUnaLlamada(motor), [])
+    vl._ear.allow_barge_in = True
+    vl.state.new_turn()
+    vl.state.set_mode(Mode.SPEAKING)
+    vl._ear._grace_s = 0.0          # sin la gracia anti-eco del arranque del habla
+    for _ in range(vl._ear._min_chunks):
+        vl._ear._on_chunk("voice")
+    vl._preconexion.join(5)
+    assert vl.state.get_mode() is Mode.LISTENING
+    assert motor.preconexiones == 1
+
+
+class _MicPorTandas:
+    """Micrófono del oído que se carga por tandas (`tanda`): entrega lo cargado y,
+    agotado, None y enciende `agotado` (el oído ya procesó toda la tanda). Un
+    (chunk, evento) entrega el chunk cuando el evento se enciende."""
+
+    def __init__(self) -> None:
+        self._guion: list = []
+        self._lock = threading.Lock()
+        self.agotado = threading.Event()
+
+    def tanda(self, chunks) -> None:
+        with self._lock:
+            self.agotado.clear()
+            self._guion.extend(chunks)
+
+    def read(self):
+        with self._lock:
+            if not self._guion:
+                self.agotado.set()
+                return None
+            chunk = self._guion.pop(0)
+        if isinstance(chunk, tuple):
+            chunk, listo = chunk
+            assert listo.wait(5), "la pre-conexión no terminó"
+        return chunk
+
+
+def test_voz_un_falso_wake_no_preconecta_y_la_orden_sigue_sin_handshake(servidor,
+                                                                        monkeypatch):
+    """Loop concurrente con GLMClient y sockets de verdad. Falsos wakes (el wake y
+    silencio hasta el plazo de la orden: SIN_VOZ, nada a Whisper): ni un preconnect
+    ni una conexión a la nube; antes, cada uno abría un repuesto que ninguna petición
+    usaba (TCP+TLS, keepalive y un segador vivo 30 s, 24/7 en reposo). La orden de
+    después sigue sin handshake en el turno: el aviso sale con su 1ª voz."""
+    from crotolamo.voice.loop import VoiceLoop
+    from crotolamo.voice.state import Mode
+
+    srv = servidor("entero")
+    client = _cliente("glm", srv)
+    por_hilo = _contando_conexiones(monkeypatch, client._transport)
+    llamadas: list[int] = []
+    listo = threading.Event()
+    original = client.preconnect
+
+    def preconectar():
+        llamadas.append(1)
+        try:
+            return original()
+        finally:
+            listo.set()
+
+    monkeypatch.setattr(client, "preconnect", preconectar)
+    agente = _AgenteDeUnaLlamada(client)
+    boca = _Boca()
+    mic = _MicPorTandas()
+    stt = type("Stt", (), {"transcribe": lambda self, audio, hotwords=None: _ORDEN})()
+    # start_timeout_s=0.1: 3 chunks sin voz tras el wake cierran la orden en SIN_VOZ.
+    vl = VoiceLoop(agente, stt, boca, None, mic=mic, wake_fn=lambda c: c == "wake",
+                   vad_fn=lambda c: 0.9 if c == "voice" else 0.0,
+                   to_wav=lambda frames: frames, silence_ms=64, start_timeout_s=0.1,
+                   post_speak_grace_s=0.0)
+    vl.start()
+    try:
+        mic.tanda(["wake", "sil", "sil", "sil"] * 3)
+        assert mic.agotado.wait(5)
+        assert vl.state.get_mode() is Mode.IDLE and agente.ordenes == []
+        vl._preconexion.join(5)
+        assert (llamadas, por_hilo, _conexiones_estables(srv)) == ([], {}, 0)
+
+        mic.tanda(["wake", "voice", ("sil", listo), "sil"])
+        assert boca.hablo.wait(5), "no se habló la respuesta"
+    finally:
+        vl.stop()
+    assert (agente.ordenes, boca.dichos) == ([_ORDEN], ["Hola, patrón."])
+    assert (llamadas, por_hilo) == ([1], {"Preconnect": 1})
+    assert (srv.peticiones, srv.conexiones) == (["/api/paas/v4/chat/completions"], 1)
+
+
+# El loop simple: el aviso va con la 1ª voz de la orden que viene DETRÁS del wake.
+
+class _OrdenQueAnota:
+    """La orden (grabación y Whisper): anota cuándo se escucha y, como el STT real,
+    llama a on_voice cuando el patrón empieza a hablar; con `listo`, la orden
+    acaba cuando la pre-conexión terminó (el patrón tarda más que un handshake).
+    Con `oido`, lo que se oye en cada escucha (por defecto, la orden)."""
+
+    def __init__(self, eventos: list[str], listo: threading.Event | None = None,
+                 oido: list[str] | None = None) -> None:
+        self.eventos = eventos
+        self.listo = listo
+        self.oido = oido
+        self.avisos: list[bool] = []    # por escucha: ¿llegó con on_voice?
+
+    def listen_once(self, on_voice=None, **kwargs):
+        self.eventos.append("orden")
+        self.avisos.append(on_voice is not None)
+        texto = self.oido.pop(0) if self.oido else _ORDEN
+        if texto and on_voice is not None:
+            on_voice()                  # la 1ª voz de la orden
+        if self.listo is not None:
+            assert self.listo.wait(5), "la pre-conexión no terminó"
+        return texto
+
+    listen_smart = listen_once
+
+
+class _WakeDeGuion:
+    """wake_stt del difuso (o detector de openWakeWord): el guion y luego Ctrl-C."""
+
+    threshold = 0.5
+
+    def __init__(self, oido) -> None:
+        self.oido = list(oido)
+
+    def listen_once(self, **kwargs):
+        if self.oido:
+            return self.oido.pop(0)
+        raise KeyboardInterrupt
+
+    def listen_for_wake(self, timeout_s=None, **kwargs):
+        if self.oido:
+            return bool(self.oido.pop(0))
+        raise KeyboardInterrupt
+
+
+def _loop_simple(monkeypatch, oido, *, use_oww=False, on_wake=None, agente=None,
+                 listo=None):
+    from types import SimpleNamespace
+
+    from interfaces import listener
+    from crotolamo.voice.state import SharedState
+    from tests.test_media_aware import _FakeAgent, _FakeTts
+
+    monkeypatch.setattr(listener, "read_control_enabled", lambda *a, **k: True)
+    monkeypatch.setattr(listener, "time", SimpleNamespace(sleep=lambda s: None, time=time.time))
+    cfg = listener.ListenerConfig(threshold=0.72, variants=["crotolamo"], followup_s=0,
+                                  ack="off", stream_speak=False, smart_endpoint=False)
+    eventos: list[str] = []
+    wake = _WakeDeGuion(oido)
+    agente = agente if agente is not None else _FakeAgent()
+    tts = _FakeTts()
+    extra = {} if on_wake is None else {"on_wake": lambda: on_wake(eventos)}
+    rc = listener._run_simple_loop(
+        agent=agente, stt=_OrdenQueAnota(eventos, listo), wake_stt=wake, tts=tts,
+        wake_detector=wake, use_oww=use_oww, cfg=cfg, hud_state=SharedState(),
+        say=lambda texto: None, **extra)
+    assert rc == 0
+    ordenes = getattr(agente, "commands", None) or getattr(agente, "ordenes", None)
+    return eventos, ordenes, tts.spoken
+
+
+@pytest.mark.parametrize("use_oww, oido", [(False, ["crotolamo"]), (True, ["wake"])])
+def test_loop_simple_preconecta_con_la_primera_voz_de_la_orden(monkeypatch, use_oww, oido):
+    def avisar(eventos):
+        eventos.append("aviso")
+
+    con = _loop_simple(monkeypatch, oido, use_oww=use_oww, on_wake=avisar)
+    sin = _loop_simple(monkeypatch, oido, use_oww=use_oww)
+
+    assert con[0] == ["orden", "aviso"]
+    assert sin[0] == ["orden"]
+    assert con[1:] == sin[1:] == ([_ORDEN], ["hecho, patrón."])
+
+
+def test_loop_simple_el_aviso_solo_viaja_con_la_orden_tras_el_wake(monkeypatch):
+    """Un falso wake (orden vacía) no avisa; la ventana de followup no lleva el
+    aviso (no hubo wake); sin aviso, el STT recibe los argumentos de siempre."""
+    from types import SimpleNamespace
+
+    from interfaces import listener
+    from crotolamo.voice.state import SharedState
+    from tests.test_media_aware import _FakeAgent, _FakeTts
+
+    monkeypatch.setattr(listener, "read_control_enabled", lambda *a, **k: True)
+    monkeypatch.setattr(listener, "time", SimpleNamespace(sleep=lambda s: None, time=time.time))
+    for smart in (True, False):
+        cfg = listener.ListenerConfig(threshold=0.72, variants=["crotolamo"], followup_s=5,
+                                      ack="off", stream_speak=False, smart_endpoint=smart)
+        for con_aviso in (True, False):
+            avisos: list[str] = []
+            eventos: list[str] = []
+            # Falso wake; luego wake, orden y un followup que ya no dice nada.
+            stt = _OrdenQueAnota(eventos, oido=["", _ORDEN, ""])
+            wake = _WakeDeGuion(["wake", "wake"])
+            extra = {"on_wake": lambda: avisos.append("aviso")} if con_aviso else {}
+            assert listener._run_simple_loop(
+                agent=_FakeAgent(), stt=stt, wake_stt=wake, tts=_FakeTts(),
+                wake_detector=wake, use_oww=True, cfg=cfg, hud_state=SharedState(),
+                say=lambda texto: None, **extra) == 0
+            assert eventos == ["orden"] * 3
+            assert stt.avisos == [con_aviso, con_aviso, False], (smart, con_aviso)
+            assert avisos == (["aviso"] if con_aviso else [])
+
+
+def test_loop_simple_el_wake_preconecta_y_el_turno_hace_la_misma_peticion(servidor,
+                                                                          monkeypatch):
+    """Loop simple con GLMClient y sockets de verdad, con el aviso que le da
+    _listen_with_warmer (WakePreconnect del agente): misma orden, UNA petición, la
+    misma respuesta, y el hilo del turno no conecta. Sin motor que pre-conecte: el
+    turno conecta como siempre."""
+    from crotolamo.voice.threads import WakePreconnect
+
+    vistos = {}
+    for con_aviso in (False, True):
+        srv = servidor("entero")
+        client = _cliente("glm", srv)
+        por_hilo = _contando_conexiones(monkeypatch, client._transport)
+        listo = None
+        if con_aviso:
+            listo = threading.Event()
+            original = client.preconnect
+
+            def preconectar(original=original, listo=listo):
+                try:
+                    return original()
+                finally:
+                    listo.set()
+
+            monkeypatch.setattr(client, "preconnect", preconectar)
+            agente = _AgenteDeUnaLlamada(client)
+        else:
+            agente = _AgenteDeUnaLlamada(_SinPreconnect(client))
+        aviso = WakePreconnect.del_agente(agente)
+        assert (aviso is not None) is con_aviso
+        _, ordenes, dichos = _loop_simple(
+            monkeypatch, ["crotolamo"], agente=agente, listo=listo,
+            on_wake=None if aviso is None else (lambda eventos, a=aviso: a()))
+        if aviso is not None:
+            aviso.join(5)
+        vistos[con_aviso] = (ordenes, dichos, list(srv.peticiones), srv.conexiones)
+        assert por_hilo == ({"Preconnect": 1} if con_aviso else {"MainThread": 1})
+
+    assert vistos[True] == vistos[False] == (
+        [_ORDEN], ["Hola, patrón."], ["/api/paas/v4/chat/completions"], 1)
+
+
+def test_loop_simple_con_la_orden_pegada_no_preconecta(monkeypatch):
+    avisos: list[str] = []
+    eventos, ordenes, _ = _loop_simple(monkeypatch, [f"crotolamo {_ORDEN}"],
+                                       on_wake=lambda e: avisos.append("aviso"))
+    assert avisos == [] and eventos == [] and ordenes == [_ORDEN]
+
+
+def test_loop_simple_un_aviso_que_revienta_no_toca_el_turno(monkeypatch, caplog):
+    def revienta(eventos):
+        raise RuntimeError("sin red")
+
+    with caplog.at_level(logging.DEBUG, logger="crotolamo.listener"):
+        eventos, ordenes, dichos = _loop_simple(monkeypatch, ["crotolamo"], on_wake=revienta)
+    assert (eventos, ordenes, dichos) == (["orden"], [_ORDEN], ["hecho, patrón."])
+    assert [r for r in caplog.records if "sin red" in r.getMessage()]
+
+
+def test_run_listen_simple_le_da_el_aviso_al_loop_y_lo_espera_al_salir(monkeypatch, tmp_path):
+    """run_listen --simple: el dueño del aviso es _listen_with_warmer, que lo pasa
+    al loop (para el motor del agente) y lo espera al salir. Con un agente sin
+    motor que pre-conecte, el loop recibe los argumentos de siempre."""
+    from types import SimpleNamespace
+
+    from interfaces import listener
+    from crotolamo.voice.threads import WakePreconnect
+    from tests.test_auditoria_voice_listener import (
+        _arnes_run_listen,
+        _BlockingDetector,
+        _join_warmers,
+    )
+
+    esperados: list = []
+    real_join = WakePreconnect.join
+
+    def join(self, *args, **kwargs):
+        esperados.append(self)
+        return real_join(self, *args, **kwargs)
+
+    monkeypatch.setattr(WakePreconnect, "join", join)
+    motor = _MotorQueAnota(lambda: True)
+    for agente, espera in [(SimpleNamespace(llm=motor), True), (SimpleNamespace(), False)]:
+        _arnes_run_listen(monkeypatch, tmp_path, _BlockingDetector())
+        monkeypatch.setattr(listener, "build_agent", lambda confirm_fn=None, a=agente: (a, None))
+        recibidos: list = []
+
+        def _loop(**kwargs) -> int:
+            recibidos.append(kwargs.get("on_wake"))
+            if kwargs.get("on_wake") is not None:
+                kwargs["on_wake"]()               # un wake con la orden detrás
+            return 0
+
+        monkeypatch.setattr(listener, "_run_simple_loop", _loop)
+        esperados.clear()
+        try:
+            assert listener.run_listen(["--simple"]) == 0
+        finally:
+            _join_warmers()
+        if espera:
+            assert isinstance(recibidos[0], WakePreconnect)
+            assert esperados == recibidos            # su dueño lo esperó al salir
+            assert motor.preconexiones == 1
+        else:
+            assert recibidos == [None] and esperados == []
+
+
+# El loop simple con el STT real (grabación con Silero sobre un micrófono de guion):
+# el aviso sale con la 1ª voz de la orden, no con el wake.
+
+class _MicDeOrdenes:
+    """sounddevice.InputStream falso del modo simple (cada orden abre el suyo):
+    entrega por grabación el guion siguiente de `ordenes` (un nivel por chunk de
+    32 ms: 0 silencio, 1 voz) y silencio al agotarlo. Tras la 1ª voz espera a
+    `listo` (el patrón tarda en decir la orden más que un handshake)."""
+
+    ordenes: list[list[int]] = []
+    listo: threading.Event | None = None
+
+    def __init__(self, **kwargs) -> None:
+        cls = type(self)
+        self._guion = cls.ordenes.pop(0) if cls.ordenes else []
+        self._hablo = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self, n):
+        import numpy as np
+
+        if self._hablo and type(self).listo is not None:
+            assert type(self).listo.wait(5), "la pre-conexión no terminó"
+        nivel = self._guion.pop(0) if self._guion else 0
+        self._hablo = self._hablo or nivel > 0
+        return np.full((n, 1), 0.3 * nivel, dtype=np.float32), False
+
+
+class _SileroDeNivel:
+    """Silero falso: voz = el chunk tiene señal."""
+
+    def reset_states(self) -> None:
+        pass
+
+    def __call__(self, block, sample_rate) -> float:
+        return 0.9 if float(abs(block).max()) > 0.1 else 0.0
+
+
+class _WakeQueEspera(_WakeDeGuion):
+    """Cada wake llega cuando la pre-conexión del anterior ya acabó y 20 s después
+    (lo normal en el 24/7: los falsos wakes no llegan en ráfaga)."""
+
+    def __init__(self, oido, aviso, reloj) -> None:
+        super().__init__(oido)
+        self.aviso = aviso
+        self.reloj = reloj
+
+    def _siguiente(self):
+        if self.aviso is not None:
+            self.aviso.join(5)
+        self.reloj["t"] += 20.0
+        if self.oido:
+            return self.oido.pop(0)
+        raise KeyboardInterrupt
+
+    def listen_once(self, **kwargs):
+        return self._siguiente()
+
+    def listen_for_wake(self, timeout_s=None, **kwargs):
+        return bool(self._siguiente())
+
+
+@pytest.mark.parametrize("use_oww", [True, False])
+def test_loop_simple_un_falso_wake_no_preconecta_y_la_orden_sigue_sin_handshake(
+        servidor, monkeypatch, use_oww):
+    """Loop simple de fábrica (smart_endpoint, acuse con bip) con el STT real, el
+    aviso que le da _listen_with_warmer y GLMClient con sockets de verdad. 5 falsos
+    wakes (el wake y silencio: "No te escuché claro", nada a Whisper) y una orden.
+    Antes, cada falso wake abría un repuesto que ninguna petición usaba (6
+    conexiones para 1 petición); ahora el aviso sale con la 1ª voz de la orden: 1
+    conexión, la del turno, y el hilo del turno sigue sin handshake. Lo que se oye
+    y se pide es lo mismo que con un motor sin preconnect."""
+    import sys
+    from types import SimpleNamespace
+
+    from crotolamo.core import engine
+    from crotolamo.voice import stt as stt_mod
+    from crotolamo.voice.state import SharedState
+    from crotolamo.voice.threads import WakePreconnect
+    from interfaces import listener
+    from tests.test_media_aware import _FakeTts
+
+    monkeypatch.setitem(sys.modules, "sounddevice",
+                        SimpleNamespace(InputStream=_MicDeOrdenes))
+    monkeypatch.setattr(stt_mod, "_voice_cfg", lambda: {"vad_backend": "silero"})
+    monkeypatch.setattr(stt_mod, "_silero_load_error", None)
+    monkeypatch.setattr(stt_mod, "_get_silero_vad", lambda **k: _SileroDeNivel())
+    monkeypatch.setattr(listener, "read_control_enabled", lambda *a, **k: True)
+    monkeypatch.setattr(listener, "time", SimpleNamespace(sleep=lambda s: None, time=time.time))
+    reloj = {"t": 1000.0}
+    monkeypatch.setattr(engine, "_reloj", lambda: reloj["t"])
+    cfg = listener.ListenerConfig(threshold=0.72, variants=["crotolamo"], followup_s=0,
+                                  stream_speak=False)
+    assert (cfg.smart_endpoint, cfg.ack) == (True, "beep")   # los de fábrica
+
+    vistos = {}
+    for con_aviso in (False, True):
+        srv = servidor("entero")
+        client = _cliente("glm", srv)
+        por_hilo = _contando_conexiones(monkeypatch, client._transport)
+        listo = threading.Event()
+        original = client.preconnect
+
+        def preconectar(original=original, listo=listo):
+            try:
+                return original()
+            finally:
+                listo.set()
+
+        monkeypatch.setattr(client, "preconnect", preconectar)
+        agente = _AgenteDeUnaLlamada(client if con_aviso else _SinPreconnect(client))
+        aviso = WakePreconnect.del_agente(agente)
+        assert (aviso is not None) is con_aviso
+        _MicDeOrdenes.ordenes = [[0] * 140 for _ in range(5)] + [[0] * 3 + [1] * 15]
+        _MicDeOrdenes.listo = listo if con_aviso else None
+        stt = stt_mod.STT(model_size="fake")
+        whisper: list[int] = []
+        monkeypatch.setattr(stt, "transcribe",
+                            lambda audio, hotwords=None: whisper.append(1) or _ORDEN)
+        wake = _WakeQueEspera(["crotolamo"] * 6, aviso, reloj)
+        dicho: list[str] = []
+        tts = _FakeTts()
+        extra = {} if aviso is None else {"on_wake": aviso}
+        assert listener._run_simple_loop(
+            agent=agente, stt=stt, wake_stt=wake, tts=tts, wake_detector=wake,
+            use_oww=use_oww, cfg=cfg, hud_state=SharedState(), say=dicho.append,
+            **extra) == 0
+        if aviso is not None:
+            aviso.join(5)
+        vistos[con_aviso] = (agente.ordenes, dicho, tts.spoken, tts.beeps, len(whisper),
+                             list(srv.peticiones), _conexiones_estables(srv))
+        assert por_hilo == ({"Preconnect": 1} if con_aviso else {"MainThread": 1})
+        assert len(srv.usadas) == 1
+
+    assert vistos[True] == vistos[False] == (
+        [_ORDEN], ["No te escuché claro, patrón."] * 5 + ["Crotolamo apagado, patrón."],
+        ["Hola, patrón."], 6, 1, ["/api/paas/v4/chat/completions"], 1)
+
+
+# El on_voice del STT (la grabación de la orden): una vez, con la 1ª voz.
+
+class _FuenteDeNiveles:
+    """Fuente ya abierta (el contrato de capture.MicSession) con un nivel por bloque:
+    0 silencio, 1 voz; agotada, silencio. Cuenta los bloques leídos."""
+
+    closed = False
+
+    def __init__(self, niveles) -> None:
+        self.niveles = list(niveles)
+        self.leidos = 0
+
+    def pending(self, frames) -> int:
+        return 0
+
+    def read(self, timeout=1.0, frames=512):
+        import numpy as np
+
+        self.leidos += 1
+        nivel = self.niveles.pop(0) if self.niveles else 0
+        return np.full(frames, 0.3 * nivel, dtype=np.float32)
+
+
+class _MicQueCuenta(_MicDeOrdenes):
+    """_MicDeOrdenes que cuenta los bloques leídos por todos sus streams."""
+
+    leidos = 0
+
+    def read(self, n):
+        type(self).leidos += 1
+        return super().read(n)
+
+
+@pytest.fixture
+def grabadora(monkeypatch):
+    """STT real con micrófono y Silero de guion (sin hardware)."""
+    import sys
+    from types import SimpleNamespace
+
+    from crotolamo.voice import stt as stt_mod
+
+    pytest.importorskip("numpy")
+    monkeypatch.setitem(sys.modules, "sounddevice",
+                        SimpleNamespace(InputStream=_MicQueCuenta))
+    monkeypatch.setattr(stt_mod, "_silero_load_error", None)
+    monkeypatch.setattr(stt_mod, "_get_silero_vad", lambda **k: _SileroDeNivel())
+    monkeypatch.setattr(_MicDeOrdenes, "listo", None)
+    monkeypatch.setattr(_MicQueCuenta, "leidos", 0)
+
+    def usar(backend: str):
+        monkeypatch.setattr(stt_mod, "_voice_cfg", lambda: {"vad_backend": backend})
+        return stt_mod.STT(model_size="fake")
+
+    return usar
+
+
+def _grabar(stt, niveles, con_fuente: bool, **kw):
+    """(frames, bloques leídos al avisar) de una grabación de `niveles`."""
+    import numpy as np
+
+    avisos: list[int] = []
+    fuente = _FuenteDeNiveles(niveles) if con_fuente else None
+    _MicDeOrdenes.ordenes = [list(niveles)]
+    _MicQueCuenta.leidos = 0
+
+    def avisar():
+        avisos.append(fuente.leidos if fuente is not None else _MicQueCuenta.leidos)
+
+    extra = {} if fuente is None else {"source": fuente}
+    if kw.pop("avisar", True):
+        extra["on_voice"] = avisar
+    frames = stt._record_frames(400, 8.0, 4.0, **extra, **kw)
+    audio = np.concatenate(frames) if frames else np.zeros(0, dtype=np.float32)
+    return audio, avisos
+
+
+@pytest.mark.parametrize("backend", ["silero", "energy"])
+@pytest.mark.parametrize("con_fuente", [False, True])
+def test_stt_on_voice_sale_una_vez_con_la_primera_voz(grabadora, backend, con_fuente):
+    """Con voz: un aviso, con el primer chunk de voz (no al acabar la orden), y la
+    grabación es la misma que sin él. Sin voz (un falso wake): ni un aviso."""
+    import numpy as np
+
+    stt = grabadora(backend)
+    niveles = [0] * 12 + [1] * 10 + [0] * 40
+    con, avisos = _grabar(stt, niveles, con_fuente)
+    sin, nada = _grabar(stt, niveles, con_fuente, avisar=False)
+    assert avisos == [13] and nada == []
+    assert con.size > 0 and np.array_equal(con, sin)
+
+    vacio, avisos = _grabar(stt, [0] * 200, con_fuente)
+    assert vacio.size == 0 and avisos == []
+
+
+def test_stt_on_voice_que_revienta_no_toca_la_grabacion(grabadora, caplog):
+    import numpy as np
+
+    stt = grabadora("silero")
+    niveles = [0] * 12 + [1] * 10 + [0] * 40
+    sin, _ = _grabar(stt, niveles, False, avisar=False)
+    _MicDeOrdenes.ordenes = [list(niveles)]
+
+    def revienta():
+        raise RuntimeError("sin red")
+
+    with caplog.at_level(logging.DEBUG, logger="crotolamo.voice.stt"):
+        con = np.concatenate(stt._record_frames(400, 8.0, 4.0, on_voice=revienta))
+    assert np.array_equal(con, sin)
+    assert [r for r in caplog.records if "sin red" in r.getMessage()]
+
+
+def test_stt_on_voice_no_se_repite_si_silero_cae_y_graba_la_energia(grabadora,
+                                                                    monkeypatch):
+    """Silero revienta a media orden (tras la 1ª voz) y la grabación se repite con
+    energía: el aviso ya salió, no sale otra vez."""
+    from crotolamo.voice import stt as stt_mod
+
+    class _SileroQueCae(_SileroDeNivel):
+        def __init__(self) -> None:
+            self.voz = False
+
+        def __call__(self, block, sample_rate) -> float:
+            if self.voz:
+                raise RuntimeError("ONNX roto")
+            prob = super().__call__(block, sample_rate)
+            self.voz = prob > 0.5
+            return prob
+
+    monkeypatch.setattr(stt_mod, "_get_silero_vad", lambda **k: _SileroQueCae())
+    stt = grabadora("silero")
+    niveles = [0] * 12 + [1] * 10 + [0] * 40
+    _MicDeOrdenes.ordenes = [list(niveles), list(niveles)]
+    avisos: list[int] = []
+    frames = stt._record_frames(400, 8.0, 4.0, on_voice=lambda: avisos.append(1))
+    assert frames and avisos == [1]
+
+
+def test_stt_listen_smart_avisa_solo_en_la_primera_ronda(grabadora, monkeypatch):
+    import numpy as np
+
+    stt = grabadora("silero")
+    for on_voice in (lambda: None, None):
+        llamadas: list[list[str]] = []
+
+        def grabar(**kw):
+            llamadas.append(sorted(kw))
+            return np.ones(16000, dtype=np.float32)
+
+        textos = iter(["pon la música de", "queen"])
+        monkeypatch.setattr(stt, "record_audio_until_silence", grabar)
+        monkeypatch.setattr(stt, "transcribe", lambda audio, hotwords=None: next(textos))
+        extra = {} if on_voice is None else {"on_voice": on_voice}
+        assert stt.listen_smart(rounds=2, **extra) == "pon la música de queen"
+        base = ["max_seconds", "silence_ms", "start_timeout_s"]
+        primera = sorted(base + ["on_voice"]) if on_voice is not None else base
+        assert llamadas == [primera, base]
+        # listen_once (smart_endpoint = false) lo pasa a su única grabación.
+        llamadas.clear()
+        textos = iter(["queen"])
+        assert stt.listen_once(silence_ms=800, **extra) == "queen"
+        assert llamadas == [sorted(["silence_ms"] + list(extra))]
+
+
+# [voice].barge_in_cancel: el turno que un barge-in invalidó deja de gastar.
+
+class _LlmQueInterrumpen:
+    """Turno A: pide ram_probe (2 llamadas). En el 4º token de su 1ª llamada llega
+    el barge-in (turno nuevo y la orden B a la cola, lo que hace el oído). Turno B:
+    charla. Cuenta lo que el turno A gasta DESPUÉS del barge-in (bench E)."""
+
+    model = "guion"
+
+    def __init__(self, al_interrumpir) -> None:
+        self.al_interrumpir = al_interrumpir
+        self.interrumpido = False
+        self.llamadas_tras = {"A": 0, "B": 0}
+        self.tokens_tras = {"A": 0, "B": 0}
+
+    def _correr(self, messages, on_token):
+        ultimo = max(i for i, m in enumerate(messages) if m.get("role") == "user")
+        quien = "B" if "segunda" in str(messages[ultimo].get("content", "")) else "A"
+        tras_tool = any(m.get("role") == "tool" for m in messages[ultimo + 1:])
+        if self.interrumpido:
+            self.llamadas_tras[quien] += 1
+        pide_tool = quien == "A" and not tras_tool
+        texto = (_PREAMBULO_2 if pide_tool
+                 else _RESPUESTA if quien == "A" else "Segunda orden atendida, patrón.")
+        for i, tk in enumerate(_tokens(texto)):
+            if self.interrumpido:
+                self.tokens_tras[quien] += 1
+            if pide_tool and i == 3 and not self.interrumpido:
+                self.interrumpido = True
+                self.al_interrumpir()
+            if on_token is not None:
+                on_token(tk)
+        if pide_tool:
+            raw = [{"function": {"name": "ram_probe", "arguments": {}}}]
+            return ChatResponse(content=texto, tool_calls=[{"name": "ram_probe", "arguments": {}}],
+                                raw_message={"role": "assistant", "content": texto,
+                                             "tool_calls": raw})
+        return ChatResponse(content=texto)
+
+    def chat_stream(self, messages, tools=None, on_token=None):
+        return self._correr(messages, on_token)
+
+    def chat(self, messages, tools=None):
+        return self._correr(messages, None)
+
+
+def _barge_in_en_vuelo(**brain_kw):
+    """BrainThread + ToolAgent reales; la orden A se interrumpe a medio stream."""
+    import queue
+
+    from crotolamo.voice.state import SharedState
+    from crotolamo.voice.threads import END, BrainThread, Utterance
+
+    state = SharedState()
+    cmd_q: queue.Queue = queue.Queue()
+    tts_q: queue.Queue = queue.Queue()
+    shutdown = threading.Event()
+    corridas: list[str] = []
+    llm = _LlmQueInterrumpen(lambda: cmd_q.put(("segunda orden", state.new_turn())))
+    agent = _agente(llm, corridas)
+    brain = BrainThread(agent, cmd_q, tts_q, state, shutdown, **brain_kw)
+    brain.start()
+    dichos: list[tuple[int, str]] = []
+    try:
+        cmd_q.put(("¿cuánta memoria traigo?", state.new_turn()))
+        while (item := tts_q.get(timeout=5)) is not END:
+            assert isinstance(item, Utterance)
+            dichos.append((item.turn_id, item.text))
+    finally:
+        shutdown.set()
+        brain.join(timeout=3)
+    assert not brain.is_alive()
+    return llm, corridas, dichos, agent
+
+
+def test_barge_in_cancel_el_turno_interrumpido_no_gasta_mas():
+    """Bench E: de fábrica el turno viejo sigue (1 llamada, todos sus tokens y la
+    tool, en silencio); con barge_in_cancel, 0 / 0 / 0. La orden nueva se contesta
+    igual en los dos casos y el historial anota la interrupción."""
+    hoy = _barge_in_en_vuelo()
+    con = _barge_in_en_vuelo(cancel_on_barge_in=True)
+
+    llm, corridas, dichos, _ = hoy
+    assert llm.llamadas_tras["A"] == 1 and llm.tokens_tras["A"] > 0
+    assert corridas == ["ram_probe"]
+    llm, corridas, dichos_con, agent = con
+    assert (llm.llamadas_tras["A"], llm.tokens_tras["A"], corridas) == (0, 0, [])
+    assert dichos_con == dichos == [(2, "Segunda orden atendida, patrón.")]
+    historial = _historial(agent)
+    assert {"role": "assistant", "content": "(Turno interrumpido por el patrón.)"} in historial
+    assert historial[-1] == {"role": "assistant", "content": "Segunda orden atendida, patrón."}
+
+
+def test_config_de_fabrica_documenta_barge_in_cancel_apagado():
+    """La clave va con las demás del barge-in, apagada (lo de siempre), con lo que
+    gana medido y lo que cuesta."""
+    import re
+    import tomllib
+
+    from crotolamo.settings import DEFAULT_CONFIG
+
+    texto = DEFAULT_CONFIG.read_text(encoding="utf-8")
+    assert tomllib.loads(texto)["voice"]["barge_in_cancel"] is False
+    lineas = texto.splitlines()
+    i = next(n for n, linea in enumerate(lineas)
+             if re.match(r"^barge_in_cancel\s*=\s*false\s*$", linea))
+    assert lineas[i - 1].startswith("#") and "barge_in_min_chunks" in "\n".join(lineas[i - 16:i])
+    comentario = []
+    for linea in reversed(lineas[:i]):
+        if not linea.startswith("#"):
+            break
+        comentario.insert(0, linea.lstrip("#").strip())
+    explicacion = " ".join(comentario)
+    for dato in ("--barge-in", "false (de fábrica", "1 llamada", "40 tokens", "1 tool",
+                 "0 / 0 / 0", "ya no corre", "historial"):
+        assert dato in explicacion, dato
+
+
+_SE_CAYO = "GLM se cayó a media respuesta, patrón."
+
+
+class _NubeQueSeCae:
+    """La nube suelta dos frases cerradas y se cae a media respuesta."""
+
+    model = "glm"
+
+    def chat_stream(self, messages, tools=None, on_token=None):
+        from crotolamo.core.llm import TransientLLMError
+
+        for tk in _tokens(_PREAMBULO_2 + " Y algo más"):
+            on_token(tk)
+        raise TransientLLMError(_SE_CAYO)
+
+    def chat(self, messages, tools=None):
+        from crotolamo.core.llm import TransientLLMError
+
+        raise TransientLLMError(_SE_CAYO)
+
+
+class _LocalQueContesta:
+    model = "local"
+
+    def __init__(self) -> None:
+        self.llamadas = 0
+
+    def chat_stream(self, messages, tools=None, on_token=None):
+        self.llamadas += 1
+        if on_token is not None:
+            on_token("Respuesta local.")
+        return ChatResponse(content="Respuesta local.")
+
+    def chat(self, messages, tools=None):
+        self.llamadas += 1
+        return ChatResponse(content="Respuesta local.")
+
+
+def _brain_con_la_nube_que_se_cae(cancel: bool, release: str, con_tools: bool = True):
+    """BrainThread (sin streaming de voz) + ToolAgent + FallbackLLM reales; la nube
+    se cae a media llamada. Lo que se dice y cuántas llamadas hizo el local."""
+    import queue
+
+    from crotolamo.core.fallback import FallbackLLM
+    from crotolamo.voice.state import SharedState
+    from crotolamo.voice.threads import END, BrainThread
+
+    local = _LocalQueContesta()
+    agent = _agente(FallbackLLM(_NubeQueSeCae(), local), stream_release=release)
+    if not con_tools:
+        agent.route_fn = lambda texto: []          # ninguna tool a la vista
+    state = SharedState()
+    cmd_q: queue.Queue = queue.Queue()
+    tts_q: queue.Queue = queue.Queue()
+    shutdown = threading.Event()
+    brain = BrainThread(agent, cmd_q, tts_q, state, shutdown, cancel_on_barge_in=cancel)
+    brain.start()
+    dichos: list[str] = []
+    try:
+        cmd_q.put(("cuánta ram traigo", state.new_turn()))
+        while (item := tts_q.get(timeout=5)) is not END:
+            dichos.append(item.text)
+    finally:
+        shutdown.set()
+        brain.join(timeout=3)
+    assert not brain.is_alive()
+    return dichos, local.llamadas
+
+
+def _comentario_de(texto: str, clave: str) -> str:
+    """El comentario que precede a `clave = ...` en la toml, en una línea."""
+    import re
+
+    lineas = texto.splitlines()
+    i = next(n for n, linea in enumerate(lineas) if re.match(rf"^{clave}\s*=", linea))
+    comentario: list[str] = []
+    for linea in reversed(lineas[:i]):
+        if not linea.startswith("#"):
+            break
+        comentario.insert(0, linea.lstrip("#").strip())
+    return " ".join(comentario)
+
+
+def test_barge_in_cancel_el_precio_en_el_respaldo_esta_documentado_entero():
+    """Con barge_in_cancel el Brain pide la respuesta en streaming hacia un on_token
+    mudo, y FallbackLLM da por hablado lo que el streamer suelta: si la nube se cae
+    DESPUÉS de soltar texto, se dice el aviso en vez de la respuesta del local. Pasa
+    sin tools a la vista y, con tools, con stream_release="sentence" (suelta tras la
+    1ª frase); con "final" y tools, igual que hoy. De fábrica (sin la clave) nada
+    cambia. La toml lo cuenta entero. Si LiveStreamer llega a respetar el False del
+    on_token mudo (threads._callar), esta prueba y ese comentario cambian juntos."""
+    from crotolamo.settings import DEFAULT_CONFIG
+    from crotolamo.voice.threads import _callar
+
+    local = (["Respuesta local."], 1)
+    aviso = ([_SE_CAYO], 0)
+    assert _brain_con_la_nube_que_se_cae(False, "final") == local      # de fábrica
+    assert _brain_con_la_nube_que_se_cae(False, "sentence") == local
+    assert _brain_con_la_nube_que_se_cae(True, "final") == local       # como hoy
+    assert _brain_con_la_nube_que_se_cae(True, "sentence") == aviso
+    assert _brain_con_la_nube_que_se_cae(False, "final", con_tools=False) == local
+    assert _brain_con_la_nube_que_se_cae(True, "final", con_tools=False) == aviso
+    # El on_token mudo ya dice "no salió nada" (el contrato de FallbackLLM); lo
+    # que falta para que cuente está en el streamer (core/streaming.py).
+    assert _callar("Hola, patrón.") is False
+
+    explicacion = _comentario_de(DEFAULT_CONFIG.read_text(encoding="utf-8"),
+                                 "barge_in_cancel")
+    for dato in ("SIN tools", 'stream_release = "sentence"', "1ª frase", '"final"',
+                 "respuesta del local"):
+        assert dato in explicacion, dato
+
+
+def test_el_agente_de_build_agent_recibe_el_aviso_y_acepta_la_cancelacion(monkeypatch,
+                                                                         tmp_path):
+    """Con el agente REAL de build_agent (GLM con respaldo): el aviso del wake llega a
+    FallbackLLM.preconnect, y con barge_in_cancel el Brain le pasa should_abort."""
+    import queue
+
+    from crotolamo.voice.state import SharedState
+    from crotolamo.voice.threads import BrainThread, WakePreconnect
+
+    agent = _build_agent_con_voz(monkeypatch, tmp_path, {})
+    aviso = WakePreconnect.del_agente(agent)
+    assert aviso is not None and aviso._llm is agent.llm
+    aviso()                                       # motores sin preconnect: False, sin error
+    aviso.join(5)
+    q: queue.Queue = queue.Queue()
+    for cancelar in (False, True):
+        brain = BrainThread(agent, q, q, SharedState(), threading.Event(),
+                            cancel_on_barge_in=cancelar)
+        assert brain._cancelable is cancelar

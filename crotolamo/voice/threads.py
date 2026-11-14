@@ -12,6 +12,7 @@ El orquestador VoiceLoop vive en loop.py; los adapters reales en adapters.py.
 
 from __future__ import annotations
 
+import inspect
 import queue
 import threading
 import time
@@ -28,6 +29,83 @@ log = get_logger("voice.loop")
 
 END = object()  # sentinel: fin de la respuesta de un turno
 STOP = object()  # sentinel: apagado (lo mete en cada cola el Wakeable de VoiceLoop)
+
+# Espera máxima, al apagar, a una pre-conexión del wake que siga en curso (ver
+# WakePreconnect.join). Más no compra nada: el hilo es daemon y lo que conecta es
+# una optimización; uno colgado en el DNS muere con el proceso.
+_PRECONNECT_JOIN_S = 0.5
+
+
+class WakePreconnect:
+    """El aviso de "empieza una orden" (wake o barge-in): pre-conecta el motor del
+    agente en segundo plano y es el DUEÑO de esos hilos.
+
+    El handshake TCP+TLS con la nube se pagaba DENTRO del turno, después del STT;
+    así se paga mientras el patrón dice la orden (ver engine.preconnect_in_background
+    y HTTPTransport.preconnect). No cambia lo que se oye: la misma petición y la
+    misma respuesta, solo que por un socket ya abierto. Nunca lanza: sin red, o si
+    algo falla, queda en el log y el turno conecta como siempre. `join` espera con
+    un tope, al apagar, a los hilos que sigan conectando.
+    """
+
+    def __init__(self, llm) -> None:
+        self._llm = llm
+        self._hilos: list[threading.Thread] = []
+        self._lock = threading.Lock()
+
+    @classmethod
+    def del_agente(cls, agent) -> WakePreconnect | None:
+        """El aviso para el motor del agente, o None si no sabe pre-conectar (un
+        agente sin `llm` o un motor sin `preconnect` llamable, como los de
+        mentiras de los tests): ni hilo ni nada, todo como antes."""
+        llm = getattr(agent, "llm", None)
+        if not callable(getattr(llm, "preconnect", None)):
+            return None
+        return cls(llm)
+
+    def __call__(self) -> None:
+        try:
+            # Perezoso: el oído no carga ssl/http.client si nadie pre-conecta.
+            from crotolamo.core.engine import preconnect_in_background
+
+            hilo = preconnect_in_background(self._llm)
+        except Exception as error:  # noqa: BLE001 - una optimización no tumba al wake
+            log.debug("no pude pre-conectar el motor: %s", error)
+            return
+        with self._lock:
+            # Solo se guardan los que siguen vivos: por transporte conecta uno a
+            # la vez (los demás salen al instante), así que la lista no crece.
+            self._hilos = [h for h in self._hilos if h.is_alive()]
+            if hilo is not None:
+                self._hilos.append(hilo)
+
+    def join(self, timeout_s: float = _PRECONNECT_JOIN_S) -> None:
+        """Espera, con UN tope para todos, a los hilos que sigan conectando."""
+        with self._lock:
+            hilos, self._hilos = self._hilos, []
+        fin = time.monotonic() + timeout_s
+        for hilo in hilos:
+            hilo.join(max(0.0, fin - time.monotonic()))
+
+
+def _acepta(funcion, nombre: str) -> bool:
+    """¿`funcion` acepta el argumento `nombre`? Para no pasarle a un agente lo que
+    no entiende (los de mentiras de los tests: handle_turn(command))."""
+    try:
+        return nombre in inspect.signature(funcion).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _callar(_texto: str) -> bool:
+    """on_token que no habla nada (ver BrainThread, cancel_on_barge_in).
+
+    Devuelve False, "no salió nada", el contrato de LiveStreamer.feed con
+    FallbackLLM: lo que llega aquí no lo oyó nadie y la nube que se cae después
+    podría repetirse en el local. Hoy el streamer no lo mira (el Emitter se traga
+    lo que devuelve): sigue contando como hablado lo que suelta (ver
+    [voice].barge_in_cancel en la toml)."""
+    return False
 
 
 def _get_timeout(shutdown) -> float | None:
@@ -93,11 +171,21 @@ class MouthThread(threading.Thread):
 class BrainThread(threading.Thread):
     """Saca comandos, llama al agente y encola las frases con su turn_id (M3.4).
 
-    Nota honesta: agent.handle_turn llama al LLM por HTTP de forma BLOQUEANTE; no se
-    puede cancelar a media inferencia. Si hay barge-in mientras el LLM piensa, la
-    inferencia vieja termina en background pero su salida se DESCARTA por el check del
-    turno (set_text_if_current); el audio para al instante. Cancelar el LLM en vuelo es mejora
-    futura (streaming con check de turno).
+    Nota honesta: de fábrica, agent.handle_turn(command) corre ENTERO. Si hay
+    barge-in mientras el LLM piensa, el turno viejo termina en background (sus
+    llamadas al LLM y sus tools, en silencio) pero su salida se DESCARTA por el
+    check del turno (set_text_if_current); el audio para al instante. La orden
+    nueva espera detrás de él en la cola.
+
+    cancel_on_barge_in ([voice].barge_in_cancel, solo con --barge-in; false de
+    fábrica): el agente recibe un should_abort que dice si el turno ya no es el
+    vigente, y lo corta en su siguiente punto de control (cada línea del stream,
+    cada iteración, antes de cada tool). Sin streaming de voz se le pasa un
+    on_token que no habla nada: así pide la respuesta en streaming y cada línea
+    es un punto de control; lo que se habla sigue saliendo de lo que devuelve.
+    Precio: una tool que el turno interrumpido aún no había empezado ya no corre
+    y el historial anota la interrupción. Un agente sin should_abort recibe la
+    llamada de siempre.
 
     stream ([voice].stream_speak_concurrent, false de fábrica): como el loop simple
     con stream_speak, cada frase va a la Boca EN CUANTO el LLM la cierra (la
@@ -108,7 +196,7 @@ class BrainThread(threading.Thread):
 
     def __init__(self, agent, command_queue: queue.Queue, tts_queue: queue.Queue,
                  state: SharedState, shutdown: threading.Event, *,
-                 stream: bool = False, tts=None) -> None:
+                 stream: bool = False, tts=None, cancel_on_barge_in: bool = False) -> None:
         super().__init__(name="Brain", daemon=True)
         self.agent = agent
         self.cmd_q = command_queue
@@ -116,6 +204,15 @@ class BrainThread(threading.Thread):
         self.state = state
         self.shutdown = shutdown
         self.stream = stream
+        self.cancel_on_barge_in = cancel_on_barge_in
+        # La firma se mira UNA vez: un agente de una sola orden (handle_turn(command))
+        # sigue recibiendo la llamada de siempre aunque la clave esté puesta.
+        handle_turn = getattr(agent, "handle_turn", None)
+        self._cancelable = cancel_on_barge_in and all(
+            _acepta(handle_turn, nombre) for nombre in ("on_token", "should_abort"))
+        if cancel_on_barge_in and not self._cancelable:
+            log.info("barge_in_cancel: el agente no acepta should_abort; un turno "
+                     "interrumpido termina como siempre")
         self._prepare = getattr(tts, "prepare", None)
 
     def _encolar(self, sentence: str, turn: int) -> None:
@@ -127,6 +224,10 @@ class BrainThread(threading.Thread):
         """emit del streaming: una frase de un turno abortado ya no va a la Boca."""
         if self.state.is_current(turn):
             self._encolar(sentence, turn)
+
+    def _abortado(self, turn: int) -> bool:
+        """should_abort del turno (cancel_on_barge_in): ya no es el vigente."""
+        return not self.state.is_current(turn)
 
     def run(self) -> None:
         timeout = _get_timeout(self.shutdown)
@@ -146,13 +247,18 @@ class BrainThread(threading.Thread):
             feeder: SentenceFeeder | None = None
             on_token: _AvisoEnFraseAparte | None = None
             roto = False
+            # cancel_on_barge_in: el turno se corta en cuanto un barge-in lo
+            # invalida (ver la nota de la clase). Sin ella, la llamada de siempre.
+            cortar = {"should_abort": partial(self._abortado, turn)} if self._cancelable else {}
             try:
                 if self.stream:
                     feeder = SentenceFeeder(partial(self._encolar_si_vigente, turn))
                     # El aviso de un LLM que se cae a media respuesta, en frase
                     # aparte (lo mismo que el loop simple).
                     on_token = _AvisoEnFraseAparte(feeder.feed)
-                    reply = self.agent.handle_turn(command, on_token=on_token)
+                    reply = self.agent.handle_turn(command, on_token=on_token, **cortar)
+                elif cortar:
+                    reply = self.agent.handle_turn(command, on_token=_callar, **cortar)
                 else:
                     reply = self.agent.handle_turn(command)
             except Exception as error:  # noqa: BLE001 - un turno roto no mata el loop
@@ -305,10 +411,17 @@ class EarThread(threading.Thread):
                  start_timeout_s: float = DEFAULTS.command_start_timeout_s,
                  preactivation_ms: float = DEFAULTS.vad_preactivation_ms,
                  wake_rearm=None,
-                 post_speak_grace_s: float = DEFAULTS.post_speak_grace_s) -> None:
+                 post_speak_grace_s: float = DEFAULTS.post_speak_grace_s,
+                 on_wake=None) -> None:
         super().__init__(name="Ear", daemon=True)
         self.mic = mic
         self.wake_fn = wake_fn
+        # Aviso de "empieza una orden" (wake o barge-in): VoiceLoop pre-conecta
+        # ahí el motor del agente (WakePreconnect). Sale con la 1ª voz de la
+        # orden (ver _start_command). Debe volver al instante; un fallo suyo no
+        # toca la captura. None = nada.
+        self.on_wake = on_wake
+        self._aviso_pendiente = False
         # Olvido del detector tras un HUECO (WakeWordDetector.rearm): un chunk
         # que no llega a wake_fn (turno, gracia post-habla, escucha pausada)
         # abre el hueco y el primer wake_fn tras él lo cierra. None = nada.
@@ -374,6 +487,26 @@ class EarThread(threading.Thread):
         # se alimenta del eco del TTS en THINKING/SPEAKING y ese contexto
         # llegaba a la orden nueva (la del barge-in o la del wake siguiente).
         self._reset_vad()
+        # Mientras el patrón dice la orden, el motor pre-conecta (el handshake con
+        # la nube sale del turno). Pero no con el wake: un falso wake (el wake y
+        # silencio, SIN_VOZ) abría una conexión que ninguna petición usaba. El
+        # aviso espera a la 1ª voz de la orden (rama LISTENING de _on_chunk), que
+        # aún deja el resto de la orden, el silencio de cierre y el STT para
+        # conectar. El barge-in ya trae voz: avisa ya.
+        self._aviso_pendiente = self.on_wake is not None
+        if voiced:
+            self._avisar()
+
+    def _avisar(self) -> None:
+        """El aviso de orden nueva (on_wake), una vez por orden. Un fallo suyo no
+        toca la captura: queda en DEBUG."""
+        if not self._aviso_pendiente:
+            return
+        self._aviso_pendiente = False
+        try:
+            self.on_wake()
+        except Exception as error:  # noqa: BLE001 - el aviso no tumba al oído
+            log.debug("oído: el aviso de orden nueva falló: %s", error)
 
     def _rearm_wake(self) -> None:
         """Primer chunk para el wake tras un hueco: que el detector olvide lo
@@ -417,6 +550,8 @@ class EarThread(threading.Thread):
         return False
 
     def _finish_command(self) -> None:
+        # Una orden que acaba sin voz no avisa (ver _start_command).
+        self._aviso_pendiente = False
         if self._endpoint.speaking:
             wav = self.to_wav(self._endpoint.frames)
             self.stt_q.put((wav, self._turn))
@@ -520,7 +655,10 @@ class EarThread(threading.Thread):
             # start_timeout_s en el modo simple, y solo guarda la pre-activación:
             # segundos de ruido de la habitación no van a Whisper. Sin voz al
             # final, a reposo y nada a Whisper (V6). Ver voice/vad.py.
-            if self._endpoint.feed(chunk, self.vad_fn(chunk)) in (FIN, SIN_VOZ):
+            estado = self._endpoint.feed(chunk, self.vad_fn(chunk))
+            if self._aviso_pendiente and self._endpoint.speaking:
+                self._avisar()          # la 1ª voz de la orden: ahora sí pre-conecta
+            if estado in (FIN, SIN_VOZ):
                 self._finish_command()
 
         elif mode in (Mode.THINKING, Mode.SPEAKING):

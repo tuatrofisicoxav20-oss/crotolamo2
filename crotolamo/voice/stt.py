@@ -217,6 +217,29 @@ class _FuenteVigilada:
             raise
 
 
+class _PrimeraVoz:
+    """on_voice de una grabación: se llama UNA vez, con el primer chunk de voz.
+
+    Para quien quiere adelantar trabajo mientras el patrón aún habla (el listener
+    pre-conecta ahí el motor, ver listener._run_simple_loop) sin hacerlo con una
+    grabación que acaba sin voz (un falso wake). Una sola instancia por grabación:
+    si Silero falla a media orden y se reintenta con energía, no avisa dos veces.
+    Un fallo suyo no toca la grabación: queda en DEBUG.
+    """
+
+    def __init__(self, fn: Callable[[], None]) -> None:
+        self._fn: Callable[[], None] | None = fn
+
+    def __call__(self) -> None:
+        fn, self._fn = self._fn, None
+        if fn is None:
+            return
+        try:
+            fn()
+        except Exception as error:  # noqa: BLE001 - el aviso no tumba la grabación
+            log.debug("el aviso de la primera voz falló: %s", error)
+
+
 def _require(module: str):
     try:
         return __import__(module)
@@ -321,7 +344,8 @@ class STT:
 
     def _record_frames(self, silence_ms: int | None, max_seconds: float,
                        start_timeout_s: float, gate: Any = None, source: Any = None,
-                       on_idle: Callable[[], bool] | None = None) -> list:
+                       on_idle: Callable[[], bool] | None = None,
+                       on_voice: Callable[[], None] | None = None) -> list:
         """Graba hasta el silencio y devuelve los frames float32 crudos. Backend
         según [voice].vad_backend: 'silero' (M2) o 'energy' (fallback). Silero
         suma un buffer de pre-activación para no perder las primeras sílabas.
@@ -329,6 +353,7 @@ class STT:
         source/on_idle: fuente ya abierta (capture.MicSession) en vez de un
         stream propio, ver _silero_de_fuente; None = lo de siempre. Con fuente,
         un fallo de la FUENTE sube tal cual: no es del VAD (ver _FuenteVigilada).
+        on_voice: se llama una vez con la 1ª voz (ver _PrimeraVoz); None = nada.
         """
         voice = _voice_cfg()
         if silence_ms is None:
@@ -338,6 +363,8 @@ class STT:
         fuente = None if source is None else _FuenteVigilada(source)
         extra: dict[str, Any] = {} if fuente is None else {"source": fuente,
                                                             "on_idle": on_idle}
+        if on_voice is not None:
+            extra["on_voice"] = _PrimeraVoz(on_voice)
 
         if backend == "silero":
             if _silero_load_error is not None:
@@ -370,7 +397,8 @@ class STT:
                                    start_timeout_s: float = DEFAULTS.command_start_timeout_s,
                                    gate: Any = None,
                                    source: Any = None,
-                                   on_idle: Callable[[], bool] | None = None):
+                                   on_idle: Callable[[], bool] | None = None,
+                                   on_voice: Callable[[], None] | None = None):
         """Graba hasta el silencio y devuelve el audio float32 EN MEMORIA.
 
         Misión velocidad: faster-whisper acepta el ndarray directo, así que el
@@ -379,9 +407,13 @@ class STT:
 
         source/on_idle: leer de una fuente ya abierta (capture.MicSession) en vez
         de abrir el micrófono; ver _silero_de_fuente. None = lo de siempre.
+        on_voice: se llama una vez con la 1ª voz de la grabación, no al acabarla
+        (ver _PrimeraVoz). None = lo de siempre.
         """
         extra: dict[str, Any] = {} if source is None else {"source": source,
                                                             "on_idle": on_idle}
+        if on_voice is not None:
+            extra["on_voice"] = on_voice
         return self._frames_to_audio(
             self._record_frames(silence_ms, max_seconds, start_timeout_s, gate=gate, **extra)
         )
@@ -407,15 +439,17 @@ class STT:
 
     def _record_energy(self, silence_ms: int, max_seconds: float,
                        start_timeout_s: float, gate: Any = None, source: Any = None,
-                       on_idle: Callable[[], bool] | None = None) -> list:
+                       on_idle: Callable[[], bool] | None = None,
+                       on_voice: Callable[[], None] | None = None) -> list:
         """VAD por energía RMS. Calibra el piso de ruido con ~10 chunks (M1 audit).
         Si en la ventana solo hubo ruido estable, devuelve [] (igual que Silero).
         gate: pre-filtro del wake difuso (ver _GateRun).
         source/on_idle: fuente ya abierta en vez de un stream propio (ver
-        _energia_de_fuente); None = lo de siempre."""
+        _energia_de_fuente); None = lo de siempre.
+        on_voice: se llama con el primer chunk que enciende `speaking`."""
         if source is not None:
             return self._energia_de_fuente(silence_ms, max_seconds, start_timeout_s,
-                                           gate, source, on_idle)
+                                           gate, source, on_idle, on_voice=on_voice)
         np = _require("numpy")
         sd = _require("sounddevice")
 
@@ -457,6 +491,8 @@ class STT:
                     threshold = max(noise_floor * ratio, 0.01)
 
                 if rms >= threshold:
+                    if not speaking and on_voice is not None:
+                        on_voice()
                     speaking = True
                     silent_run = 0
                 elif speaking:
@@ -482,7 +518,8 @@ class STT:
 
     def _energia_de_fuente(self, silence_ms: int, max_seconds: float,
                            start_timeout_s: float, gate: Any, source: Any,
-                           on_idle: Callable[[], bool] | None) -> list:
+                           on_idle: Callable[[], bool] | None,
+                           on_voice: Callable[[], None] | None = None) -> list:
         """_record_energy sobre una fuente ya abierta: mismas decisiones chunk a
         chunk (bloques de 30 ms que la fuente re-encuadra), con lo propio de leer
         de una fuente que explica _silero_de_fuente. Al pedir seguir tras una
@@ -534,6 +571,8 @@ class STT:
                 threshold = max(noise_floor * ratio, 0.01)
 
             if rms >= threshold:
+                if not speaking and on_voice is not None:
+                    on_voice()
                 speaking = True
                 silent_run = 0
             elif speaking:
@@ -557,16 +596,18 @@ class STT:
 
     def _record_silero(self, silence_ms: int, max_seconds: float,
                        start_timeout_s: float, voice: dict, gate: Any = None,
-                       source: Any = None, on_idle: Callable[[], bool] | None = None) -> list:
+                       source: Any = None, on_idle: Callable[[], bool] | None = None,
+                       on_voice: Callable[[], None] | None = None) -> list:
         """VAD neuronal Silero (de GLaDOS, M2). Probabilidad de voz por chunk de
         32 ms + buffer circular de pre-activación para no perder el inicio.
         gate: pre-filtro del wake difuso (ver _GateRun).
         source/on_idle: fuente ya abierta en vez de un stream propio (ver
         _silero_de_fuente); None = lo de siempre.
+        on_voice: se llama con el primer chunk en voz (Endpointer.speaking).
         """
         if source is not None:
             return self._silero_de_fuente(silence_ms, max_seconds, start_timeout_s, voice,
-                                          gate, source, on_idle)
+                                          gate, source, on_idle, on_voice=on_voice)
         np = _require("numpy")
         sd = _require("sounddevice")
 
@@ -590,7 +631,11 @@ class STT:
                 # lanzaba VoiceUnavailable y el servicio salía en bucle).
                 prob = float(model(np.ascontiguousarray(block, dtype=np.float32),
                                    self.sample_rate))
-                if ep.feed(block, prob) in (FIN, SIN_VOZ):
+                estado = ep.feed(block, prob)
+                if on_voice is not None and ep.speaking:
+                    on_voice()      # la 1ª voz: lo mismo que el oído concurrente
+                    on_voice = None
+                if estado in (FIN, SIN_VOZ):
                     break
 
         return gated.trim(ep.frames, ep.first)
@@ -621,7 +666,8 @@ class STT:
 
     def _silero_de_fuente(self, silence_ms: int, max_seconds: float,
                           start_timeout_s: float, voice: dict, gate: Any, source: Any,
-                          on_idle: Callable[[], bool] | None) -> list:
+                          on_idle: Callable[[], bool] | None,
+                          on_voice: Callable[[], None] | None = None) -> list:
         """_record_silero sobre una fuente ya abierta (capture.MicSession): las
         mismas decisiones chunk a chunk que con el stream propio (lo comparan
         los tests de tests/test_capture.py), más lo que solo existe porque el
@@ -661,6 +707,9 @@ class STT:
             prob = float(model(np.ascontiguousarray(block, dtype=np.float32),
                                self.sample_rate))
             estado = ep.feed(block, prob)
+            if on_voice is not None and ep.speaking:
+                on_voice()
+                on_voice = None
             if estado == SIN_VOZ:
                 if on_idle is None or not on_idle():
                     break
@@ -747,7 +796,8 @@ class STT:
                      rounds: int = DEFAULTS.endpoint_rounds,
                      continue_timeout_s: float = DEFAULTS.endpoint_continue_s,
                      hotwords: str | None = None,
-                     min_audio_s: float = 0.0, source: Any = None) -> str:
+                     min_audio_s: float = 0.0, source: Any = None,
+                     on_voice: Callable[[], None] | None = None) -> str:
         """Escucha con endpointing inteligente: si la frase parece INCOMPLETA
         (pausa de pensar: termina en "de", "para", coma...), reabre la escucha
         `continue_timeout_s` segundos y concatena la continuación, hasta
@@ -758,13 +808,17 @@ class STT:
         Con el stream propio, la continuación abría el suyo tras decodificar la
         primera parte y el arranque de la frase que seguía se perdía; con la
         fuente, eso queda capturado y se lee primero. None = lo de siempre.
+
+        on_voice: se llama una vez con la 1ª voz de la PRIMERA ronda (ver
+        record_audio_until_silence); las continuaciones ya no avisan.
         """
         from crotolamo.voice.endpoint import seems_incomplete
 
         fuente: dict[str, Any] = {} if source is None else {"source": source}
+        voz: dict[str, Any] = {} if on_voice is None else {"on_voice": on_voice}
         text = self._listen_transcribe(
             hotwords=hotwords, min_audio_s=min_audio_s, silence_ms=silence_ms,
-            max_seconds=max_seconds, start_timeout_s=start_timeout_s, **fuente,
+            max_seconds=max_seconds, start_timeout_s=start_timeout_s, **fuente, **voz,
         )
         for _ in range(max(0, rounds)):
             if not text.strip() or not seems_incomplete(text):

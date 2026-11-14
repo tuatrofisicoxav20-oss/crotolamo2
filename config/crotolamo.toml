@@ -464,6 +464,22 @@ vad_silence_ms       = 600
 barge_in_grace_ms         = 400   # ignora barge-in los primeros ms tras empezar a hablar
 barge_in_threshold_margin = 0.1   # umbral VAD más alto mientras suena el TTS
 barge_in_min_chunks       = 5     # racha de chunks de voz para disparar (no un pico)
+# Qué pasa con el turno que un barge-in interrumpe (solo con --barge-in, loop
+# concurrente). false (de fábrica, lo de siempre) = termina en silencio: sus llamadas
+# al LLM y sus tools siguen y la orden nueva espera detrás de él. true = se corta en
+# su siguiente punto de control (cada línea del stream, antes de cada tool). MEDIDO
+# (bench, barge-in en el 4º token de la 1ª llamada de un turno con tool): lo que el
+# turno viejo gasta tras la interrupción pasa de 1 llamada al LLM, 40 tokens y 1 tool
+# a 0 / 0 / 0; la orden nueva se contesta igual. El precio: una tool que el turno
+# interrumpido aún no había empezado ya no corre (hoy corre en silencio), el
+# historial anota "(Turno interrumpido por el patrón.)" y ese turno no va a la
+# memoria. Para poder cortar a media respuesta, el Brain la pide en streaming (sin
+# hablarla) y el respaldo la da por hablada en cuanto suelta texto: si la nube se cae
+# después, se oye el aviso en vez de la respuesta del local. Pasa SIN tools a la vista
+# (raro con GLM) y, con stream_release = "sentence", también con tools tras la 1ª frase
+# (así stream_release cuenta aquí aunque no se hable en streaming); con "final" y
+# tools, el local contesta como hoy. Sin validar con micro y auriculares reales.
+barge_in_cancel = false
 # Hotwords (faster-whisper >= 1.0.2): sesgo del decoder hacia nombres propios,
 # SOLO en la transcripción de comandos (post-wake). La detección de wake NO lo
 # usa: un sesgo con "crotolamo" sobre silencio aumentaría falsos despertares.

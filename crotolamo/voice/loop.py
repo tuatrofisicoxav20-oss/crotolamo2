@@ -31,6 +31,7 @@ from crotolamo.voice.threads import (
     MouthThread,
     SttThread,
     Utterance,
+    WakePreconnect,
     _drain_queue,
 )
 from crotolamo.voice.vad import DEFAULTS
@@ -97,6 +98,8 @@ class VoiceLoop:
                 publisher del estado. None (default) = sin ducking, nada cambia.
         stream_speak: [voice].stream_speak_concurrent (ver BrainThread). False
                 (default) = la respuesta se habla cuando el LLM termina, como siempre.
+                [voice].barge_in_cancel (false de fábrica) se lee de la config y
+                solo actúa con allow_barge_in (ver BrainThread).
         start_timeout_s, max_command_s, post_speak_grace_s: espera de la orden
                 tras el wake, tope de la orden y gracia del oído tras un turno (los
                 da ListenerConfig; sin ellos, los de la tabla de voice/vad.py).
@@ -152,6 +155,14 @@ class VoiceLoop:
         except Exception as error:  # noqa: BLE001 — sin config, defaults
             log.warning("no pude cargar la config de voz (%s); uso defaults", error)
             vcfg = {}
+        # El aviso del wake (y del barge-in): el motor del agente pre-conecta
+        # mientras el patrón dice la orden (ver WakePreconnect). None = el agente
+        # no sabe hacerlo (los de mentiras): ni hilo ni nada. Su dueño es este
+        # loop: stop() espera, acotado, a la que siga conectando.
+        self._preconexion = WakePreconnect.del_agente(agent)
+        # [voice].barge_in_cancel: cortar el turno que un barge-in invalidó. Sin
+        # --barge-in no hay interrupción que lo dispare: no aplica.
+        cancel_on_barge_in = allow_barge_in and bool(vcfg.get("barge_in_cancel", False))
         # Adapters reales por defecto; los tests inyectan fakes (no abre audio).
         # input_device: None (default) = micrófono default del sistema. Apúntalo a
         # "crotolamo_aec_source" tras activar el AEC (ver desktop/aec.sh).
@@ -183,6 +194,7 @@ class VoiceLoop:
             # Tras un hueco (escucha pausada) el detector olvida lo de antes;
             # con un wake_fn inyectado (tests) no hay detector que rearmar.
             wake_rearm=None if wake_fn is not None else getattr(wake_detector, "rearm", None),
+            on_wake=self._preconexion,
         )
         # El oído es el ÚNICO lector del micrófono: stop() lo espera antes de
         # cerrar el stream (ver stop()).
@@ -194,7 +206,7 @@ class VoiceLoop:
             SttThread(stt, self.stt_q, self.cmd_q, self.state, self.shutdown,
                       hotwords=vcfg.get("hotwords", DEFAULTS.hotwords_concurrent)),
             BrainThread(agent, self.cmd_q, self.tts_q, self.state, self.shutdown,
-                        stream=stream_speak, tts=tts),
+                        stream=stream_speak, tts=tts, cancel_on_barge_in=cancel_on_barge_in),
             MouthThread(tts, self.tts_q, self.state, self.shutdown),
         ]
         for hilo in self.threads:
@@ -409,3 +421,5 @@ class VoiceLoop:
         for t in self.threads:                    # 6) esperar (todos miran shutdown)
             if t is not self._ear:
                 t.join(timeout=2.0)
+        if self._preconexion is not None:         # 7) la pre-conexión del último wake
+            self._preconexion.join()
