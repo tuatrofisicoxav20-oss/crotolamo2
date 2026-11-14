@@ -318,6 +318,25 @@ _ENVS_KEY_SDK: dict[str, tuple[str, ...]] = {
 _KEY_RELLENO = "sin-key"
 
 
+def _sin_key(llm: dict[str, Any]) -> bool:
+    """True si el SDK del LLM de extracción se quedaría sin key: ni en la config
+    de mem0 ni en las variables de las que la toma él solo. Ollama no usa key."""
+    envs = _ENVS_KEY_SDK.get(llm["provider"])
+    if not envs:
+        return False
+    return not llm["config"].get("api_key") and not any(
+        os.environ.get(env, "").strip() for env in envs)
+
+
+def extraccion_sin_key(cfg: MemoriaConfig, settings: Any) -> bool:
+    """¿Arrancaría mem0 sin key para extraer (y con la extracción apagada)?
+
+    El mismo criterio que Mem0Backend._config_arrancable, en un solo sitio: el
+    doctor lo usa para decir lo que de verdad va a pasar al arrancar.
+    """
+    return _sin_key(_llm_config(cfg, settings))
+
+
 def fijar_cache_modelos(ruta: Path) -> None:
     """Hace que fastembed guarde el modelo de embeddings en `ruta`/modelos.
 
@@ -367,9 +386,7 @@ class Mem0Backend:
         """
         conf = self.config_mem0()
         llm = conf["llm"]
-        envs = _ENVS_KEY_SDK.get(llm["provider"])
-        if envs and not llm["config"].get("api_key") and not any(
-                os.environ.get(env, "").strip() for env in envs):
+        if _sin_key(llm):
             llm["config"]["api_key"] = _KEY_RELLENO
             self.sin_llm = True
             if self.cfg.extraer:

@@ -6,7 +6,9 @@ y prueba el comportamiento que el arreglo cambia; todos fallaban antes.
 
 from __future__ import annotations
 
+import builtins
 import http.client
+import logging
 import runpy
 import signal
 import socket
@@ -14,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -21,6 +24,7 @@ import pytest
 
 from crotolamo import settings as settings_mod
 from crotolamo.core import memoria as memoria_mod
+from crotolamo.core.agent import ToolAgent
 from crotolamo.core.llm import TransientLLMError
 from crotolamo.core.memoria import Memoria, MemoriaConfig
 from crotolamo.tools import _web, media, search
@@ -683,3 +687,126 @@ def test_los_si_claros_siguen_confirmando(answer):
 def test_la_suite_no_fusiona_el_local_toml_del_repo():
     assert settings_mod.LOCAL_CONFIG != settings_mod.CONFIG_DIR / "crotolamo.local.toml"
     assert not settings_mod.LOCAL_CONFIG.exists()
+
+
+# --- idx 7 (memoria-persistence#4): el doctor dice lo que hará la memoria al arrancar --
+# Con llm_provider = "ollama" mem0 necesita el paquete `ollama` (sin él no arranca y
+# la memoria ENTERA queda fuera) y el doctor no lo miraba. Sin API key para openai o
+# groq la memoria arranca pero sin extracción, y el doctor daba un ✅ liso.
+
+_ENVS_KEY_MEMORIA = ("CROTOLAMO_GLM_API_KEY", "ZAI_API_KEY", "ZHIPU_API_KEY",
+                     "OPENAI_API_KEY", "OPENROUTER_API_KEY", "GROQ_API_KEY")
+
+
+def _check_memoria_del_doctor(monkeypatch, tmp_path, faltan=(), env=None, **memoria):
+    from scripts import crotolamo_doctor as doctor
+
+    for nombre in _ENVS_KEY_MEMORIA:
+        monkeypatch.delenv(nombre, raising=False)
+    for nombre, valor in (env or {}).items():
+        monkeypatch.setenv(nombre, valor)
+    monkeypatch.setenv("MEM0_TELEMETRY", "False")
+    # mem0 & cía no están en el venv de la suite: se dan por importables salvo `faltan`.
+    monkeypatch.setattr(doctor, "_import_error",
+                        lambda m: f"ModuleNotFoundError: {m}" if m in faltan else None)
+    raw = {"memoria": {"enabled": True, "ruta": str(tmp_path / "mem"), **memoria}}
+    settings = settings_mod.Settings(raw=raw, user="test", home=tmp_path,
+                                     paths={"home": tmp_path})
+    ctx = doctor._Ctx(settings=settings, doctor={}, backend="glm", today=date(2026, 9, 30))
+    [check] = doctor._check_memoria(ctx)
+    return check
+
+
+def test_doctor_memoria_con_ollama_sin_su_paquete_es_rojo(monkeypatch, tmp_path):
+    check = _check_memoria_del_doctor(monkeypatch, tmp_path, faltan=("ollama",),
+                                      llm_provider="ollama")
+    assert not check.ok and "ollama" in check.detail
+    assert "pip install ollama" in check.fix
+
+
+def test_doctor_memoria_con_ollama_instalado_no_pide_key(monkeypatch, tmp_path):
+    check = _check_memoria_del_doctor(monkeypatch, tmp_path, llm_provider="ollama")
+    assert check.ok and not check.warn
+
+
+@pytest.mark.parametrize("provider", ["auto", "openai", "groq"])
+def test_doctor_memoria_sin_key_avisa_que_no_extrae(monkeypatch, tmp_path, provider):
+    check = _check_memoria_del_doctor(monkeypatch, tmp_path, llm_provider=provider)
+    assert check.ok and check.warn
+    assert "sin API key: la extracción automática queda apagada" in check.detail
+    assert "CROTOLAMO_GLM_API_KEY" in check.fix
+
+
+@pytest.mark.parametrize("env", [
+    {"CROTOLAMO_GLM_API_KEY": "clave-de-zai"},
+    {"OPENAI_API_KEY": "clave-del-sdk"},  # el SDK la toma solo: el runtime extrae
+])
+def test_doctor_memoria_con_key_es_un_ok_liso(monkeypatch, tmp_path, env):
+    check = _check_memoria_del_doctor(monkeypatch, tmp_path, env=env)
+    assert check.ok and not check.warn and "sin API key" not in check.detail
+
+
+def test_doctor_memoria_sin_key_y_con_extraer_false_no_avisa(monkeypatch, tmp_path):
+    # Sin extracción configurada no hay nada que se apague: el runtime tampoco avisa.
+    check = _check_memoria_del_doctor(monkeypatch, tmp_path, extraer=False)
+    assert check.ok and not check.warn
+
+
+# --- idx 21 (tools-fs-safety#2): un turno que revienta no mata el shell -------------
+# run_shell llamaba a handle_turn sin try: una excepción imprevista (un hook, un
+# print de un texto que no se puede codificar) cerraba la sesión entera, historial
+# incluido. Ahora va al log con su traceback y el patrón oye una frase en personaje.
+
+class _AgenteQueRevienta:
+    def handle_turn(self, text, on_token=None, should_abort=None):
+        if text == "rompe":
+            raise RuntimeError("bug imprevisto")
+        return f"eco: {text}"
+
+
+class _ToolAgentQueRevienta(ToolAgent):
+    def __init__(self):  # sin LLM ni registry: solo el contrato que usa el shell
+        pass
+
+    def handle_turn(self, text, on_token=None, should_abort=None):
+        assert on_token is not None
+        if text == "rompe":
+            on_token("Empiezo a cont")
+            raise RuntimeError("bug imprevisto")
+        on_token(f"eco: {text}")
+        return f"eco: {text}"
+
+
+@pytest.mark.parametrize("argv, agente", [
+    ([], _AgenteQueRevienta()),
+    (["--stream"], _ToolAgentQueRevienta()),
+])
+def test_un_turno_que_revienta_no_cierra_el_shell(monkeypatch, capsys, caplog, argv, agente):
+    import interfaces.shell as shell
+
+    monkeypatch.setattr(shell, "build_agent", lambda confirm_fn=None: (agente, None))
+    entradas = iter(["rompe", "sigue", "salir"])
+    monkeypatch.setattr(builtins, "input", lambda prompt="": next(entradas))
+
+    with caplog.at_level(logging.ERROR, logger="crotolamo.shell"):
+        assert shell.run_shell(argv) == 0
+    out = capsys.readouterr().out
+    assert "Se me trabaron los cables, patrón. Vuelve a intentarlo." in out
+    assert "eco: sigue" in out  # el turno siguiente se atendió
+    assert out.rstrip().endswith("Crotolamo apagado, patrón.")
+    [registro] = [r for r in caplog.records if r.exc_info]
+    assert "bug imprevisto" in str(registro.exc_info[1])
+
+
+def test_ctrl_c_en_un_turno_sigue_sin_tragarse(monkeypatch):
+    """El except es de Exception: un KeyboardInterrupt sigue saliendo como antes."""
+    import interfaces.shell as shell
+
+    class _Interrumpe:
+        def handle_turn(self, text, on_token=None, should_abort=None):
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(shell, "build_agent", lambda confirm_fn=None: (_Interrumpe(), None))
+    monkeypatch.setattr(builtins, "input", lambda prompt="": "hola")
+    with pytest.raises(KeyboardInterrupt):
+        shell.run_shell([])

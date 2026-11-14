@@ -83,8 +83,9 @@ class LLMClient:
         self.temperature = temperature
         self.timeout = timeout
         # num_ctx: ventana de contexto que Ollama reserva. En CPU, una ventana
-        # más chica reduce memoria y trabajo del KV-cache; con el routing de
-        # tools (prompts cortos) 2048 sobra. None = default del modelo.
+        # más chica reduce memoria y trabajo del KV-cache; ojo: persona + 8
+        # schemas enrutadas ya ocupan ~1600-1750 tokens; ver el comentario de
+        # [llm].num_ctx en config/crotolamo.toml. None = default del modelo.
         self.num_ctx = num_ctx
         # keep_alive: cuánto mantiene Ollama el modelo (y su cache de prefijo KV)
         # residente tras una respuesta. En CPU es CLAVE: el primer turno paga el

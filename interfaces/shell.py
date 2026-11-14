@@ -19,6 +19,9 @@ from crotolamo.settings import get_settings
 
 log = get_logger("shell")
 
+# Lo que oye el patrón cuando un turno revienta por un bug (la misma frase que la voz).
+_TURNO_ROTO = "Se me trabaron los cables, patrón. Vuelve a intentarlo."
+
 
 def build_agent(confirm_fn=None) -> tuple[Agent, Conversation]:
     """Construye el agente con tools, guard y memoria persistente inyectada.
@@ -194,13 +197,22 @@ def run_shell(argv: list[str] | None = None) -> int:
             _show_history(conversation)
             continue
 
-        if can_stream and isinstance(agent, ToolAgent):
-            print("\nCrotolamo > ", end="", flush=True)
-            agent.handle_turn(user, on_token=lambda t: print(t, end="", flush=True))
-            print("\n")
-        else:
-            reply = agent.handle_turn(user)
-            print(f"\nCrotolamo > {reply}\n")
+        try:
+            if can_stream and isinstance(agent, ToolAgent):
+                print("\nCrotolamo > ", end="", flush=True)
+                agent.handle_turn(user, on_token=lambda t: print(t, end="", flush=True))
+                print("\n")
+            else:
+                reply = agent.handle_turn(user)
+                print(f"\nCrotolamo > {reply}\n")
+        except Exception as error:  # noqa: BLE001 - un turno roto no mata el shell
+            # Como el listener: el traceback al log y al patrón una frase en
+            # personaje. Sin esto, UNA excepción imprevista (un hook, la DB, un
+            # print de texto que no se puede codificar) cerraba la sesión entera
+            # con su historial. Los LLMError ya vuelven como respuesta normal.
+            log.exception("el turno reventó: %s", error)
+            # En streaming el "Crotolamo > " (y quizá media frase) ya salió.
+            print(f"\n{_TURNO_ROTO}\n" if can_stream else f"\nCrotolamo > {_TURNO_ROTO}\n")
 
 
 if __name__ == "__main__":

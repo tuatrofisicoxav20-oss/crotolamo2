@@ -765,7 +765,7 @@ def _check_silero(ctx: _Ctx) -> list[Check]:
 
 def _check_memoria(ctx: _Ctx) -> list[Check]:
     """Memoria semántica (mem0): deps importables, ruta escribible, telemetría off."""
-    from crotolamo.core.memoria import MemoriaConfig, resolver_provider
+    from crotolamo.core.memoria import MemoriaConfig, extraccion_sin_key, resolver_provider
 
     cfg = MemoriaConfig.from_settings(ctx.settings)
     provider = resolver_provider(cfg, ctx.settings)
@@ -774,9 +774,16 @@ def _check_memoria(ctx: _Ctx) -> list[Check]:
     faltan = [m for m in ("mem0", "chromadb", "fastembed") if _import_error(m)]
     if provider == "groq" and _import_error("groq"):
         faltan.append("groq")
+    # mem0 construye el cliente de Ollama al ARRANCAR y sin el paquete `ollama`
+    # no arranca: la memoria entera (no solo la extracción) se quedaba fuera
+    # con este check en verde.
+    if provider == "ollama" and _import_error("ollama"):
+        faltan.append("ollama")
     if faltan:
-        return [Check("memoria", False, f"faltan módulos: {', '.join(faltan)}",
-                      "pip install -e '.[memoria]'  (versiones fijadas en pyproject)")]
+        fix = "pip install -e '.[memoria]'  (versiones fijadas en pyproject)"
+        if "ollama" in faltan:
+            fix += '; para llm_provider = "ollama": pip install ollama'
+        return [Check("memoria", False, f"faltan módulos: {', '.join(faltan)}", fix)]
     try:
         cfg.ruta.mkdir(parents=True, exist_ok=True)
         prueba = cfg.ruta / ".doctor_escribe"
@@ -789,9 +796,18 @@ def _check_memoria(ctx: _Ctx) -> list[Check]:
     if os.environ.get("MEM0_TELEMETRY") != "False":
         return [Check("memoria", False, "la telemetría de mem0 NO está apagada",
                       "No exportes MEM0_TELEMETRY en el entorno; core/memoria.py la apaga.")]
-    return [Check("memoria", True,
-                  f"mem0/chromadb/fastembed OK, ruta {cfg.ruta} escribible, telemetría apagada "
-                  f"(umbral {cfg.umbral:g}, top_k {cfg.top_k}, LLM {provider})")]
+    detalle = (f"mem0/chromadb/fastembed OK, ruta {cfg.ruta} escribible, telemetría apagada "
+               f"(umbral {cfg.umbral:g}, top_k {cfg.top_k}, LLM {provider})")
+    # Sin key, la memoria arranca con una de relleno y solo se apaga la extracción
+    # (Mem0Backend._config_arrancable, mismo criterio): un ✅ liso escondía que
+    # Crotolamo ya no aprende hechos solo. Con extraer=false no hay nada que apagar.
+    if cfg.extraer and extraccion_sin_key(cfg, ctx.settings):
+        return [Check("memoria", True,
+                      f"{detalle}; sin API key: la extracción automática queda apagada",
+                      "Recordar y buscar funcionan igual. Para extraer: CROTOLAMO_GLM_API_KEY "
+                      "en ~/.config/crotolamo/env (GROQ_API_KEY si llm_provider = \"groq\" y "
+                      "la nube no es Groq), o llm_provider = \"ollama\".", warn=True)]
+    return [Check("memoria", True, detalle)]
 
 
 def _check_ydotool(ctx: _Ctx) -> list[Check]:

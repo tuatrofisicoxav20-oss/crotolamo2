@@ -30,7 +30,15 @@ tool-call del LLM -> guard (rutas, recursivo) -> confirmación -> tools/call -> 
   `terminate_all()` para el apagado por señal del listener, que sale con
   `os._exit` y se salta `atexit`). Las señales de cierre van al **grupo de
   procesos** del server: con un wrapper (`npx`, `uvx`, `sh -c`) el hijo directo
-  es el launcher y el nieto es quien habla el protocolo.
+  es el launcher y el nieto es quien habla el protocolo. El cierre es el de la
+  spec: primero se cierra stdin y se espera hasta 1 s a que el server salga solo
+  (un server bien hecho guarda su estado al ver EOF); luego SIGTERM al grupo y,
+  si a los 2 s el server o algo de su grupo sigue reteniendo las tuberías (p. ej.
+  el nieto de un wrapper que ignora SIGTERM), SIGKILL. Si un envío está atascado
+  porque el server no lee, no hay EOF posible: tras 1 s se pasa directo al
+  SIGTERM. Peor caso ~6 s por server. El apagado por señal (`terminate_all()`)
+  no espera a nadie: cierra stdin (si no hay un envío atascado) y manda SIGTERM
+  al grupo.
 
 ## Configuración
 

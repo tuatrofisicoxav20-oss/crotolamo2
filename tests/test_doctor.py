@@ -609,7 +609,10 @@ def test_el_toml_trae_la_seccion_doctor_con_los_defaults_del_repo():
     assert cfg["aec_sink"] == "crotolamo_aec_sink"
     assert cfg["musica_service"] == "soloist.service"
     assert (cfg["musica_host"], cfg["musica_port"]) == ("127.0.0.1", 9090)
-    assert cfg["musica_caduca"] == date(2026, 11, 29) and cfg["musica_aviso_dias"] == 14
+    # La fecha es la de la credencial del dueño y cambia en cada renovación (la que
+    # el propio doctor pide): se fija el TIPO, no el valor. "" = check omitido.
+    assert isinstance(cfg["musica_caduca"], date) or cfg["musica_caduca"] == ""
+    assert cfg["musica_aviso_dias"] == 14
     assert cfg["spotify_client_id_env"] == "SPOTIFY_CLIENT_ID"
     # Las claves del toml y los defaults del código son el mismo conjunto: si
     # alguien añade una perilla, que la documente en los dos sitios.

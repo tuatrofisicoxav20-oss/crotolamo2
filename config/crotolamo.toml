@@ -249,6 +249,8 @@ dims_embeddings = 384
 # casos con la MISMA key (CROTOLAMO_GLM_API_KEY), que así siempre va al proveedor
 # que la emitió. "groq" explícito con otra nube lee GROQ_API_KEY; "ollama" = modelo
 # local de [llm] (sin key, más lento).
+# Sin API key para ese proveedor la memoria sigue funcionando (recordar y buscar no
+# usan LLM); solo se apaga la extracción automática, con un WARNING al arrancar.
 llm_provider = "auto"
 # Vacío = el mismo modelo que [llm.glm].model.
 llm_model = ""
