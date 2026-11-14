@@ -132,7 +132,13 @@ class VoiceLoop:
             barge_in_min_chunks=vcfg.get("barge_in_min_chunks", 5),
             # None (default) = sin histéresis, comportamiento idéntico al previo.
             vad_neg_threshold=vcfg.get("vad_neg_threshold"),
+            # Lo que se antepone a la orden cuando el patrón calla un rato tras
+            # el wake (V1); mismo valor y default que el modo simple.
+            preactivation_ms=vcfg.get("vad_preactivation_ms", 800),
         )
+        # El oído es el ÚNICO lector del micrófono: stop() lo espera antes de
+        # cerrar el stream (ver stop()).
+        self._ear = ear
         self.threads = [
             ear,
             SttThread(stt, self.stt_q, self.cmd_q, self.state, self.shutdown,
@@ -171,7 +177,10 @@ class VoiceLoop:
         self._control_mtime = mtime
         self.state.set_enabled(read_control_enabled(self.control_path))
 
-    def run(self) -> None:
+    def run(self) -> int:
+        """Corre el loop hasta el apagado. Devuelve 0 si se apagó por las buenas
+        y 1 si murió alguno de sus hilos (V2): el listener lo usa como código de
+        salida para que systemd (Restart=on-failure) reinicie el servicio."""
         self.start()
         # Estado inicial de la escucha desde el canal de control (default: activa).
         if self.control_path is not None:
@@ -180,6 +189,7 @@ class VoiceLoop:
         # un proceso anterior que murió a medio turno (el HUD se quedaba en
         # "PENSANDO" hasta el siguiente cambio de modo).
         self.state.publish_now()
+        codigo = 0
         try:
             while not self.shutdown.is_set():
                 self.shutdown.wait(0.3)
@@ -188,23 +198,38 @@ class VoiceLoop:
                 # si el mtime cambió. Sin thread extra: reutilizamos esta espera.
                 if self.control_path is not None:
                     self._poll_control()
+                # Vigilar a los hilos en la misma espera (V2): con uno muerto (el
+                # oído que se rindió ante el micro, la boca...) el loop seguía
+                # vivo, sordo o mudo, y systemd lo veía sano. Los muertos se miran
+                # ANTES que shutdown: un hilo que salió por el apagado no cuenta.
+                muertos = [t.name for t in self.threads if not t.is_alive()]
+                if muertos and not self.shutdown.is_set():
+                    log.error("murió el hilo %s del loop de voz: me apago",
+                              ", ".join(muertos))
+                    codigo = 1
+                    break
         except KeyboardInterrupt:
             pass
         finally:
             self.stop()
+        return codigo
 
     def stop(self) -> None:
         """Apagado ordenado con un límite conocido (B1): si el EarThread está
         BLOQUEADO dentro de mic.read() (PortAudio sin timeout), el join expira
         a los 2s y el thread queda vivo; al ser daemon, muere con el proceso
-        (el atajo de teclado usa os._exit justamente por esto). Cerrar el mic
-        antes del join suele desbloquear la lectura, pero no está garantizado.
+        (el atajo de teclado usa os._exit justamente por esto).
+
+        El mic se cierra DESPUÉS de esperar al oído (V17): PortAudio no admite
+        cerrar un stream mientras otro hilo está dentro de read() sobre él
+        (comportamiento indefinido: error en el oído o un crash nativo). El
+        oído sale de read() en un frame (~32 ms), ve shutdown y termina; solo
+        si sigue dentro al expirar el join (lectura colgada) se cierra igual
+        desde aquí, como último recurso para desbloquearla.
         """
         self.shutdown.set()                       # 1) avisar a todos
         try:
             self.tts.stop()                       # 2) cortar audio en curso
-            if hasattr(self._mic, "close"):
-                self._mic.close()
         finally:
             # 3) devolver la música ANTES de esperar a los hilos: el join del
             # oído puede tardar hasta 2s (PortAudio) y no hay razón para que
@@ -214,5 +239,9 @@ class VoiceLoop:
             if self.ducker is not None:
                 self.ducker.close()
                 self.ducker.restore()
-        for t in self.threads:                    # 4) esperar (todos miran shutdown)
-            t.join(timeout=2.0)
+        self._ear.join(timeout=2.0)               # 4) el oído suelta el mic...
+        if hasattr(self._mic, "close"):
+            self._mic.close()                     # 5) ...y recién entonces se cierra
+        for t in self.threads:                    # 6) esperar (todos miran shutdown)
+            if t is not self._ear:
+                t.join(timeout=2.0)

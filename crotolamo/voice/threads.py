@@ -15,6 +15,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 
 from crotolamo.logging_setup import get_logger
@@ -52,15 +53,23 @@ class MouthThread(threading.Thread):
                 continue
             if item is END:
                 # Terminó la respuesta de un turno; si nadie habló nuevo, a IDLE.
-                if self.state.get_mode() == Mode.SPEAKING:
-                    self.state.set_mode(Mode.IDLE)
+                # Comprobar y cambiar de una vez (V5): mirar SPEAKING y luego
+                # poner IDLE pisaba el LISTENING de un barge-in recién llegado.
+                self.state.compare_and_set_mode(Mode.SPEAKING, Mode.IDLE)
                 continue
             assert isinstance(item, Utterance)
             # Descarta frases de turnos abortados (barge-in o comando nuevo).
-            if not self.state.is_current(item.turn_id):
+            # Turno y SPEAKING de una vez (V5): un barge-in entre los dos
+            # quedaba pisado y, con su END ya drenado, el loop se quedaba en
+            # "hablando".
+            if not self.state.set_mode_if_current(item.turn_id, Mode.SPEAKING):
                 continue
-            self.state.set_mode(Mode.SPEAKING)
-            self.tts.speak(item.text)  # interrumpible (M3.1)
+            try:
+                self.tts.speak(item.text)  # interrumpible (M3.1)
+            except Exception as error:  # noqa: BLE001 - una frase rota no mata la boca
+                # Sin guarda, la excepción mataba al Mouth (V2): el resto de la
+                # respuesta no sonaba y el loop se quedaba en "hablando".
+                log.warning("mouth: %s", error)
 
 
 class BrainThread(threading.Thread):
@@ -68,8 +77,8 @@ class BrainThread(threading.Thread):
 
     Nota honesta: agent.handle_turn llama al LLM por HTTP de forma BLOQUEANTE; no se
     puede cancelar a media inferencia. Si hay barge-in mientras el LLM piensa, la
-    inferencia vieja termina en background pero su salida se DESCARTA por el check de
-    is_current(turn); el audio para al instante. Cancelar el LLM en vuelo es mejora
+    inferencia vieja termina en background pero su salida se DESCARTA por el check del
+    turno (set_text_if_current); el audio para al instante. Cancelar el LLM en vuelo es mejora
     futura (streaming con check de turno).
     """
 
@@ -89,9 +98,10 @@ class BrainThread(threading.Thread):
             except queue.Empty:
                 continue
             # El turno ya cambió (barge-in mientras esperaba en cola): ignora.
-            if not self.state.is_current(turn):
+            # Turno y THINKING de una vez (V5): un barge-in entre los dos
+            # quedaba pisado y el loop se quedaba en "pensando" para siempre.
+            if not self.state.set_mode_if_current(turn, Mode.THINKING):
                 continue
-            self.state.set_mode(Mode.THINKING)
             try:
                 reply = self.agent.handle_turn(command)
             except Exception as error:  # noqa: BLE001 - un turno roto no mata el loop
@@ -100,14 +110,15 @@ class BrainThread(threading.Thread):
                 # Antes hacía `continue` sin tocar el modo -> el HUD se quedaba
                 # PEGADO en "pensando" para siempre.
                 reply = "Se me trabaron los cables, patrón. Vuelve a intentarlo."
-            # Si interrumpieron mientras pensaba, el turno nuevo ya maneja el estado.
-            if not self.state.is_current(turn):
-                continue
+            # Si interrumpieron mientras pensaba, el turno nuevo ya maneja el
+            # estado: los *_if_current no tocan nada de un turno abortado (V5).
             # Respuesta vacía: volver a reposo en vez de dejar el HUD en "pensando".
             if not (reply and reply.strip()):
-                self.state.set_mode(Mode.IDLE)
+                self.state.set_mode_if_current(turn, Mode.IDLE)
                 continue
-            self.state.set_text(reply)  # HUD: respuesta que se va a hablar
+            # HUD: respuesta que se va a hablar.
+            if not self.state.set_text_if_current(turn, reply):
+                continue
             for sentence in split_sentences(reply):
                 self.tts_q.put(Utterance(sentence, turn))
             self.tts_q.put(END)
@@ -158,15 +169,19 @@ class SttThread(threading.Thread):
                     except OSError as error:
                         log.debug("stt: no pude borrar el WAV temporal %s: %s",
                                   audio, error)
-            if text.strip() and self.state.is_current(turn):
-                self.state.set_text(text)  # HUD: frase reconocida del usuario
-                self.out_q.put((text, turn))
-            elif self.state.is_current(turn):
+            # Comprobar el turno y tocar el estado de una vez (V5): un barge-in
+            # entre los dos veía su LISTENING pisado por el IDLE de aquí, o la
+            # frase vieja repintada en el HUD.
+            if text.strip():
+                # HUD: frase reconocida del usuario.
+                if self.state.set_text_if_current(turn, text):
+                    self.out_q.put((text, turn))
+            else:
                 # Transcripción VACÍA (comando corto/silencio: el VAD cortó pronto o
                 # el patrón solo dijo "crotolamo" sin orden). No hay nada que pensar:
                 # volver a reposo. Antes se quedaba PEGADO en "pensando" para siempre
                 # porque el EarThread ya había puesto el modo en THINKING.
-                self.state.set_mode(Mode.IDLE)
+                self.state.set_mode_if_current(turn, Mode.IDLE)
 
 
 def _drain_queue(q: queue.Queue) -> None:
@@ -188,6 +203,13 @@ class EarThread(threading.Thread):
     AEC real (webrtc-audio-processing) es una mejora futura.
     """
 
+    # Fallos de audio (V2): mic.read() o wake_fn() revientan (micro desenchufado
+    # o suspendido, PipeWire reiniciado, openWakeWord que no carga). Uno suelto
+    # se aguanta; tras estos SEGUIDOS (~1 s con la pausa) el oído se rinde y
+    # termina, VoiceLoop.run() lo nota y apaga el loop con código de fallo.
+    _MAX_FALLOS_SEGUIDOS = 10
+    _PAUSA_TRAS_FALLO_S = 0.1
+
     def __init__(self, mic, wake_fn, vad_fn, to_wav, tts,
                  stt_queue: queue.Queue, tts_queue: queue.Queue,
                  state: SharedState, shutdown: threading.Event, *,
@@ -196,7 +218,9 @@ class EarThread(threading.Thread):
                  chunk_ms: float = 32.0, barge_in_grace_ms: float = 400,
                  barge_in_threshold_margin: float = 0.1,
                  barge_in_min_chunks: int = 5,
-                 vad_neg_threshold: float | None = None) -> None:
+                 vad_neg_threshold: float | None = None,
+                 start_timeout_s: float = 4.0,
+                 preactivation_ms: float = 800) -> None:
         super().__init__(name="Ear", daemon=True)
         self.mic = mic
         self.wake_fn = wake_fn
@@ -212,17 +236,25 @@ class EarThread(threading.Thread):
         # None = sin histéresis (idéntico al comportamiento previo). Ver voice/vad.py.
         self.vad_neg_threshold = resolve_neg_threshold(vad_threshold, vad_neg_threshold)
         self.allow_barge_in = allow_barge_in
-        self._chunk_ms = chunk_ms
         self._silence_chunks = max(1, int(silence_ms / chunk_ms))
         self._max_chunks = int(max_command_s * 1000 / chunk_ms)
+        # V1: tras el wake la captura ESPERA la orden, con su propio límite (el
+        # start_timeout_s del modo simple) y guardando solo la pre-activación.
+        self._start_chunks = max(1, int(start_timeout_s * 1000 / chunk_ms))
+        self._pre_chunks = max(1, int(preactivation_ms / chunk_ms))
         # M3.8: mitigación de eco (gracia + margen de umbral + persistencia).
         self._grace_s = barge_in_grace_ms / 1000.0
         self._margin = barge_in_threshold_margin
         self._min_chunks = max(1, barge_in_min_chunks)
+        # Los últimos chunks vistos por _is_patron_voice: al disparar, son
+        # justo la racha de voz del patrón, el arranque de su orden.
+        self._barge_frames: deque = deque(maxlen=self._min_chunks)
         self._turn = 0
         self._cmd_frames: list = []
         self._silent_run = 0
         self._cmd_count = 0
+        # ¿La captura en curso tuvo AL MENOS un chunk con voz? (V6)
+        self._voiced = False
         self._prev_mode = Mode.IDLE
         self._speaking_since = 0.0
         self._barge_run = 0
@@ -234,11 +266,25 @@ class EarThread(threading.Thread):
         self._idle_grace_until = 0.0
         self._post_speak_grace_s = 1.5
 
-    def _start_command(self, preroll: list | None = None) -> None:
+    def _start_command(self, preroll: list | None = None, *, voiced: bool = False) -> None:
         # M2: arrancar con el buffer de pre-activación para no perder el inicio.
         self._cmd_frames = list(preroll or [])
         self._silent_run = 0
         self._cmd_count = 0
+        # voiced=True: el preroll ya es voz del patrón (la racha del barge-in);
+        # el del wake es la palabra de activación, no la orden.
+        self._voiced = voiced
+        # La orden arranca con la RNN del VAD limpia (V11): con barge-in el VAD
+        # se alimenta del eco del TTS en THINKING/SPEAKING y ese contexto
+        # llegaba a la orden nueva (la del barge-in o la del wake siguiente).
+        self._reset_vad()
+
+    def _reset_vad(self) -> None:
+        # Limpia el estado de la RNN del VAD (si el vad_fn lo soporta; en tests
+        # suele ser un lambda sin reset).
+        reset = getattr(self.vad_fn, "reset", None)
+        if callable(reset):
+            reset()
 
     def _is_patron_voice(self, chunk, mode) -> bool:
         """Detecta voz del patrón con mitigación de eco (M3.8), 3 capas:
@@ -248,6 +294,7 @@ class EarThread(threading.Thread):
         # Capa 2: umbral más alto mientras suena el TTS (el eco infla el VAD).
         thr = self.vad_threshold + (self._margin if mode is Mode.SPEAKING else 0.0)
         is_voice = self.vad_fn(chunk) >= thr
+        self._barge_frames.append(chunk)
         # Capa 1: gracia tras arrancar el habla (el eco del arranque es el peor).
         in_grace = (mode is Mode.SPEAKING
                     and (time.monotonic() - self._speaking_since) < self._grace_s)
@@ -262,65 +309,111 @@ class EarThread(threading.Thread):
         return False
 
     def _finish_command(self) -> None:
-        wav = self.to_wav(self._cmd_frames)
-        self.stt_q.put((wav, self._turn))
-        self.state.set_mode(Mode.THINKING)
-        # Cerrar el turno limpia el estado de la RNN del VAD (si el vad_fn lo
-        # soporta; en tests suele ser un lambda sin reset).
-        reset = getattr(self.vad_fn, "reset", None)
-        if callable(reset):
-            reset()
+        if self._voiced:
+            wav = self.to_wav(self._cmd_frames)
+            self.stt_q.put((wav, self._turn))
+            self.state.set_mode(Mode.THINKING)
+        else:
+            # Captura SIN un solo chunk con voz (falso wake, o el wake y nada
+            # más): no hay orden que transcribir (V6). Mandarla a Whisper costaba
+            # ~2 s de pared y ~3 s de CPU por falso wake (el STT normaliza ese
+            # ruido a pico 0.9 y el decoder alucina sobre él), con el loop en
+            # THINKING y sordo al wake. Directo a reposo, como haría el Stt con
+            # su transcripción vacía.
+            self.state.set_mode(Mode.IDLE)
+        # Cerrar el turno también limpia la RNN: la detección de barge-in en
+        # THINKING/SPEAKING no arranca con el contexto de la orden.
+        self._reset_vad()
 
     def run(self) -> None:
+        fallos = 0
         while not self.shutdown.is_set():
-            chunk = self.mic.read()
+            try:
+                chunk = self.mic.read()
+                if chunk is not None:
+                    self._on_chunk(chunk)
+            except Exception as error:  # noqa: BLE001 - un fallo de audio no deja sordo al loop
+                # Sin esto la excepción mataba al hilo (V2) y el proceso seguía
+                # vivo, sordo y con el HUD en reposo: nadie lo notaba.
+                fallos += 1
+                if fallos >= self._MAX_FALLOS_SEGUIDOS:
+                    log.error("oído: %d fallos seguidos, me rindo (el loop se apaga): %s",
+                              fallos, error, exc_info=error)
+                    return
+                log.warning("oído: %s (fallo %d de %d seguidos)", error, fallos,
+                            self._MAX_FALLOS_SEGUIDOS, exc_info=fallos == 1)
+                # Un stream muerto revienta al instante en cada lectura: sin
+                # pausa, esto sería un busy-spin. wait() atiende al apagado.
+                self.shutdown.wait(self._PAUSA_TRAS_FALLO_S)
+                continue
+            fallos = 0
             if chunk is None:
                 time.sleep(0.005)  # sin audio ahora mismo: no hacer busy-spin
-                continue
-            mode = self.state.get_mode()
-            # M3.8: marca el inicio del habla para la ventana de gracia.
-            if mode is Mode.SPEAKING and self._prev_mode is not Mode.SPEAKING:
-                self._speaking_since = time.monotonic()
-                self._barge_run = 0
-            # Al ENTRAR a IDLE desde un turno (habló/pensó/escuchó), arranca el
-            # cooldown anti-eco para que el TTS y su eco no disparen un falso wake.
-            if mode is Mode.IDLE and self._prev_mode in (
-                Mode.SPEAKING, Mode.THINKING, Mode.LISTENING
-            ):
-                self._idle_grace_until = time.monotonic() + self._post_speak_grace_s
-            self._prev_mode = mode
 
-            if mode is Mode.IDLE:
-                # Escucha pausada desde el panel: ignora la wake word por completo.
-                # (Un turno en curso NO se corta; solo dejamos de despertar de nuevo.)
-                if not self.state.is_enabled():
-                    continue
-                # Cooldown anti-eco: tras un turno, no escuches el wake un momento.
-                if time.monotonic() < self._idle_grace_until:
-                    continue
-                if self.wake_fn(chunk):
-                    self._turn = self.state.new_turn()
-                    self.state.set_mode(Mode.LISTENING)
-                    self._start_command(preroll=[chunk])
+    def _on_chunk(self, chunk) -> None:
+        """Decide las transiciones por audio con UN chunk del micro (era el
+        cuerpo del bucle de run(); vive aparte para que run() aguante sus fallos)."""
+        mode = self.state.get_mode()
+        # M3.8: marca el inicio del habla para la ventana de gracia.
+        if mode is Mode.SPEAKING and self._prev_mode is not Mode.SPEAKING:
+            self._speaking_since = time.monotonic()
+            self._barge_run = 0
+        # Al ENTRAR a IDLE desde un turno (habló/pensó/escuchó), arranca el
+        # cooldown anti-eco para que el TTS y su eco no disparen un falso wake.
+        if mode is Mode.IDLE and self._prev_mode in (
+            Mode.SPEAKING, Mode.THINKING, Mode.LISTENING
+        ):
+            self._idle_grace_until = time.monotonic() + self._post_speak_grace_s
+        self._prev_mode = mode
 
-            elif mode is Mode.LISTENING:
-                self._cmd_frames.append(chunk)
-                self._cmd_count += 1
-                # Ya estamos DENTRO del habla (speaking=True): basta el umbral bajo
-                # para seguir en voz, así una micro-pausa no cierra el comando.
-                if is_voice(self.vad_fn(chunk), speaking=True,
-                            threshold=self.vad_threshold,
-                            neg_threshold=self.vad_neg_threshold):
-                    self._silent_run = 0
-                else:
-                    self._silent_run += 1
-                if self._silent_run >= self._silence_chunks or self._cmd_count >= self._max_chunks:
-                    self._finish_command()
+        if mode is Mode.IDLE:
+            # Escucha pausada desde el panel: ignora la wake word por completo.
+            # (Un turno en curso NO se corta; solo dejamos de despertar de nuevo.)
+            if not self.state.is_enabled():
+                return
+            # Cooldown anti-eco: tras un turno, no escuches el wake un momento.
+            if time.monotonic() < self._idle_grace_until:
+                return
+            if self.wake_fn(chunk):
+                self._turn = self.state.new_turn()
+                self.state.set_mode(Mode.LISTENING)
+                self._start_command(preroll=[chunk])
 
-            elif mode in (Mode.THINKING, Mode.SPEAKING):
-                if self.allow_barge_in and self._is_patron_voice(chunk, mode):
-                    self.tts.stop()            # corta el audio YA
-                    _drain_queue(self.tts_q)   # tira las frases viejas
-                    self._turn = self.state.new_turn()  # invalida turnos viejos
-                    self.state.set_mode(Mode.LISTENING)
-                    self._start_command(preroll=[chunk])
+        elif mode is Mode.LISTENING:
+            self._cmd_frames.append(chunk)
+            self._cmd_count += 1
+            # Para EMPEZAR la orden hace falta el umbral de entrada (no arrancar
+            # con ruido); ya DENTRO del habla basta el bajo (histéresis), así una
+            # micro-pausa no cierra el comando. Ver voice/vad.py.
+            if is_voice(self.vad_fn(chunk), speaking=self._voiced,
+                        threshold=self.vad_threshold,
+                        neg_threshold=self.vad_neg_threshold):
+                self._silent_run = 0
+                self._voiced = True
+            elif self._voiced:
+                self._silent_run += 1
+            else:
+                # Aún sin voz tras el wake, el silencio NO cuenta (V1): antes una
+                # pausa de respirar tras "crotolamo" cerraba la captura vacía y la
+                # orden, dicha justo después, se perdía. La espera tiene su propio
+                # límite, como start_timeout_s en el modo simple, y solo guarda la
+                # pre-activación: segundos de ruido de la habitación no van a
+                # Whisper.
+                if len(self._cmd_frames) > self._pre_chunks:
+                    del self._cmd_frames[0]
+                if self._cmd_count >= self._start_chunks:
+                    self._finish_command()  # sin voz: a reposo, nada a Whisper (V6)
+                    return
+            if self._silent_run >= self._silence_chunks or self._cmd_count >= self._max_chunks:
+                self._finish_command()
+
+        elif mode in (Mode.THINKING, Mode.SPEAKING):
+            if self.allow_barge_in and self._is_patron_voice(chunk, mode):
+                self.tts.stop()            # corta el audio YA
+                _drain_queue(self.tts_q)   # tira las frases viejas
+                self._turn = self.state.new_turn()  # invalida turnos viejos
+                self.state.set_mode(Mode.LISTENING)
+                # La racha del VAD ya es voz del patrón y el arranque de su orden:
+                # va ENTERA (antes solo su último chunk y la primera sílaba, los
+                # barge_in_min_chunks - 1 chunks previos, se perdía).
+                self._start_command(preroll=list(self._barge_frames), voiced=True)

@@ -98,6 +98,12 @@ class SharedState:
 
     def __init__(self, publisher: Callable[[dict], None] | None = None) -> None:
         self._lock = threading.Lock()
+        # Turno de PUBLICAR (C8), aparte del lock de estado: las consultas y los
+        # cambios (el oído mira el modo ~31 veces por segundo) nunca esperan a
+        # que otro hilo termine de escribir el archivo del HUD; solo la
+        # publicación espera su turno. Reentrante: un publisher puede volver a
+        # entrar al estado sin colgarse.
+        self._pub_lock = threading.RLock()
         self._mode = Mode.IDLE
         self._turn_id = 0
         self._text = ""
@@ -107,46 +113,99 @@ class SharedState:
         self._publisher = publisher
 
     # ------------------------------------------------------------------
-    # Publicación interna: siempre se llama SIN el lock tomado para evitar
-    # deadlock (el lock en SharedState no es reentrant).
+    # Publicación interna: siempre se llama SIN el lock de estado tomado para
+    # evitar deadlock (ese lock no es reentrant y el publisher hace E/S).
+    #
+    # La foto del estado se toma AQUÍ, ya con el turno de publicar en la mano,
+    # y no al cambiar (C8): cuando cada hilo publicaba la foto que tomó bajo el
+    # lock, dos cambios casi simultáneos podían escribirse al revés y la foto
+    # VIEJA quedaba la última; el HUD (y el ducker) se quedaban con un modo
+    # rancio hasta el siguiente cambio. Así lo último publicado es siempre el
+    # estado real.
     # ------------------------------------------------------------------
-    def _publish(self, mode: Mode, turn_id: int, text: str, enabled: bool) -> None:
+    def _publish(self) -> None:
         if self._publisher is None:
             return
-        state_dict = {
-            "mode": mode.name.lower(),
-            "turn_id": turn_id,
-            "text": text,
-            "enabled": enabled,
-            "ts": time.time(),
-            "pid": os.getpid(),
-        }
-        try:
-            self._publisher(state_dict)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("hud publisher excepción: %s", exc)
+        with self._pub_lock:
+            state_dict = self.current_snapshot()
+            try:
+                self._publisher(state_dict)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("hud publisher excepción: %s", exc)
 
     def get_mode(self) -> Mode:
         with self._lock:
             return self._mode
 
     def set_mode(self, mode: Mode) -> None:
+        """Cambia el modo. Publica SOLO si cambia (como set_enabled).
+
+        El Brain repite THINKING (el oído ya lo puso al cerrar la orden) y el
+        Mouth pone SPEAKING antes de CADA frase: sin la guarda, la mitad de las
+        escrituras de un turno (temporal + os.replace + un despertar del HUD
+        por inotify) contaban el mismo estado. Para forzar: publish_now().
+        """
         with self._lock:
+            if mode is self._mode:
+                return
             self._mode = mode
-            _turn = self._turn_id
-            _text = self._text
-            _enabled = self._enabled
         # Publicar FUERA del lock
-        self._publish(mode, _turn, _text, _enabled)
+        self._publish()
+
+    def set_mode_if_current(self, turn: int, mode: Mode) -> bool:
+        """set_mode SOLO si ``turn`` sigue vigente; devuelve si lo era (V5).
+
+        is_current() y LUEGO set_mode() dejaba un hueco: un barge-in en medio
+        (new_turn + LISTENING) quedaba pisado por el THINKING/SPEAKING/IDLE del
+        turno viejo, y el oído, que obedece al modo, abandonaba la orden nueva:
+        el loop se quedaba en "pensando"/"hablando" (música bajada, wake
+        ignorado) hasta otro barge-in. Aquí comprobar y cambiar van bajo el
+        MISMO lock. Como set_mode, publica solo si el modo cambia.
+        """
+        with self._lock:
+            if turn != self._turn_id:
+                return False
+            if mode is self._mode:
+                return True
+            self._mode = mode
+        self._publish()
+        return True
+
+    def compare_and_set_mode(self, expected: Mode, mode: Mode) -> bool:
+        """Pasa a ``mode`` SOLO si el modo actual es ``expected`` (V5).
+
+        Para el fin de respuesta del Mouth: get_mode() == SPEAKING y luego
+        set_mode(IDLE) pisaba el LISTENING que un barge-in acababa de poner, y
+        la orden nueva se perdía.
+        """
+        with self._lock:
+            if self._mode is not expected:
+                return False
+            if mode is self._mode:
+                return True
+            self._mode = mode
+        self._publish()
+        return True
 
     def set_text(self, text: str) -> None:
         """Actualiza el texto visible (última frase reconocida o respuesta)."""
         with self._lock:
             self._text = text
-            _mode = self._mode
-            _turn = self._turn_id
-            _enabled = self._enabled
-        self._publish(_mode, _turn, text, _enabled)
+        self._publish()
+
+    def set_text_if_current(self, turn: int, text: str) -> bool:
+        """set_text SOLO si ``turn`` sigue vigente; devuelve si lo era (V5).
+
+        Mismo hueco que set_mode_if_current: la frase o la respuesta de un
+        turno abortado volvía a pintarse en el HUD bajo "escuchando" después
+        de que new_turn() la limpiara.
+        """
+        with self._lock:
+            if turn != self._turn_id:
+                return False
+            self._text = text
+        self._publish()
+        return True
 
     @property
     def turn_id(self) -> int:
@@ -164,10 +223,8 @@ class SharedState:
             self._turn_id += 1
             self._text = ""
             _turn = self._turn_id
-            _mode = self._mode
-            _enabled = self._enabled
         # Publicar FUERA del lock
-        self._publish(_mode, _turn, "", _enabled)
+        self._publish()
         return _turn
 
     def is_current(self, turn: int) -> bool:
@@ -191,11 +248,8 @@ class SharedState:
             if enabled == self._enabled:
                 return
             self._enabled = enabled
-            _mode = self._mode
-            _turn = self._turn_id
-            _text = self._text
         # Publicar FUERA del lock (para que el panel vea el estado real).
-        self._publish(_mode, _turn, _text, enabled)
+        self._publish()
 
     def publish_now(self) -> None:
         """Publica el estado actual aunque nada haya cambiado.
@@ -205,15 +259,12 @@ class SharedState:
         se quedó en "thinking"/"listening" y el HUD lo mostraba para siempre,
         porque set_mode/set_enabled solo publican al cambiar.
         """
-        with self._lock:
-            _mode = self._mode
-            _turn = self._turn_id
-            _text = self._text
-            _enabled = self._enabled
-        self._publish(_mode, _turn, _text, _enabled)
+        self._publish()
 
     def current_snapshot(self) -> dict:
-        """Devuelve un snapshot del estado actual (para publicar el idle final)."""
+        """Devuelve un snapshot del estado actual: es el dict que publica
+        _publish (el esquema de hud_state.json; el idle final del listener lo
+        repite y un test de la auditoría los mantiene iguales)."""
         with self._lock:
             return {
                 "mode": self._mode.name.lower(),

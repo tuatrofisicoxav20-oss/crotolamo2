@@ -143,7 +143,9 @@ def test_make_file_publisher_creates_parent_dir(tmp_path):
     pub = make_file_publisher(nested)
     state = SharedState(publisher=pub)
 
-    state.set_mode(Mode.IDLE)
+    # LISTENING y no IDLE: IDLE es el modo inicial y set_mode solo publica si
+    # el modo cambia (el estado sin cambio se fuerza con publish_now).
+    state.set_mode(Mode.LISTENING)
 
     assert nested.exists(), "Debe crear el directorio padre si no existe"
 
