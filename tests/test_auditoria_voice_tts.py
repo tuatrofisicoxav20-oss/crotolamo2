@@ -274,7 +274,8 @@ def test_carga_fallida_de_piper_no_envenena_la_siguiente(slow_piper):
 
 
 # --- el corte REAL (_speak_streaming): stop() y should_abort --------------------
-# Hasta ahora la suite solo probaba _play_interruptible (que speak() ya no usa):
+# Hasta ahora la suite solo probaba _play_interruptible (que speak() ya no usaba,
+# y que la revisión final quitó):
 # el camino que de verdad suena (Piper por chunks -> sd.OutputStream) no tenía
 # ninguna prueba de corte. Aquí la voz Piper y el OutputStream son dobles.
 

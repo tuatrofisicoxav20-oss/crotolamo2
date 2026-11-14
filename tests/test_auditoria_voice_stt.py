@@ -184,6 +184,8 @@ def test_formas_tonicas_cierran_la_frase():
         "mándamelo a mí",
         "igual que tú",
         "sí",  # "sí" en NFD (tilde combinante): misma palabra
+        "¿Por qué?",  # interrogativos tónicos: "qué" no es "que"
+        "¿a dónde?",
     ]:
         assert not seems_incomplete(frase), frase
 
@@ -215,7 +217,8 @@ class _ScriptedSTT(stt_mod.STT):
         return self.script.pop(0) if self.script else ""
 
 
-@pytest.mark.parametrize("respuesta", ["sí", "¿dónde está?", "llámale a él"])
+@pytest.mark.parametrize("respuesta", ["sí", "¿dónde está?", "llámale a él", "¿Por qué?",
+                                       "¿a dónde?"])
 def test_listen_smart_no_reabre_con_una_frase_que_cierra_en_tonica(respuesta):
     """Antes cada una costaba una segunda grabación de endpoint_continue_s
     (2.5 s de espera) y lo que sonara en esa ventana se pegaba a la orden."""

@@ -119,7 +119,8 @@ def is_wake_word(text: str, threshold: float = DEFAULT_THRESHOLD,
     return score >= threshold
 
 
-def strip_wake_word(text: str, variants: Iterable[str] | None = None) -> str:
+def strip_wake_word(text: str, variants: Iterable[str] | None = None, *,
+                    whole: bool = False) -> str:
     """Quita la palabra de activación para dejar solo la orden.
 
     Sin una variante literal al inicio, se corta el prefijo de 1 a 3 palabras que
@@ -127,9 +128,14 @@ def strip_wake_word(text: str, variants: Iterable[str] | None = None) -> str:
     probaban los prefijos de 3, 2 y 1 palabras con is_wake_word, que puntúa por
     VENTANAS: cualquier prefijo de 3 palabras que CONTUVIERA algo parecido a
     "crotolamo" pasaba y la orden perdía palabras ("protolamo pon música" ->
-    "música"; en el followup, "pero tómalo con calma" -> "calma"). La frase
-    entera también puede ser el wake ("caroto llamo" -> ""): antes se saltaba
-    y "llamo" llegaba al agente como orden.
+    "música"; en el followup, "pero tómalo con calma" -> "calma").
+
+    La frase ENTERA solo cuenta como wake con whole=True, que pasa quien ya sabe
+    que la frase activó (split_wake_command: "caroto llamo" -> "", y no "llamo"
+    como orden). Sin él siempre queda al menos una palabra: en el followup (una
+    orden SIN wake) una frase corta que solo se PARECE al nombre ("¿cómo me
+    llamo?" puntúa 0.76 contra "croto el amo") se borraba entera y la
+    conversación acababa en silencio, sin llegar al agente.
     """
     variant_list = list(variants) if variants is not None else _default_variants()
     original = text.strip()
@@ -151,7 +157,7 @@ def strip_wake_word(text: str, variants: Iterable[str] | None = None) -> str:
 
     candidates = _candidates(variant_list)
     best_n, best_score = 0, 0.0
-    for n in range(1, min(3, len(words)) + 1):
+    for n in range(1, min(3, len(words) if whole else len(words) - 1) + 1):
         comp = compact(" ".join(words[:n]))
         score = max(similarity(comp, candidate) for candidate in candidates)
         if score > best_score:  # ante empate, el prefijo más corto: corta menos
@@ -160,6 +166,32 @@ def strip_wake_word(text: str, variants: Iterable[str] | None = None) -> str:
         return " ".join(words[best_n:]).strip(" ,.:;-")
 
     return original
+
+
+def _cut_after_wake(text: str, variant_list: list[str]) -> str:
+    """Corta justo tras el tramo de las 3 primeras palabras que más se parece al
+    wake, EMPIECE donde empiece; el original si ninguno llega al umbral.
+
+    strip_wake_word solo compara prefijos desde la 1ª palabra: con un saludo
+    delante ("buenos días crotolamo ...") el prefijo entero no llega al umbral
+    aunque la cabeza activó por el "crotolamo" de la 3ª. Aquí cada final n se
+    compara con todos sus comienzos; ante empate gana el final más corto (corta
+    menos orden). Una variante literal puntúa 1.0, así que gana siempre.
+    """
+    words = text.split()
+    candidates = _candidates(variant_list)
+    best_n, best_score = 0, 0.0
+    for n in range(1, min(3, len(words)) + 1):
+        for start in range(n):
+            comp = compact(" ".join(words[start:n]))
+            if not comp:  # solo puntuación: "" contra una variante vacía da 1.0
+                continue
+            score = max(similarity(comp, candidate) for candidate in candidates)
+            if score > best_score:
+                best_n, best_score = n, score
+    if best_n and best_score >= DEFAULT_THRESHOLD:
+        return " ".join(words[best_n:]).strip(" ,.:;-")
+    return text
 
 
 def contains_any(text: str, variants: Iterable[str]) -> bool:
@@ -244,6 +276,7 @@ def split_wake_command(
 
     - "crotolamo"                    -> (True, "")            [pide la orden]
     - "crotolamo pausa la música"    -> (True, "pausa la música")  [directo]
+    - "buenos días crotolamo pon las noticias" -> (True, "pon las noticias")
     - "abre la carpeta de descargas" -> (False, "")           [no es wake]
     """
     heard = (heard or "").strip()
@@ -253,9 +286,13 @@ def split_wake_command(
     head = " ".join(heard.split()[:3])
     if not is_wake_word(head, threshold, variant_list):
         return False, ""
-    command = strip_wake_word(heard, variant_list)
-    # strip devuelve el original si no encontró qué quitar (p.ej. el score fue
-    # difuso sobre las 3 palabras juntas): en ese caso no hay orden separable.
+    command = strip_wake_word(heard, variant_list, whole=True)
     if normalize_for_wake(command) == normalize_for_wake(heard):
-        return True, ""
+        # strip no cortó nada pero la cabeza ya activó: el wake no venía en un
+        # prefijo (saludo delante). Se corta tras él dentro de la cabeza; si ni
+        # así aparece (score difuso de las 3 palabras juntas), no hay orden
+        # separable y el listener la pide.
+        command = _cut_after_wake(heard, variant_list)
+        if normalize_for_wake(command) == normalize_for_wake(heard):
+            return True, ""
     return True, command.strip()

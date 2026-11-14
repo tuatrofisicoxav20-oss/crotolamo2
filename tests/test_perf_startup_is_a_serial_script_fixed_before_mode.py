@@ -3,10 +3,12 @@
 Paso 1 (voz): los cuatro cargadores perezosos (Whisper, Piper, Silero y el modelo
 de openWakeWord) construyen UNA sola vez aunque los pidan N hilos a la vez, mezclando
 el calentamiento con el primer uso real; y cada uno tiene su entrada de
-calentamiento (stt.warm_vad, STT.warm, TTS.warm, WakeWordDetector.warm) que nunca
+calentamiento (stt.warm_vad, STT.warm, WakeWordDetector.warm) que nunca
 lanza ni se queda con la decisión del fallback: el primer uso real avisa y decide
-exactamente como sin calentar. Se fija con cuentas (construcciones, hilos que
-chocaron en el cargador), no con relojes.
+exactamente como sin calentar. Piper se calienta por su cargador, como lo encola
+el listener (_calentar_piper): su error llega al WARNING de _Warmer y no deja nada
+cacheado (TTS.warm, sin quien la llamara, se quitó). Se fija con cuentas
+(construcciones, hilos que chocaron en el cargador), no con relojes.
 
 Paso 2 (listener): primero se decide el modo y luego se calienta, en el hilo
 WarmVoice, lo que ese loop usa y en el orden en que lo usa: Piper primero (el
@@ -312,6 +314,13 @@ def cargas(monkeypatch):
     stt_mod._model_locks.pop(_TAMANO, None)
 
 
+def _calentar_piper(tts: TTS) -> bool:
+    """Lo que el listener encola para Piper en WarmVoice (run_listen:
+    warmer.add("piper", ...)): el cargador tal cual, para que un .onnx roto llegue
+    al WARNING de _Warmer."""
+    return tts.available() and tts._get_voice() is not None
+
+
 def _cargador(nombre: str, monkeypatch, tmp_path: Path):
     """(calentar, primer_uso_real, poner_lock, en_cache, etiqueta) de un cargador."""
     if nombre == "whisper":
@@ -323,8 +332,8 @@ def _cargador(nombre: str, monkeypatch, tmp_path: Path):
         onnx = tmp_path / "voz.onnx"
         onnx.touch()
         tts = TTS(onnx)
-        return (tts.warm, tts._get_voice, lambda lock: setattr(tts, "_voice_lock", lock),
-                lambda: tts._voice, "piper")
+        return (lambda: _calentar_piper(tts), tts._get_voice,
+                lambda lock: setattr(tts, "_voice_lock", lock), lambda: tts._voice, "piper")
     if nombre == "silero":
         return (stt_mod.warm_vad, stt_mod._get_silero_vad,
                 lambda lock: monkeypatch.setattr(stt_mod, "_silero_lock", lock),
@@ -390,7 +399,7 @@ def test_tras_calentar_el_primer_uso_real_no_construye_nada(cargas, tmp_path):
     onnx.touch()
     orden, tts = STT(model_size=_TAMANO), TTS(onnx)
     det = WakeWordDetector(model_name="hey_jarvis")
-    assert [orden.warm(), tts.warm(), stt_mod.warm_vad(), det.warm()] == [True] * 4
+    assert [orden.warm(), _calentar_piper(tts), stt_mod.warm_vad(), det.warm()] == [True] * 4
     calentadas = len(cargas.hechas)
     assert sorted(cargas.etiquetas()) == sorted(
         [f"whisper:{_TAMANO}", "piper", "silero", "oww"])
@@ -568,22 +577,24 @@ def test_stt_warm_fallido_no_envenena_la_carga_siguiente(cargas):
     assert cargas.etiquetas() == [f"whisper:{_TAMANO}"] * 5
 
 
-def test_tts_warm_sin_onnx_no_carga_nada(cargas, tmp_path):
+def test_piper_sin_onnx_no_carga_nada_al_calentar(cargas, tmp_path):
     tts = TTS(tmp_path / "no_existe.onnx")
-    assert tts.warm() is False
+    assert _calentar_piper(tts) is False
     assert cargas.hechas == [] and tts._voice is None
 
 
-def test_tts_warm_fallido_no_lanza_y_el_uso_da_el_error_de_siempre(cargas, tmp_path):
+def test_piper_fallido_al_calentar_da_el_error_de_siempre_y_no_envenena(cargas, tmp_path):
+    """El calentamiento de Piper lanza el error de su primer uso (lo avisa _Warmer
+    con WARNING) y no deja nada cacheado: el uso real lo reintenta igual."""
     onnx = tmp_path / "voz.onnx"
     onnx.touch()
     cargas.falla = RuntimeError("onnx corrupto")
     sin_calentar = _error(TTS(onnx)._get_voice)
     tts = TTS(onnx)
-    assert tts.warm() is False
+    assert _error(lambda: _calentar_piper(tts)) == sin_calentar
     assert _error(tts._get_voice) == sin_calentar == "RuntimeError: onnx corrupto"
     cargas.falla = None
-    assert tts.warm() is True and tts._get_voice() is tts._voice
+    assert _calentar_piper(tts) is True and tts._get_voice() is tts._voice
     assert cargas.etiquetas() == ["piper"] * 4
 
 

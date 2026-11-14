@@ -547,7 +547,9 @@ class STT:
                 frames, calib_rms, threshold = [], [], None
                 rms_floor = rms_max = 0.0
                 origen = ventana = i + 1
-                gated = _GateRun(gate, lookback)
+                # El gate de la grabación, no el original: roto ya es None y sigue
+                # fuera (ver _silero_de_fuente).
+                gated = _GateRun(gated.gate, lookback)
 
         if not speaking and (rms_floor == 0.0 or rms_max < rms_floor * ratio):
             return []
@@ -664,7 +666,11 @@ class STT:
                     break
                 model.reset_states()
                 ep.restart()
-                gated = _GateRun(gate, lookback)
+                # El gate de ESTA grabación, no el original: uno que ya lanzó es None
+                # y sigue fuera hasta que la grabación vuelva al listener (que es
+                # quien deja de pasarlo). Rearmar el original cada ventana lo hacía
+                # fallar y avisar de nuevo cada ~6 s mientras on_idle siguiera.
+                gated = _GateRun(gated.gate, lookback)
             elif estado == FIN:
                 break
 

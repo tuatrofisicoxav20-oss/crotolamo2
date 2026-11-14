@@ -209,6 +209,16 @@ class _Presintesis:
         self.empezada = False
 
 
+class _TurnoVoz:
+    """El turno de voz que _tomar_voz le da a UNA frase. `corte` son los stop()
+    que llevaba el TTS al dárselo: uno más, y esa frase está cortada."""
+
+    __slots__ = ("corte",)
+
+    def __init__(self, corte: int) -> None:
+        self.corte = corte
+
+
 def _piper_arena_keep_phonemes(voice_cfg) -> int:
     """[voice].piper_arena_keep_phonemes: frases de hasta tantos phoneme ids
     conservan el arena de ONNX Runtime; las más largas devuelven su pico al terminar.
@@ -244,7 +254,9 @@ class TTS:
         self._voz = threading.Condition(threading.Lock())
         self._voz_dueno: object | None = None
         self._voz_avance = 0.0  # monotonic del último progreso de quien habla
-        self._cortes = 0  # cuántos stop(): quien esperaba turno antes de uno no habla
+        # Cuántos stop(): quien esperaba turno antes de uno no habla, y la frase que
+        # ya sonaba se corta aunque otra limpie la bandera (ver _speak_streaming).
+        self._cortes = 0
         # [voice].tts_presynth (false de fábrica): la frase siguiente se sintetiza
         # MIENTRAS suena la actual, en UN hilo propio (perezoso) por el que pasa
         # entonces toda la síntesis: Piper nunca corre en dos hilos a la vez.
@@ -288,23 +300,6 @@ class TTS:
                 voice = self._voice
         return voice
 
-    def warm(self) -> bool:
-        """Precalienta la voz Piper: la misma carga que la primera frase, en el hilo
-        de quien llama (si otro hilo ya la está cargando, espera a esa carga).
-
-        Sin el .onnx no carga nada (sin voz no hay modelo que cargar). Nunca lanza:
-        si la carga falla no queda nada cacheado y la primera frase la reintenta y
-        falla como siempre. True si la voz quedó cargada.
-        """
-        if not self.available():
-            return False
-        try:
-            self._get_voice()
-        except Exception as error:  # noqa: BLE001 - lo decide y lo avisa el primer uso real
-            log.debug("no precalenté la voz Piper (%s); lo decidirá su primer uso", error)
-            return False
-        return True
-
     def synthesize_pcm(self, text: str):
         """Devuelve (audio_int16 ndarray, sample_rate) sintetizado por Piper.
 
@@ -324,12 +319,13 @@ class TTS:
         """Habla `text`. `should_abort` (opcional): se consulta junto a la bandera
         de stop antes de sintetizar y en cada rebanada de audio; True = cortar.
 
-        Existe porque stop() SOLO no basta (V4): _speak_streaming limpia la
-        bandera al entrar (si no, un corte mataría todas las frases siguientes),
-        así que un stop() del barge-in que cae entre el is_current() de quien
-        llama y ese clear() se pierde y la frase del turno ya abortado suena
-        entera. Quien sabe de turnos (la Boca) pasa `lambda: not
-        state.is_current(turno)`: así el corte no depende del instante del stop().
+        Existe porque stop() SOLO no basta (V4): un stop() corta lo que ya tenía
+        el turno de voz, no lo que viene detrás (si no, un corte mataría todas
+        las frases siguientes), así que un stop() del barge-in que cae entre el
+        is_current() de quien llama y la toma del turno se pierde y la frase del
+        turno ya abortado suena entera. Quien sabe de turnos (la Boca) pasa
+        `lambda: not state.is_current(turno)`: así el corte no depende del
+        instante del stop().
         """
         # ÚNICO punto de limpieza para voz: por aquí pasa todo lo que se habla
         # (StreamSpeaker, speak_sentences, MouthThread, say), sea cual sea el
@@ -351,14 +347,22 @@ class TTS:
         turno = self._tomar_voz(should_abort)
         if turno is None:
             return  # un stop() o el turno que caducó mientras esperaba: no suena
+        corte = turno.corte
+
+        def _abortada() -> bool:
+            # Cualquier stop() desde que tomó el turno la corta: también el que cae
+            # antes de que _speak_streaming cuente los suyos (StreamSpeaker y say()
+            # no pasan should_abort, y la bandera la limpia al entrar).
+            return self._cortes != corte or (should_abort is not None and should_abort())
+
         try:
-            self._speak_streaming(text, should_abort)
+            self._speak_streaming(text, _abortada)
         except Exception as error:  # noqa: BLE001 - una voz rota no debe matar el agente
             log.warning("error sintetizando/reproduciendo con Piper: %s", error)
         finally:
             self._soltar_voz(turno)
 
-    def _tomar_voz(self, should_abort: Callable[[], bool] | None) -> object | None:
+    def _tomar_voz(self, should_abort: Callable[[], bool] | None) -> _TurnoVoz | None:
         """Espera a que nadie más esté hablando y toma el turno de voz.
 
         Devuelve None (no hablar) si mientras esperaba llegó un stop() o
@@ -382,12 +386,12 @@ class TTS:
                 # esta despierte.
                 if self._cortes != corte or (should_abort is not None and should_abort()):
                     return None
-            turno = object()
+            turno = _TurnoVoz(corte)  # aquí self._cortes == corte: ver la espera de arriba
             self._voz_dueno = turno
             self._voz_avance = time.monotonic()
             return turno
 
-    def _soltar_voz(self, turno: object) -> None:
+    def _soltar_voz(self, turno: _TurnoVoz) -> None:
         with self._voz:
             # Si otro tomó el turno porque esta frase estaba trabada, ya es suyo.
             if self._voz_dueno is turno:
@@ -405,11 +409,19 @@ class TTS:
         (~90ms) vigilando el stop (y `should_abort`), así el corte (barge-in)
         sigue siendo casi inmediato. Devuelve False si se cortó a media frase.
         """
+        # La bandera de stop es compartida y la limpia CADA frase al empezar: sola,
+        # la frase que habla igual mientras esta sigue trabada en el sink (ver
+        # _tomar_voz) deshacía el stop() que cortó a esta, y al destrabarse el
+        # audio esta sonaba entera encima de la nueva. Por eso también se cuentan
+        # los stop(): cualquiera desde aquí (incluida la carga en frío de la voz)
+        # corta esta frase, limpie quien limpie la bandera.
+        corte = self._cortes
         import numpy as np
         import sounddevice as sd
 
         def _cortar() -> bool:
-            return self._stop_flag.is_set() or (should_abort is not None and should_abort())
+            return (self._stop_flag.is_set() or self._cortes != corte
+                    or (should_abort is not None and should_abort()))
 
         # Turno ya abortado antes de empezar: ni cargar/sintetizar ni abrir audio.
         if should_abort is not None and should_abort():
@@ -445,30 +457,12 @@ class TTS:
                 try:
                     # abort() tira lo que queda en el búfer; stop() solo lo
                     # dejaría sonar hasta el final.
-                    if cortado or self._stop_flag.is_set():
+                    if cortado or self._stop_flag.is_set() or self._cortes != corte:
                         stream.abort()
                     stream.stop()
                     stream.close()
                 except Exception:  # noqa: BLE001 - cerrar audio es best-effort
                     pass
-
-    def _play_interruptible(self, audio, sample_rate: int) -> bool:
-        """Reproduce vigilando el stop en pasos cortos (sd.wait() no es interrumpible).
-
-        Devuelve False si se cortó a media frase (M3.1).
-        """
-        import sounddevice as sd
-
-        self._stop_flag.clear()
-        sd.play(audio, samplerate=sample_rate)
-        stream = sd.get_stream()
-        while stream is not None and stream.active:
-            if self._stop_flag.is_set():
-                sd.stop()
-                return False
-            sd.sleep(20)  # ms
-            stream = sd.get_stream()
-        return not self._stop_flag.is_set()
 
     def _chunks_de(self, voice, text: str) -> Iterable[Any]:
         """Los chunks de Piper de `text` (ya limpio): los de voice.synthesize, como
