@@ -315,6 +315,8 @@ class HTTPTransport:
         # Una sola pre-conexión en vuelo: wakes seguidos con el DNS colgado no
         # apilan hilos ni sockets (el segundo vuelve al momento).
         self._preconnecting = threading.Lock()
+        # El contexto TLS de todas sus conexiones https (ver `_contexto_tls`).
+        self._tls: ssl.SSLContext | None = None
 
     @property
     def _conn(self) -> http.client.HTTPConnection | None:
@@ -333,9 +335,37 @@ class HTTPTransport:
         self._local.last = value
 
     def _connect(self) -> http.client.HTTPConnection:
-        cls = _HTTPSConnection if self._https else _HTTPConnection
-        return cls(self._host, self._port, timeout=self.timeout,
-                   connect_timeout=self.connect_timeout, keepalive=self._keepalive)
+        if self._https:
+            return _HTTPSConnection(
+                self._host, self._port, timeout=self.timeout,
+                connect_timeout=self.connect_timeout, keepalive=self._keepalive,
+                context=self._contexto_tls())
+        return _HTTPConnection(self._host, self._port, timeout=self.timeout,
+                               connect_timeout=self.connect_timeout, keepalive=self._keepalive)
+
+    def _contexto_tls(self) -> ssl.SSLContext:
+        """El SSLContext de este transporte: uno para todas sus conexiones https.
+
+        Sin `context=`, http.client crea uno nuevo por conexión y vuelve a cargar
+        el bundle de CAs del sistema (~20 ms de CPU) en el hilo que conecta: el
+        del turno cada vez que la nube cerró el keep-alive entre turnos, en cada
+        reintento y en cada preconnect. Es la misma receta que la suya (el gancho
+        de PEP 476, ALPN http/1.1, PHA), así que verifica igual. Un SSLContext es
+        seguro entre hilos. Por transporte y no global: cada cliente lee las CAs
+        (SSL_CERT_FILE) en su primera conexión; un bundle que cambie en disco
+        después se ve al reiniciar, como en tools/_web.py. Perezoso: construir el
+        cliente no lo paga, y lo suele pagar el preconnect, fuera del turno. Dos
+        hilos a la vez la primera vez lo crean dos veces como mucho; cualquiera
+        de los dos sirve, así que no hace falta lock.
+        """
+        contexto = self._tls
+        if contexto is None:
+            contexto = ssl._create_default_https_context()
+            contexto.set_alpn_protocols(["http/1.1"])
+            if contexto.post_handshake_auth is not None:
+                contexto.post_handshake_auth = True
+            self._tls = contexto
+        return contexto
 
     # Cola de un stream ya terminado lógicamente: línea en blanco + chunk
     # terminal, unos pocos bytes que para la siguiente petición ya llegaron.

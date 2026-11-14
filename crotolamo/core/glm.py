@@ -32,7 +32,15 @@ from crotolamo.core.llm import (
     _read_body,
 )
 from crotolamo.core.openai_adapter import from_openai_message, to_openai_messages
-from crotolamo.core.sse import SSEError, SSETruncated, parse_sse
+from crotolamo.core.sse import (
+    _FALLO_DE_INFERENCIA,
+    _FIN_NORMAL,
+    SSEError,
+    SSETruncated,
+    _error_text,
+    parse_sse,
+)
+from crotolamo.core.tool_parsing import arguments_complete
 from crotolamo.logging_setup import get_logger
 
 log = get_logger("core.glm")
@@ -60,6 +68,18 @@ def _find_api_key() -> str | None:
         if key and key.strip():
             return key.strip()
     return None
+
+
+def _key_cabe_en_header(key: str) -> bool:
+    """¿La key se puede mandar tal cual en el header Authorization?
+
+    Las keys de Z.ai son ASCII imprimible. Una pegada con comillas tipográficas
+    o un espacio invisible (U+200B no es espacio para strip()) hacía que
+    http.client reventara con un UnicodeEncodeError (latin-1) o un ValueError
+    ("Invalid header value") crudos en CADA turno: fuera del contrato LLMError,
+    así que FallbackLLM nunca usaba el local y el log hablaba de un codec.
+    """
+    return key.isascii() and key.isprintable()
 
 
 def _log_usage(usage: Any) -> None:
@@ -156,16 +176,23 @@ class GLMClient:
                 "(la sacas gratis en https://z.ai) o cambia [llm].backend a "
                 '"ollama" en la config.'
             )
+        if not _key_cabe_en_header(self.api_key):
+            # Una credencial mala más (como un 401), sin tocar la red: FallbackLLM
+            # pasa al local y lo dice en el log. La key NO va en el mensaje.
+            raise GLMAuthError(
+                "La API key de GLM trae caracteres raros (¿comillas o un espacio "
+                "invisible al copiarla?), patrón. Revísala en ~/.config/crotolamo/env."
+            )
         return {"Authorization": f"Bearer {self.api_key}"}
 
     def preconnect(self) -> bool:
         """Abre por adelantado la conexión HTTPS con la nube (el aviso del wake).
 
         Ver HTTPTransport.preconnect: nunca lanza y True = repuesto listo. Sin API
-        key la petición ni saldría (GLMAuthError antes de tocar la red): nada que
-        abrir.
+        key (o con una que no cabe en un header) la petición ni saldría
+        (GLMAuthError antes de tocar la red): nada que abrir.
         """
-        if not self.api_key:
+        if not self.api_key or not _key_cabe_en_header(self.api_key):
             return False
         return self._transport.preconnect()
 
@@ -298,6 +325,13 @@ class GLMClient:
         except ValueError as error:
             # JSONDecodeError o UnicodeDecodeError (cuerpo no-UTF-8): ambas ValueError.
             raise LLMError("GLM me devolvió basura no-JSON, patrón.") from error
+        if raw.get("error"):
+            # Un 200 que trae un objeto `error` (algunos compatibles con OpenAI):
+            # transitorio, como en el stream (ver parse_sse). La petición y la key
+            # ya pasaron; tragárselo como respuesta vacía era "Me quedé en blanco"
+            # sin probar el local.
+            raise TransientLLMError(
+                f"GLM me respondió con un error, patrón: {_error_text(raw['error'])}")
 
         usage = raw.get("usage", {}) or {}
         if _PROF:
@@ -313,12 +347,46 @@ class GLMClient:
         _log_usage(usage)
 
         choices = raw.get("choices") or []
-        message = (choices[0].get("message", {}) or {}) if choices else {}
+        choice = choices[0] if choices else {}
+        message = choice.get("message", {}) or {}
+        self._check_finish(choice.get("finish_reason"), message)
         normalized = from_openai_message(message)
         return ChatResponse(
             content=(normalized.get("content") or "").strip(),
             tool_calls=_parse_tool_calls(normalized),
             raw_message=normalized,
+        )
+
+    @staticmethod
+    def _check_finish(finish: Any, message: dict[str, Any]) -> None:
+        """El `finish_reason` de chat() con el mismo criterio que parse_sse.
+
+        Es la ruta de fábrica en voz (el loop concurrente no hace stream), y
+        daba por buena cualquier respuesta: `network_error` (Z.ai: fallo de
+        inferencia) salía vacía o a media frase sin probar el local, y tras un
+        corte (`length`, `sensitive`...) un tool_call a medias se degradaba a {}
+        y la tool corría con sus defaults. Sin `finish_reason` (hay servidores
+        que no lo mandan) o con un fin normal, nada cambia.
+        """
+        if not finish or finish in _FIN_NORMAL:
+            return
+        if finish == _FALLO_DE_INFERENCIA:
+            raise TransientLLMError(
+                f"GLM falló al generar la respuesta, patrón: error de inferencia "
+                f"del modelo ({finish})")
+        # Un corte: la marca dice que el modelo NO acabó. Los argumentos se miran
+        # CRUDOS, antes de que from_openai_message los degrade a {}; sin ellos
+        # (o null) no se sabe si venían enteros, igual que en el stream.
+        for call in message.get("tool_calls") or []:
+            fn = call.get("function", {}) or {}
+            if not arguments_complete(fn.get("arguments", "")):
+                raise TransientLLMError(
+                    f"GLM me cortó la respuesta a medias, patrón (acabó por {finish!r} "
+                    f"con un tool_call a medias).")
+        log.warning(
+            "GLM acabó por finish_reason=%r: respuesta posiblemente incompleta "
+            "(%d caracteres, %d tool_calls)", finish, len(message.get("content") or ""),
+            len(message.get("tool_calls") or []),
         )
 
     def chat_stream(

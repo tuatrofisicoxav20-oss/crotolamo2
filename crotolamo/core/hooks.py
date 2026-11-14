@@ -18,20 +18,25 @@ log = get_logger("core.hooks")
 # acepta parámetros. Te resumo el resultado: ..."). Patrones ANCLADOS al inicio,
 # conservadores, para no tocar respuestas normales. Cada patrón consume su frase
 # y la puntuación/espacio que la sigue.
+# El separador tras la frase es OBLIGATORIO: opcional, el patrón casaba con el
+# principio de una frase normal y se la comía ("Aquí el resultado final fue 3 a
+# 1" -> "final fue 3 a 1"; "...no acepta parámetros negativos. Dime..." ->
+# "negativos. Dime...").
 _META_PREAMBLES: tuple[re.Pattern[str], ...] = (
     # "(Patrón, )parece que la herramienta '...' no acepta (ningún )parámetro(s)."
+    # La frase acaba en "parámetro(s)": con su puntuación o con el salto de línea.
     re.compile(
         r"^\s*(?:patrón[,\s]+)?(?:parece que )?la herramienta\b[^.!?\n]*?"
-        r"no acepta[^.!?\n]*?par[áa]metros?[.!?\s]*",
+        r"no acepta[^.!?\n]*?par[áa]metros?(?:\s*[.!?]+|[ \t]*\n)\s*",
         re.IGNORECASE,
     ),
     # "Te resumo el resultado:" / "Aquí (te) (va )el resultado:"
     re.compile(
-        r"^\s*(?:te\s+)?resumo el resultado\s*[:.\-]?\s*",
+        r"^\s*(?:te\s+)?resumo el resultado\s*[:.\-]\s*",
         re.IGNORECASE,
     ),
     re.compile(
-        r"^\s*aqu[íi](?:\s+te)?(?:\s+va)?\s+el resultado\s*[:.\-]?\s*",
+        r"^\s*aqu[íi](?:\s+te)?(?:\s+va)?\s+el resultado\s*[:.\-]\s*",
         re.IGNORECASE,
     ),
 )

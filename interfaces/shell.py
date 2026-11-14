@@ -8,7 +8,9 @@ Comandos del shell:
 
 from __future__ import annotations
 
-from typing import Any, Callable
+import math
+import threading
+from typing import TYPE_CHECKING, Any, Callable, cast
 
 from crotolamo.core.agent import Agent
 from crotolamo.core.engine import build_llm
@@ -16,6 +18,9 @@ from crotolamo.core.memory import CompactionWorker, Conversation
 from crotolamo.core.persona import system_prompt
 from crotolamo.logging_setup import get_logger
 from crotolamo.settings import get_settings
+
+if TYPE_CHECKING:
+    from crotolamo.core.memoria import Memoria
 
 log = get_logger("shell")
 
@@ -26,14 +31,111 @@ _TURNO_ROTO = "Se me trabaron los cables, patrón. Vuelve a intentarlo."
 def _memory_knob(memory: dict[str, Any], key: str, default: int | None) -> Any:
     """Un número opcional (>= 0) de [memory]. Un valor que no lo es (un typo en el
     toml) se avisa y se ignora: un knob opcional no debe tumbar el arranque del
-    daemon, ni un negativo vaciar la conversación en cada turno."""
+    daemon, ni un negativo vaciar la conversación en cada turno. Tampoco `inf`
+    (TOML válido): Conversation hace int() y el OverflowError, fuera del try de
+    build_agent, dejaba al listener en un bucle de reinicios de systemd."""
     value = memory.get(key, default)
     if value is None or (isinstance(value, (int, float)) and not isinstance(value, bool)
-                         and value >= 0):
+                         and value >= 0 and math.isfinite(value)):
         return value
     log.warning("[memory].%s = %r no es un número >= 0; lo ignoro (uso %r)",
                 key, value, default)
     return default
+
+
+# El bloque de recuerdos con el formato del pre-hook (make_memoria_prehook).
+_BLOQUE_RECUERDOS = "[recuerdos sobre el patrón que vienen al caso:\n{}]\n\n"
+
+
+class _RecuerdosOmitidos:
+    """La memoria del pre-hook de recuerdos con GLM de cerebro: busca con la de
+    verdad y apunta los recuerdos que el pre-hook dejó FUERA por ir ya en la
+    ventana (make_memoria_prehook con `ventana_entera`).
+
+    POR QUÉ: el pre-hook decide una vez por turno, ANTES de la llamada, si el
+    motor ve la ventana entera; FallbackLLM elige motor llamada a llamada. Si la
+    nube cae A MEDIA llamada, el local recibe esa petición (y, con el breaker ya
+    abierto, las siguientes del turno) y su ajuste a num_ctx tira los turnos
+    viejos, donde iba la única copia. _LocalConRecuerdos se los devuelve con lo
+    apuntado aquí. Apuntar y no buscar otra vez: una 2ª búsqueda en el turno,
+    con la 1ª aún en curso, contaría como otro fallo para el breaker de la memoria.
+
+    Por hilo (el del turno; el resumen de compaction llama al LLM desde el suyo)
+    y por turno: uno que no busca (un comando anclado) no hereda los del anterior.
+    """
+
+    def __init__(self, memoria: Memoria, turno: Callable[[], object]) -> None:
+        self._memoria = memoria
+        self._turno = turno
+        self._hilo = threading.local()
+
+    def __getattr__(self, name: str) -> Any:
+        # El resto del contrato, el de la memoria de verdad. Sin ella aún (copy
+        # crea el objeto sin __init__), AttributeError y no una recursión.
+        if name == "_memoria":
+            raise AttributeError(name)
+        return getattr(self._memoria, name)
+
+    def contexto(self, query: str, ya_visto: Callable[[str], bool] | None = None) -> str:
+        omitidas: list[str] = []
+        self._hilo.apunte = (self._turno(), omitidas)
+        if ya_visto is None:
+            return self._memoria.contexto(query)
+
+        def visto(linea: str) -> bool:
+            if ya_visto(linea):
+                omitidas.append(linea)
+                return True
+            return False
+
+        return self._memoria.contexto(query, visto)
+
+    def omitidas(self) -> list[str]:
+        """Las que dejó fuera el pre-hook de ESTE turno en ESTE hilo ([] si no buscó)."""
+        apunte = getattr(self._hilo, "apunte", None)
+        if apunte is None or apunte[0] is not self._turno():
+            return []
+        return list(apunte[1])
+
+
+class _LocalConRecuerdos:
+    """El motor local con GLM de cerebro: la petición que le llega en un turno
+    cuyo pre-hook dejó recuerdos fuera (ver _RecuerdosOmitidos) los lleva de
+    vuelta delante del último mensaje del patrón, el que su ajuste a num_ctx no
+    tira nunca: lo mismo que ve con el breaker abierto desde el principio del
+    turno, cuando el pre-hook ya los repite. Solo en la petición: la
+    Conversation (y la nube, cuando vuelve) sigue sin copias de más.
+    """
+
+    def __init__(self, local: Any, recuerdos: _RecuerdosOmitidos) -> None:
+        self._local = local
+        self._recuerdos = recuerdos
+
+    def __getattr__(self, name: str) -> Any:
+        # model, preconnect, el transporte...: los del cliente de verdad (sin él
+        # aún, como en _RecuerdosOmitidos, AttributeError y no una recursión).
+        if name == "_local":
+            raise AttributeError(name)
+        return getattr(self._local, name)
+
+    def _con_recuerdos(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        lineas = self._recuerdos.omitidas()
+        if not lineas:
+            return messages
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user":
+                bloque = _BLOQUE_RECUERDOS.format("\n".join(lineas))
+                out = list(messages)
+                out[i] = {**messages[i], "content": bloque + (messages[i].get("content") or "")}
+                return out
+        return messages
+
+    def chat(self, messages, tools=None):
+        return self._local.chat(self._con_recuerdos(messages), tools=tools)
+
+    def chat_stream(self, messages, tools=None, on_token=None):
+        return self._local.chat_stream(self._con_recuerdos(messages), tools=tools,
+                                       on_token=on_token)
 
 
 def build_agent(confirm_fn=None) -> tuple[Agent, Conversation]:
@@ -159,13 +261,17 @@ def build_agent(confirm_fn=None) -> tuple[Agent, Conversation]:
         # (after-turn hook). Sustituye a la inyección única de hechos SQLite:
         # tras `crotolamo memoria migrar` ya viven aquí. Sin ella, todo como antes.
         memoria = get_memoria()
+        recuerdos: _RecuerdosOmitidos | None = None
         if memoria.enabled and mem0_instalado():
             memoria.precalentar()
             if glm_brain:
                 # Un recuerdo que ya va en la ventana no se repite en cada turno
                 # (ver make_memoria_prehook). Mientras responde el local (breaker
-                # abierto), sí: el ajuste a su num_ctx tira los turnos viejos.
-                recall = make_memoria_prehook(memoria, conversation,
+                # abierto), sí: el ajuste a su num_ctx tira los turnos viejos. Si
+                # la nube cae A MEDIA llamada, el local recibe los que se dejaron
+                # fuera (_RecuerdosOmitidos; ver abajo, tras armar el agente).
+                recuerdos = _RecuerdosOmitidos(memoria, lambda: tool_agent.last_turn)
+                recall = make_memoria_prehook(cast("Memoria", recuerdos), conversation,
                                               ventana_entera=lambda: not llm.degraded)
             else:
                 recall = make_memoria_prehook(memoria)
@@ -206,6 +312,11 @@ def build_agent(confirm_fn=None) -> tuple[Agent, Conversation]:
             # Un valor raro lo rechaza ToolAgent: "final" y un aviso en el log.
             stream_release=str(settings.voice.get("stream_release", "final")),
         )
+        if recuerdos is not None:
+            # Cada petición que llegue al local en un turno cuyo pre-hook dejó
+            # recuerdos fuera los lleva de vuelta: la de la caída (tras el shaper)
+            # y las siguientes del turno, que van directas con el breaker abierto.
+            llm.secondary = _LocalConRecuerdos(llm.secondary, recuerdos)
         if failover_policy is not None:
             # La nube cayó A MEDIA llamada: esa petición iba armada para GLM (todas
             # las tools). El local recibe la dieta chica del texto limpio del turno,

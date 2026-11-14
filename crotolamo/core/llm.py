@@ -11,6 +11,7 @@ import http.client
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, NoReturn
@@ -62,6 +63,27 @@ def _parse_tool_calls(message: dict[str, Any]) -> list[dict[str, Any]]:
     return calls
 
 
+# Un número sin unidad escrito como texto ("-1", "3600", "1.5").
+_NUMERO_SIN_UNIDAD = re.compile(r"[+-]?\d+(\.\d+)?")
+
+
+def _keep_alive_para_ollama(value: str | float) -> str | float:
+    """keep_alive en una forma que Ollama acepta: un número entre comillas, como número.
+
+    tomllib lee `keep_alive = "-1"` (lo que sugiere el comentario de [llm]) como
+    string, y Ollama decodifica un string con time.ParseDuration de Go, que exige
+    unidad: "-1" daba 400 ("missing unit in duration") en CADA request local. Un
+    número sí lo acepta: segundos, y negativo = residente para siempre; es lo mismo
+    que Ollama hace con OLLAMA_KEEP_ALIVE sin unidad. "15m", "1h", "-1m" y los
+    números de verdad salen tal cual.
+    """
+    if isinstance(value, str):
+        texto = value.strip()
+        if _NUMERO_SIN_UNIDAD.fullmatch(texto):
+            return float(texto) if "." in texto else int(texto)
+    return value
+
+
 def _read_body(resp) -> str:
     """Cuerpo de una respuesta de error, best-effort y acotado."""
     try:
@@ -103,7 +125,7 @@ class LLMClient:
         model: str = "qwen2.5-coder:7b",
         temperature: float = 0.2,
         timeout: float = 120,
-        keep_alive: str = "15m",
+        keep_alive: str | float = "15m",
         num_ctx: int | None = None,
         connect_timeout: float | None = None,
     ) -> None:
@@ -123,7 +145,8 @@ class LLMClient:
         # prompt-eval completo de los tool-schemas (~lento), pero si el modelo
         # sigue caliente los turnos siguientes reusan el cache y son baratos.
         # "15m" balancea rapidez en sesión vs. liberar RAM cuando no se usa.
-        self.keep_alive = keep_alive
+        # Un "-1" entre comillas viaja como número: ver _keep_alive_para_ollama.
+        self.keep_alive = _keep_alive_para_ollama(keep_alive)
         # Conexión HTTP persistente: evita abrir TCP nuevo en cada petición.
         # `timeout` cubre la respuesta (carga en frío incluida); conectar tiene
         # su propio tope (None = 5 s): un host caído no espera 180 s.
