@@ -26,13 +26,20 @@ _REPLACEMENTS = {
     "tle tl": "tletl",
 }
 
+# Orden de aplicación: de la clave MÁS LARGA a la más corta. "yutub" es prefijo
+# de "yutube": aplicada antes (orden del dict), dejaba "abre yutube" en "abre
+# youtubee" y la regla larga no coincidía nunca.
+_ORDERED_REPLACEMENTS = sorted(
+    _REPLACEMENTS.items(), key=lambda rule: len(rule[0]), reverse=True
+)
+
 
 def normalize_text(text: str) -> str:
     """Corrige errores comunes de Whisper. Devuelve el texto en minúsculas y limpio."""
     text = re.sub(r"\s+", " ", text.strip())
     lower = text.lower()
 
-    for wrong, right in _REPLACEMENTS.items():
+    for wrong, right in _ORDERED_REPLACEMENTS:
         lower = lower.replace(wrong, right)
 
     # 'crear una carpeta' / 'qué es una carpeta' -> 'crea una carpeta'

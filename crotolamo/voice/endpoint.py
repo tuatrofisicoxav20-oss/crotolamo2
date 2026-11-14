@@ -42,6 +42,14 @@ _CONNECTORS = frozenset({
     "mas", "menos", "muy", "tan", "cada", "todo", "toda", "todos", "todas",
 })
 
+# Formas TÓNICAS: llevan tilde justo para distinguirse del conector átono, y
+# ESAS sí cierran oración — "sí" (afirmación) no es "si" (conjunción), "está"
+# (verbo) no es "esta" (determinante), "él/mí/tú" (pronombres) no son
+# "el/mi/tu". Como _norm quita los acentos, sin esta lista un "sí" a secas o un
+# "¿dónde está?" contaban como frase a medias y reabrían la escucha antes de
+# actuar. Se comparan CON acento, antes de normalizar.
+_TONIC_CLOSERS = frozenset({"sí", "él", "mí", "tú", "está"})
+
 # Verbos transitivos que, SOLOS, piden objeto: "abre" (¿qué?), "mueve" (¿qué?).
 # Solo aplican cuando la transcripción es UNA palabra; "pausa" o "siguiente"
 # solos sí son órdenes completas y no están aquí.
@@ -50,7 +58,7 @@ _DANGLING_VERBS = frozenset({
     "busca", "buscame", "manda", "mandame", "pasa", "pasame", "quita",
     "quitame", "cierra", "cierrame", "cambia", "toca", "reproduce",
     "dime", "dame", "lee", "leeme", "escribe", "apunta", "borra",
-    "elimina", "crea", "creame", "guarda", "guardame", "enseñame",
+    "elimina", "crea", "creame", "guarda", "guardame",
     "ensename", "muestrame", "recuerda", "recuerdame",
 })
 
@@ -63,8 +71,12 @@ def seems_incomplete(text: str) -> bool:
     # Whisper marca el trailing-off con coma o puntos suspensivos.
     if t.endswith(",") or t.endswith("...") or t.endswith("…"):
         return True
-    words = _norm(t.rstrip(".!?¿¡ ")).split()
+    body = t.rstrip(".!?¿¡ ")
+    words = _norm(body).split()
     if not words:
+        return False
+    # NFC: Whisper puede entregar la tilde como carácter combinante suelto.
+    if unicodedata.normalize("NFC", body.lower()).split()[-1] in _TONIC_CLOSERS:
         return False
     if words[-1] in _CONNECTORS:
         return True

@@ -8,6 +8,7 @@ sea "barato") es costo puro sin motivo.
 
 from __future__ import annotations
 
+import threading
 from typing import Any
 
 from crotolamo.logging_setup import get_logger
@@ -28,9 +29,20 @@ class _RealMic:
         self.frame = frame
         self.device = device
         self._stream = None
+        # close() es TERMINAL (V17): VoiceLoop.stop() lo llama desde el hilo
+        # principal con el oído todavía en su bucle. Sin esta marca, el read()
+        # siguiente veía _stream en None y abría un InputStream NUEVO que ya
+        # nadie cerraba. El lock solo protege el relevo del stream (publicarlo
+        # / retirarlo), nunca la lectura ni la apertura: close() no espera a
+        # PortAudio.
+        self._closed = False
+        self._lock = threading.Lock()
 
     def read(self):
         """Lee un frame BLOQUEANTE (~32ms a 16kHz con frame=512).
+
+        Devuelve None si el micrófono ya se cerró (el oído trata None como
+        "sin audio" y vuelve a mirar shutdown).
 
         LÍMITE CONOCIDO (B1): PortAudio no ofrece read() con timeout; si el
         driver/dispositivo se atora, esta llamada puede colgar el EarThread y
@@ -43,23 +55,57 @@ class _RealMic:
         import numpy as np
         import sounddevice as sd
 
-        if self._stream is None:
-            self._stream = sd.InputStream(
-                samplerate=self.sample_rate, channels=1, dtype="float32",
-                device=self.device,
-            )
-            self._stream.start()
-        block, _ = self._stream.read(self.frame)
+        if self._closed:
+            return None
+        try:
+            stream = self._stream
+            if stream is None:
+                stream = self._open(sd)
+                if stream is None:
+                    return None
+            block, _ = stream.read(self.frame)
+        except Exception:
+            # stop() cierra el stream desde OTRO hilo para desbloquear esta
+            # lectura: que PortAudio la corte con un error es entonces el
+            # apagado, no un fallo del micro (propagarlo tumbaba al oído con un
+            # traceback). Sin close() de por medio, el error es real y sube.
+            if self._closed:
+                return None
+            raise
         return np.squeeze(block)
 
+    def _open(self, sd):
+        """Abre y publica el stream; None si close() llegó mientras se abría."""
+        stream = sd.InputStream(
+            samplerate=self.sample_rate, channels=1, dtype="float32",
+            device=self.device,
+        )
+        with self._lock:
+            closed = self._closed
+            if not closed:
+                self._stream = stream
+        if closed:
+            # close() corrió durante la apertura y no vio este stream: lo
+            # cierra quien lo abrió, o quedaría huérfano.
+            self._shut(stream)
+            return None
+        stream.start()
+        return stream
+
+    @staticmethod
+    def _shut(stream) -> None:
+        try:
+            stream.stop()
+            stream.close()
+        except Exception:  # noqa: BLE001
+            pass
+
     def close(self) -> None:
-        if self._stream is not None:
-            try:
-                self._stream.stop()
-                self._stream.close()
-            except Exception:  # noqa: BLE001
-                pass
-            self._stream = None
+        with self._lock:
+            self._closed = True
+            stream, self._stream = self._stream, None
+        if stream is not None:
+            self._shut(stream)
 
 
 class _SileroVad:

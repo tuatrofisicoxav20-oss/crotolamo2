@@ -12,12 +12,15 @@ from crotolamo.voice.wakeword import WakeWordDetector
 
 
 class _FakeModel:
-    """Sustituto de openwakeword.Model: devuelve un score fijo."""
+    """Sustituto de openwakeword.Model: devuelve un score fijo y guarda lo que
+    recibe (para comprobar la conversión a int16 que exige openWakeWord)."""
 
     def __init__(self, value: float) -> None:
         self.value = value
+        self.received = None
 
     def predict(self, arr):
+        self.received = arr
         return {"crotolamo": self.value}
 
 
@@ -55,8 +58,20 @@ def test_no_debug_prints_nothing(capsys):
 
 def test_score_converts_float_chunks():
     det = _detector(score=0.3)
-    chunk = np.zeros(1280, dtype=np.float32)
+    chunk = np.array([0.0, 0.5, -0.5, 1.0], dtype=np.float32)
     assert det.score(chunk) == pytest.approx(0.3)
+    # El modelo falso ignora el audio: sin mirar lo que recibe, este test pasaba
+    # aunque se borrara la conversión. openWakeWord espera int16 escalado.
+    received = det._model.received
+    assert received.dtype == np.int16
+    assert received.tolist() == [0, 16383, -16383, 32767]
+
+
+def test_score_passes_int16_chunks_untouched():
+    det = _detector(score=0.3)
+    chunk = np.array([0, 1200, -1200, 32767], dtype=np.int16)
+    det.score(chunk)
+    assert det._model.received.tolist() == [0, 1200, -1200, 32767]
 
 
 def test_from_settings_reads_debug_env(monkeypatch):

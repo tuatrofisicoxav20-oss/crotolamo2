@@ -11,6 +11,7 @@ o grabar se exige la extra [voice].
 from __future__ import annotations
 
 import tempfile
+import threading
 import wave
 from pathlib import Path
 
@@ -29,11 +30,32 @@ _INITIAL_PROMPT = "Transcripción de habla en español de México."
 # coexistir sin pisarse el uno al otro.
 _models: dict[str, object] = {}
 
+# Un lock de carga POR tamaño. El hilo WarmVoice del listener precalienta los
+# modelos mientras el loop ya escucha: sin lock, el primer transcribe() que
+# llegaba a media carga construía una SEGUNDA copia del mismo modelo (segundos de
+# CPU y ~137 MB de pico para nada). Por tamaño y no global: cargar (o descargar)
+# 'base' no debe dejar esperando al wake, que usa 'tiny'.
+_model_locks: dict[str, threading.Lock] = {}
+_model_locks_guard = threading.Lock()
+
+
+def _model_lock(model_size: str) -> threading.Lock:
+    with _model_locks_guard:
+        return _model_locks.setdefault(model_size, threading.Lock())
+
+
 # Caché del VAD Silero. Antes se hacía load_silero_vad() en CADA grabación (y hasta
 # 3 veces por orden con smart_endpoint), releyendo el ONNX del disco cada vez. El
 # modelo no tiene configuración: una sola instancia sirve a todos los turnos; su
 # estado de RNN se limpia con reset_states() en cada uso.
 _silero_vad: object | None = None
+
+# Motivo por el que CARGAR Silero falló (falta silero-vad u onnxruntime, ONNX
+# corrupto), o None. Ese fallo es permanente en el proceso: antes cada grabación
+# del modo simple reintentaba el import/carga y escribía un WARNING — uno cada
+# <=6 s, para siempre, en el bucle del wake — para acabar igual en el VAD por
+# energía. Mismo criterio que el fallback permanente de adapters._SileroVad.
+_silero_load_error: str | None = None
 
 
 def _get_silero_vad():
@@ -43,26 +65,22 @@ def _get_silero_vad():
     hilo de STT transcribe con Whisper, no con Silero. Si algún día ambos corren a la
     vez, hay que dar una instancia por hilo o el estado se pisará.
     """
-    global _silero_vad
+    global _silero_vad, _silero_load_error
     if _silero_vad is None:
-        from silero_vad import load_silero_vad
+        if _silero_load_error is not None:
+            raise RuntimeError(f"Silero no cargó: {_silero_load_error}")
+        try:
+            from silero_vad import load_silero_vad
 
-        _silero_vad = load_silero_vad(onnx=True)
+            _silero_vad = load_silero_vad(onnx=True)
+        except Exception as error:
+            _silero_load_error = f"{type(error).__name__}: {error}"
+            raise
     return _silero_vad
 
 
 class VoiceUnavailable(RuntimeError):
     """Faltan las dependencias de voz. Instala con: pip install -e '.[voice]'."""
-
-
-def _wav_seconds(path: Path) -> float:
-    """Duración del WAV en segundos (0.0 si no se puede leer)."""
-    try:
-        with wave.open(str(path), "rb") as wav:
-            rate = wav.getframerate()
-            return wav.getnframes() / rate if rate else 0.0
-    except (OSError, wave.Error):
-        return 0.0
 
 
 def _require(module: str):
@@ -110,12 +128,17 @@ class STT:
         )
 
     def _get_model(self):
+        # Camino caliente sin lock: con el modelo ya cargado es un dict lookup.
         if self.model_size not in _models:
-            faster_whisper = _require("faster_whisper")
-            log.info("Cargando Whisper '%s' (la primera vez tarda)", self.model_size)
-            _models[self.model_size] = faster_whisper.WhisperModel(
-                self.model_size, device="cpu", compute_type="int8"
-            )
+            with _model_lock(self.model_size):
+                # Doble comprobación: otro hilo pudo cargarlo mientras esperábamos.
+                if self.model_size not in _models:
+                    faster_whisper = _require("faster_whisper")
+                    log.info("Cargando Whisper '%s' (la primera vez tarda)",
+                             self.model_size)
+                    _models[self.model_size] = faster_whisper.WhisperModel(
+                        self.model_size, device="cpu", compute_type="int8"
+                    )
         return _models[self.model_size]
 
     # --- grabación ---
@@ -140,12 +163,17 @@ class STT:
         backend = voice.get("vad_backend", "energy")
 
         if backend == "silero":
-            try:
-                return self._record_silero(silence_ms, max_seconds, start_timeout_s, voice)
-            except VoiceUnavailable:
-                raise
-            except Exception as error:  # noqa: BLE001 - si silero falla, caemos a energía
-                log.warning("VAD silero falló (%s); uso energía", error)
+            if _silero_load_error is not None:
+                # Ya no carga ni cargará en este proceso, y se avisó UNA vez (abajo).
+                log.debug("VAD silero no disponible (%s); uso energía", _silero_load_error)
+            else:
+                try:
+                    return self._record_silero(silence_ms, max_seconds, start_timeout_s,
+                                               voice)
+                except VoiceUnavailable:
+                    raise
+                except Exception as error:  # noqa: BLE001 - si silero falla, caemos a energía
+                    log.warning("VAD silero falló (%s); uso energía", error)
         return self._record_energy(silence_ms, max_seconds, start_timeout_s)
 
     def record_until_silence(self, silence_ms: int | None = None, max_seconds: float = 12.0,
@@ -190,7 +218,8 @@ class STT:
 
     def _record_energy(self, silence_ms: int, max_seconds: float,
                        start_timeout_s: float) -> list:
-        """VAD por energía RMS. Calibra el piso de ruido con ~10 chunks (M1 audit)."""
+        """VAD por energía RMS. Calibra el piso de ruido con ~10 chunks (M1 audit).
+        Si en la ventana solo hubo ruido estable, devuelve [] (igual que Silero)."""
         np = _require("numpy")
         sd = _require("sounddevice")
 
@@ -200,12 +229,16 @@ class STT:
         max_chunks = int(max_seconds * 1000 / chunk_ms)
         start_chunks = int(start_timeout_s * 1000 / chunk_ms)
         calib_chunks = 10
+        ratio = 3.0  # voz = RMS >= max(piso de ruido * ratio, 0.01)
 
         frames: list = []
         speaking = False
         silent_run = 0
         threshold = None
         calib_rms: list[float] = []
+        # Chunk más bajo CON señal (los ceros digitales del arranque del stream o
+        # de un mic silenciado no dicen nada del ruido de la sala) y el más alto.
+        rms_floor = rms_max = 0.0
 
         with sd.InputStream(samplerate=self.sample_rate, channels=1, dtype="float32",
                             device=_voice_cfg().get("input_device")) as stream:
@@ -214,13 +247,16 @@ class STT:
                 block = np.squeeze(block)
                 frames.append(block)
                 rms = float(np.sqrt(np.mean(block ** 2)) + 1e-9)
+                if rms > 1e-6 and (rms_floor == 0.0 or rms < rms_floor):
+                    rms_floor = rms
+                rms_max = max(rms_max, rms)
 
                 if i < calib_chunks:
                     calib_rms.append(rms)
                     continue
                 if threshold is None:
                     noise_floor = float(np.mean(calib_rms)) if calib_rms else 0.0
-                    threshold = max(noise_floor * 3.0, 0.01)
+                    threshold = max(noise_floor * ratio, 0.01)
 
                 if rms >= threshold:
                     speaking = True
@@ -233,6 +269,17 @@ class STT:
                 if not speaking and i >= start_chunks:
                     break
 
+        # Solo ruido de fondo estable (o silencio digital): nada que transcribir,
+        # [] como Silero, y min_audio_s lo corta antes de Whisper. Antes se
+        # devolvía la ventana ENTERA (6 s en el wake difuso), Whisper la
+        # transcribía normalizada a 0.9 y el micrófono quedaba sordo ~1 s en cada
+        # ciclo vacío. Se juzga con el criterio MÁS permisivo, no con `speaking`:
+        # si la voz (o el bip) cayó en los chunks de calibración, el umbral quedó
+        # en 3x la propia voz; y una voz bajita (mic con poca ganancia) no cruza
+        # el piso absoluto de 0.01. En ambos casos `speaking` no se enciende pero
+        # algún chunk supera 3x el más bajo, y el audio llega a Whisper como antes.
+        if not speaking and (rms_floor == 0.0 or rms_max < rms_floor * ratio):
+            return []
         return frames
 
     def _record_silero(self, silence_ms: int, max_seconds: float,

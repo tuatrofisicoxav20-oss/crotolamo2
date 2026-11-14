@@ -48,6 +48,12 @@ class WakeWordDetector:
         self.debug = debug
         self._model = None  # se carga una sola vez
         self._np: Any = None  # numpy cacheado: score() corre en CADA chunk (~31/s)
+        # Buffers del preprocessor recién cargado (openwakeword < 0.6): reset()
+        # los restaura de esta copia en vez de recalcular ~200 ms de embeddings.
+        self._blank_state: dict[str, Any] | None = None
+        # (score, umbral) del chunk anterior: feed() no repite en el log una
+        # predicción que openWakeWord no recalculó (ver feed).
+        self._last_score_key: tuple[float, float] | None = None
 
     @classmethod
     def from_settings(cls, settings) -> "WakeWordDetector":
@@ -91,8 +97,9 @@ class WakeWordDetector:
         pre-entrenados que openWakeWord trae en resources/models
         (p.ej. 'hey_jarvis' -> 'hey_jarvis_v0.1.onnx').
         """
-        if self.model_name.endswith(".onnx") and os.path.isfile(self.model_name):
-            return self.model_name
+        own = self._own_model_path()
+        if own is not None:
+            return own
         try:
             import openwakeword
 
@@ -106,6 +113,29 @@ class WakeWordDetector:
             log.debug("no pude resolver la ruta del modelo '%s': %s",
                       self.model_name, error)
         return self.model_name
+
+    def _own_model_path(self) -> str | None:
+        """Ruta al .onnx PROPIO de [wake].oww_model si existe; None si no.
+
+        Se expanden ~ y $VARS como en el resto de rutas de la config (settings.py):
+        aquí se usaba la cadena cruda y "~/modelos/x.onnx" no existía. Una ruta
+        relativa se busca primero desde el CWD (lo que ya funcionaba no cambia) y
+        luego desde la raíz del repo: la documentada
+        (wakeword_training/my_custom_model/crotolamo.onnx) solo cargaba lanzando
+        el proceso desde ahí, como hace el .service; desde otra terminal, no.
+        """
+        if not self.model_name.endswith(".onnx"):
+            return None
+        path = os.path.expandvars(os.path.expanduser(self.model_name))
+        if os.path.isfile(path):
+            return path
+        if not os.path.isabs(path):
+            from crotolamo.settings import REPO_ROOT
+
+            anchored = os.path.join(REPO_ROOT, path)
+            if os.path.isfile(anchored):
+                return anchored
+        return None
 
     def _get_model(self):
         """Carga el modelo de openWakeWord una sola vez (descarga el puente si falta).
@@ -135,28 +165,82 @@ class WakeWordDetector:
             log.debug("descarga del modelo '%s' omitida: %s", self.model_name, error)
 
         path = self._resolve_model_path()
+        # Un .onnx propio va por su ruta YA resuelta también en el primer intento:
+        # 0.6+ solo acepta wakeword_models y busca ahí un archivo existente.
+        own = self._own_model_path()
 
         # La firma del constructor cambia entre versiones de openWakeWord: unas aceptan
         # el NOMBRE (wakeword_models) y/o inference_framework; otras solo la RUTA al
         # .onnx (wakeword_model_paths) y son ONNX puro. Probamos en orden y nos
         # quedamos con la primera variante que cargue.
         attempts = (
-            {"wakeword_models": [self.model_name], "inference_framework": "onnx"},
+            {"wakeword_models": [own or self.model_name], "inference_framework": "onnx"},
             {"wakeword_model_paths": [path], "inference_framework": "onnx"},
             {"wakeword_model_paths": [path]},
             {"wakeword_models": [path]},
         )
-        last_error: Exception | None = None
+        cause: Exception | None = None
         for kwargs in attempts:
             try:
                 self._model = Model(**kwargs)
-                return self._model
             except Exception as error:  # noqa: BLE001 - TypeError o NoSuchFile, etc.
-                last_error = error
+                # Un TypeError es una firma que no es de ESTA versión: se informa
+                # el primer error que no lo sea (archivo inexistente, pesos que
+                # faltan...). Antes salía el del ÚLTIMO intento, un TypeError de
+                # firma que apuntaba a incompatibilidad y escondía la causa real.
+                if cause is None or (isinstance(cause, TypeError)
+                                     and not isinstance(error, TypeError)):
+                    cause = error
                 continue
+            self._remember_blank_state()
+            return self._model
         raise VoiceUnavailable(
-            f"No pude cargar el wake word '{self.model_name}', patrón: {last_error}"
+            f"No pude cargar el wake word '{self.model_name}', patrón: {cause}"
         )
+
+    def _remember_blank_state(self) -> None:
+        """Copia los buffers del preprocessor recién cargado (antes de oír nada).
+
+        Solo hace falta en openwakeword < 0.6, donde Model.reset() no toca el
+        preprocessor; en 0.6+ el preprocessor trae su propio reset().
+        """
+        pre = getattr(self._model, "preprocessor", None)
+        if pre is None or callable(getattr(pre, "reset", None)):
+            return
+        self._blank_state = {
+            name: getattr(pre, name).copy()
+            for name in ("melspectrogram_buffer", "feature_buffer", "raw_data_remainder")
+            if hasattr(getattr(pre, name, None), "copy")
+        }
+
+    def reset(self) -> None:
+        """Olvida el audio ya escuchado: el modelo queda como recién cargado.
+
+        Se llama al DISPARAR. openWakeWord puntúa las últimas features (~1.3 s de
+        audio) que guarda su preprocessor; tras un wake el oído deja de
+        alimentarlo (LISTENING, THINKING, SPEAKING, gracia) y, al volver, el
+        primer chunk de SILENCIO todavía puntuaba con el wake dentro: turno
+        fantasma tras turno fantasma (un solo wake real abría más de 20), y en
+        el modo simple listen_for_wake() devolvía True en su primer frame.
+        Model.reset() solo vacía las predicciones en 0.4/0.5; los buffers del
+        preprocessor se restauran aparte desde la copia en blanco.
+        """
+        model = self._model
+        if model is None:
+            return
+        model_reset = getattr(model, "reset", None)
+        if callable(model_reset):
+            model_reset()  # prediction_buffer (en 0.6+ también el preprocessor)
+        pre = getattr(model, "preprocessor", None)
+        if pre is None or self._blank_state is None:
+            return
+        for name, value in self._blank_state.items():
+            setattr(pre, name, value.copy())
+        raw = getattr(pre, "raw_data_buffer", None)
+        if raw is not None:
+            raw.clear()
+        if hasattr(pre, "accumulated_samples"):
+            pre.accumulated_samples = 0
 
     def available(self) -> bool:
         """True si openwakeword (y sounddevice) están importables.
@@ -206,9 +290,17 @@ class WakeWordDetector:
                   f"{'  <<< DISPARA' if fired else ''}", flush=True)
         # Log de diagnóstico: solo cuando hay señal (>0.05), para ver qué score da
         # la voz REAL del patrón y afinar el umbral sin inundar el log con silencio.
-        if mx > 0.05:
+        # Con chunks de 512 openWakeWord solo predice de nuevo cada 1280 muestras;
+        # entre medias devuelve el MISMO score y la misma línea salía 2-3 veces
+        # seguidas. Se omite la repetición exacta (mismo score y mismo umbral);
+        # un disparo se loguea siempre: cada uno abre un turno.
+        key = (mx, threshold)
+        if mx > 0.05 and (fired or key != self._last_score_key):
             log.info("wake score=%.3f (umbral=%.2f) -> %s",
                      mx, threshold, "DISPARA" if fired else "no")
+        self._last_score_key = key
+        if fired:
+            self.reset()  # el wake ya se atendió: que no vuelva a puntuar (ver reset)
         return fired
 
     def score(self, chunk) -> float:
@@ -255,5 +347,8 @@ class WakeWordDetector:
                 # Umbral efectivo por frame: la música puede arrancar o parar
                 # mientras esperamos el wake (el monitor lo refleja en su caché).
                 if scores and max(scores.values()) >= self.effective_threshold():
+                    # Sin reset, la siguiente espera disparaba en su PRIMER frame
+                    # con este mismo wake todavía en los buffers (ver reset).
+                    self.reset()
                     return True
         return False

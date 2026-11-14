@@ -10,15 +10,20 @@ TTS) ya cumplen estos Protocols por tipado estructural.
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 
 @runtime_checkable
 class SpeechToText(Protocol):
     def listen_once(self, **kwargs) -> str: ...
 
-    def transcribe(self, path: Path) -> str: ...
+    # La firma que el loop USA de verdad (V14): SttThread llama
+    # transcribe(audio, hotwords=...) y `audio` es un ndarray float32 16 kHz EN
+    # MEMORIA en el camino caliente, o la ruta de un WAV (Path/str). Antes decía
+    # transcribe(path: Path): un backend escrito contra eso pasaba isinstance
+    # (runtime_checkable solo mira nombres) y luego fallaba con TypeError en cada
+    # comando, que SttThread traga -> todas las órdenes perdidas en silencio.
+    def transcribe(self, audio: Any, hotwords: str | None = None) -> str: ...
 
 
 @runtime_checkable

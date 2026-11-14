@@ -40,6 +40,23 @@ def _default_variants() -> list[str]:
     return WAKE_VARIANTS
 
 
+def _default_target() -> str:
+    """El nombre a despertar desde la config ([wake].target); WAKE_TARGET de fallback.
+
+    El docstring del módulo promete leer target desde config, pero wake_score
+    usaba siempre la constante: la clave de crotolamo.toml no hacía nada (V16).
+    """
+    try:
+        from crotolamo.settings import get_settings
+
+        target = get_settings().wake.get("target")
+        if target:
+            return str(target)
+    except Exception:
+        pass
+    return WAKE_TARGET
+
+
 def normalize_for_wake(text: str) -> str:
     text = text.lower().strip()
     text = "".join(
@@ -58,11 +75,16 @@ def similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, a, b).ratio()
 
 
+def _candidates(variant_list: list[str]) -> list[str]:
+    """El nombre a despertar y sus variantes, compactados (sin espacios)."""
+    return [compact(_default_target())] + [compact(v) for v in variant_list]
+
+
 def wake_score(text: str, variants: Iterable[str] | None = None) -> tuple[float, str]:
     """Devuelve qué tan parecido fue lo escuchado a 'crotolamo'."""
     variant_list = list(variants) if variants is not None else _default_variants()
     comp = compact(normalize_for_wake(text))
-    candidates = [compact(WAKE_TARGET)] + [compact(v) for v in variant_list]
+    candidates = _candidates(variant_list)
 
     best_score = 0.0
     best_variant = ""
@@ -98,23 +120,44 @@ def is_wake_word(text: str, threshold: float = DEFAULT_THRESHOLD,
 
 
 def strip_wake_word(text: str, variants: Iterable[str] | None = None) -> str:
-    """Quita la palabra de activación para dejar solo la orden."""
+    """Quita la palabra de activación para dejar solo la orden.
+
+    Sin una variante literal al inicio, se corta el prefijo de 1 a 3 palabras que
+    MÁS se parece al wake comparado ENTERO, y solo si llega al umbral. Antes se
+    probaban los prefijos de 3, 2 y 1 palabras con is_wake_word, que puntúa por
+    VENTANAS: cualquier prefijo de 3 palabras que CONTUVIERA algo parecido a
+    "crotolamo" pasaba y la orden perdía palabras ("protolamo pon música" ->
+    "música"; en el followup, "pero tómalo con calma" -> "calma"). La frase
+    entera también puede ser el wake ("caroto llamo" -> ""): antes se saltaba
+    y "llamo" llegaba al agente como orden.
+    """
     variant_list = list(variants) if variants is not None else _default_variants()
     original = text.strip()
     lower = normalize_for_wake(original)
+    words = original.split()
 
     for wake in variant_list:
         wake_norm = normalize_for_wake(wake)
         if lower.startswith(wake_norm):
-            count = len(wake_norm.split())
-            return " ".join(original.split()[count:]).strip(" ,.:;-")
+            # Se cuentan palabras NORMALIZADAS pero se corta el ORIGINAL:
+            # "Croto-lamo," es UNA palabra del original y DOS normalizadas. Se
+            # avanza por el original hasta cubrir las del wake (cortar 2 del
+            # original dejaba "Croto-lamo, pon música" en "música").
+            pending, cut = len(wake_norm.split()), 0
+            while cut < len(words) and pending > 0:
+                pending -= len(normalize_for_wake(words[cut]).split())
+                cut += 1
+            return " ".join(words[cut:]).strip(" ,.:;-")
 
-    words = original.split()
-    for n in (3, 2, 1):
-        if len(words) <= n:
-            continue
-        if is_wake_word(" ".join(words[:n]), variants=variant_list):
-            return " ".join(words[n:]).strip(" ,.:;-")
+    candidates = _candidates(variant_list)
+    best_n, best_score = 0, 0.0
+    for n in range(1, min(3, len(words)) + 1):
+        comp = compact(" ".join(words[:n]))
+        score = max(similarity(comp, candidate) for candidate in candidates)
+        if score > best_score:  # ante empate, el prefijo más corto: corta menos
+            best_n, best_score = n, score
+    if best_n and best_score >= DEFAULT_THRESHOLD:
+        return " ".join(words[best_n:]).strip(" ,.:;-")
 
     return original
 
@@ -145,10 +188,29 @@ def confirmation_from_answer(answer: str) -> bool:
     Es la única regla de decisión para tools delicadas dichas por voz; vive
     aquí (pura) para poder probarla sin micrófono. Cualquier respuesta que no
     contenga una confirmación clara se trata como "no" (lo seguro).
+
+    Una PREGUNTA no es una confirmación clara: "¿se va a borrar todo?" o "¿y si
+    mejor lo dejamos?" confirmaban por el "va"/"si" que llevan dentro y la tool
+    delicada corría. Whisper conserva "¿"/"?" (normalize_text no los toca).
     """
     if contains_any(answer, CANCEL_VARIANTS):
         return False
-    return contains_any(answer, CONFIRM_VARIANTS)
+    if "?" in answer or "¿" in answer:
+        return False
+    return contains_any(_sin_va_de_futuro(answer), CONFIRM_VARIANTS)
+
+
+def _sin_va_de_futuro(text: str) -> str:
+    """Quita el "va" de la perífrasis "va a + infinitivo" ("qué va a borrar").
+
+    Ese "va" es el verbo ir, no el "va" de "va que va"; cuenta aunque el modelo
+    tiny del wake (el que transcribe la confirmación) se coma los signos de
+    interrogación. El "va" suelto o seguido de otra cosa sigue confirmando.
+    """
+    words = normalize_for_wake(text).split()
+    return " ".join(
+        w for i, w in enumerate(words) if not (w == "va" and words[i + 1:i + 2] == ["a"])
+    )
 
 
 def split_wake_command(
