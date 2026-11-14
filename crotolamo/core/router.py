@@ -5,7 +5,8 @@ que la PRIMERA llamada de cada turno tarde ~130-156s evaluando el prompt. Con
 solo 5-8 tools relevantes (~600-900 tokens) ese costo baja a ~2-5s. Medido en
 este equipo: 6 tools = 2.4s vs 30 tools = 142s.
 
-CÓMO: keyword-matching insensible a acentos en español. Cada "grupo" (≈ un
+CÓMO: keyword-matching insensible a acentos en español, al inicio de palabra
+("pon" entra con "ponme", no con "responde"). Cada "grupo" (≈ un
 módulo de tools) tiene disparadores; la consulta activa uno o varios grupos y se
 envía la unión de sus tools, con un tope. Si nada matchea, se manda un set común
 para que las acciones básicas nunca se rompan. Cero dependencias (stdlib).
@@ -17,6 +18,7 @@ a 'music_now' en vez de 'music_control').
 M4: además de los grupos estáticos de abajo, los servers MCP se registran como
 grupos DINÁMICOS (`register_group` / `unregister_group`) y, cuando varios de
 ellos matchean, rotan en round-robin para que el tope no mate siempre al mismo.
+Dentro de un server, las tools que la frase nombra van primero (`_named_first`).
 """
 
 from __future__ import annotations
@@ -32,8 +34,30 @@ def _norm(text: str) -> str:
     return "".join(c for c in nfd if unicodedata.category(c) != "Mn")
 
 
+def _hits(norm: str, kw: str) -> bool:
+    """True si la keyword aparece en la consulta EMPEZANDO una palabra.
+
+    POR QUÉ no basta `kw in norm`: a media palabra, "pon" matcheaba "responde",
+    "tema" "sistema", "ram" "gramática"/"telegram" y "prende" "comprendes". Una
+    charla (sin tools: ~1-2s y hablada en vivo) se volvía un turno con tools
+    colgando (~30s en CPU, y el 3B tentado a llamar una).
+    Solo se exige el INICIO de palabra; el final queda libre a propósito: las
+    keywords son prefijos ("tengo abiert", "compu") y el español pega el
+    pronombre al imperativo ("ponme", "ábrelo", "ciérrala").
+    """
+    if not kw[:1].isalnum():
+        return kw in norm  # p.ej. ".md": no hay inicio de palabra que exigir
+    start = norm.find(kw)
+    while start != -1:
+        if start == 0 or not norm[start - 1].isalnum():
+            return True
+        start = norm.find(kw, start + 1)
+    return False
+
+
 # Grupo -> (tools del grupo, palabras clave que lo activan). Las keywords se
-# comparan ya normalizadas (sin acentos, minúsculas) como subcadena de la consulta.
+# comparan ya normalizadas (sin acentos, minúsculas) contra la consulta, al
+# inicio de palabra (ver _hits).
 GROUPS: dict[str, dict[str, Any]] = {
     "system": {
         "tools": ["disk_usage", "ram_usage", "list_processes", "system_status"],
@@ -52,6 +76,16 @@ GROUPS: dict[str, dict[str, Any]] = {
             "blender", "libreoffice", "calculadora", "nautilus", "terminal",
             "atajo", "tecla", "alt+tab", "alt tab", "minimiza", "cierra ventana",
             "escritorio",
+            # con prefijo: entraban de rebote por llevar "abre"/"lanza" a media
+            # palabra (ya no matchea, ver _hits) y siguen siendo órdenes de abrir.
+            "reabre", "reabrir", "relanza",
+            # "abre la carpeta X" es open_folder. Sin la frase completa, "carpeta"
+            # (files, 7 letras) le gana a "abre" (4) y las 8 tools de files llenan
+            # el tope: al modelo no le llegaba open_folder (sí antes de ordenar
+            # por especificidad, cuando desktop iba primero por declaración).
+            "abre la carpeta", "abre mi carpeta", "abreme la carpeta",
+            "abreme mi carpeta", "abrime la carpeta", "abrime mi carpeta",
+            "abrir la carpeta", "abrir mi carpeta",
         ],
     },
     "media": {
@@ -90,10 +124,15 @@ GROUPS: dict[str, dict[str, Any]] = {
             # frases comunes para "ver qué hay" en una carpeta (gap del routing):
             "carpeta", "que hay en", "que tengo en", "muestra", "muestrame",
             "contenido de", "ensename los", "ver los archivos",
+            # con prefijo: entraban de rebote por llevar "nota"/"escribe"/
+            # "carpeta" a media palabra (ya no matchea, ver _hits) y siguen
+            # siendo órdenes de archivos ("anota comprar leche" -> create_note).
+            "anota", "sobrescribe", "sobreescribe", "subcarpeta",
         ],
     },
     # Memoria semántica (mem0). Mismos disparadores que "facts": solo una de las
-    # dos familias está registrada a la vez (route_schemas ignora las ausentes).
+    # dos familias está registrada a la vez (route_schemas ignora las ausentes,
+    # que tampoco cuentan para el tope).
     "memoria": {
         "tools": ["recordar_de_mi", "buscar_recuerdos", "olvidar_recuerdo"],
         "keywords": [
@@ -212,7 +251,11 @@ def dynamic_groups() -> dict[str, dict[str, Any]]:
         return {name: dict(group) for name, group in _DYNAMIC_GROUPS.items()}
 
 
-def _rotate_mcp_groups(ordered: list[tuple[int, int, int, dict[str, Any], bool]]) -> None:
+# (score, nº de matches, orden de declaración, grupo, es MCP, keywords matcheadas)
+_Scored = tuple[int, int, int, dict[str, Any], bool, list[str]]
+
+
+def _rotate_mcp_groups(ordered: list[_Scored]) -> None:
     """Rota IN PLACE, en round-robin, los grupos MCP dentro de la lista ordenada.
 
     POR QUÉ: con el tope de max_tools, dos servers MCP que matchean la misma
@@ -234,7 +277,32 @@ def _rotate_mcp_groups(ordered: list[tuple[int, int, int, dict[str, Any], bool]]
         ordered[pos] = entry
 
 
-def select_tool_names(text: str, max_tools: int = MAX_TOOLS_DEFAULT) -> list[str]:
+def _named_first(tools: list[str], matched: list[str]) -> list[str]:
+    """Las tools de un grupo MCP con las que la consulta NOMBRA primero.
+
+    POR QUÉ: un server MCP entra como UN grupo con todas sus tools en el orden de
+    tools/list, y el tope corta por el final: con 13-14 tools y max_tools=8 las
+    últimas no le llegaban nunca al modelo local, ni cuando la frase decía su
+    nombre (las keywords derivadas salen de esos mismos nombres: "recibido"
+    enrutaba al server de `pong_recibido` y se ofrecían las 8 primeras, sin ella).
+    Peso = suma de longitudes de las keywords que aparecen en el nombre (como el
+    score de grupo). Orden estable: sin coincidencia propia (o con la misma en
+    todas, p.ej. el prefijo) queda el orden de tools/list, como siempre. Solo para
+    MCP: el orden de los grupos estáticos lo decidió el patrón y no se toca.
+    """
+
+    def weight(name: str) -> int:
+        spaced = _norm(name).replace("_", " ")  # "pull request" casa con pull_request
+        return sum(len(kw) for kw in matched if kw in spaced and _hits(spaced, kw))
+
+    return sorted(tools, key=lambda name: -weight(name))
+
+
+def select_tool_names(
+    text: str,
+    max_tools: int = MAX_TOOLS_DEFAULT,
+    available: Iterable[str] | None = None,
+) -> list[str]:
     """Nombres de tools relevantes a la consulta (con tope).
 
     Si NINGÚN grupo se activa, devuelve [] a propósito: es charla/saludo. En ese
@@ -242,8 +310,13 @@ def select_tool_names(text: str, max_tools: int = MAX_TOOLS_DEFAULT) -> list[str
     (1) velocidad — sin tools el turno baja de ~30s a ~1-2s; (2) calidad — con
     tools colgando, el 3B alucina y llama una tool aunque solo le saluden
     ("hola" -> abría apps al azar). Sin tools, simplemente conversa.
+
+    `available`: los nombres que de verdad están en el registry. Con él, los
+    ausentes se saltan ANTES de contar el tope. Sin él (inspección, tests) se
+    devuelven tal cual los declarados en los grupos.
     """
     norm = _norm(text)
+    registradas = None if available is None else set(available)
     selected: list[str] = []
     seen: set[str] = set()
 
@@ -254,25 +327,32 @@ def select_tool_names(text: str, max_tools: int = MAX_TOOLS_DEFAULT) -> list[str
     # longitudes de los matches (evidencia total), desempate por número de
     # matches y luego por orden de declaración, como antes. Los grupos
     # dinámicos (MCP) van DESPUÉS de los estáticos en el orden de declaración.
-    scored: list[tuple[int, int, int, dict[str, Any], bool]] = []
+    scored: list[_Scored] = []
     with _DYNAMIC_LOCK:
         dynamic = list(_DYNAMIC_GROUPS.values())
     static_groups = [(g, False) for g in GROUPS.values()]
     all_groups = static_groups + [(g, True) for g in dynamic]
     for idx, (group, is_mcp) in enumerate(all_groups):
-        matched = [kw for kw in group["keywords"] if kw in norm]
+        # `kw in norm` primero: descarta casi todas las keywords sin la llamada.
+        matched = [kw for kw in group["keywords"] if kw in norm and _hits(norm, kw)]
         if matched:
             score = sum(len(kw) for kw in matched)
-            scored.append((score, len(matched), idx, group, is_mcp))
+            scored.append((score, len(matched), idx, group, is_mcp, matched))
 
     ordered = sorted(scored, key=lambda t: (-t[0], -t[1], t[2]))
     _rotate_mcp_groups(ordered)
 
-    for _, _, _, group, _ in ordered:
-        for name in group["tools"]:
-            if name not in seen:
-                seen.add(name)
-                selected.append(name)
+    for _, _, _, group, is_mcp, matched in ordered:
+        tools = _named_first(group["tools"], matched) if is_mcp else group["tools"]
+        for name in tools:
+            # Una tool que no está registrada no puede gastar cupo: "memoria" y
+            # "facts" comparten disparadores y solo una familia existe a la vez,
+            # así que la ausente se comía 3-4 de los 8 huecos y dejaba fuera
+            # tools reales (o TODAS, con un tope chico: la orden salía sin tools).
+            if name in seen or (registradas is not None and name not in registradas):
+                continue
+            seen.add(name)
+            selected.append(name)
 
     return selected[:max_tools]
 
@@ -285,26 +365,16 @@ def route_schemas(
     """Esquemas (formato Ollama) de las tools enrutadas para esta consulta.
 
     Solo incluye tools que existen en el registry (ignora nombres desconocidos,
-    p.ej. si una tool se quita). Lista vacía es intencional (charla): significa
+    p.ej. si una tool se quita), y el tope se cuenta sobre ESAS: un nombre
+    ausente no ocupa hueco. Lista vacía es intencional (charla): significa
     "sin tools este turno", NO "manda todas".
     """
-    names = select_tool_names(text, max_tools)
+    names = select_tool_names(text, max_tools, available=registry.names())
     if not names:
         return []  # charla: turno rápido, sin tentar al modelo a alucinar tools
     schemas: list[dict[str, Any]] = []
-    available = set(registry.names())
     for name in names:
-        if name in available:
-            tool = registry.get(name)
-            if tool is not None:
-                schemas.append(tool.schema())
+        tool = registry.get(name)
+        if tool is not None:
+            schemas.append(tool.schema())
     return schemas
-
-
-def names_for(text: str, registry=None, max_tools: int = MAX_TOOLS_DEFAULT) -> Iterable[str]:
-    """Helper para depurar/inspeccionar qué se enrutaría (usado en tests)."""
-    names = select_tool_names(text, max_tools)
-    if registry is not None:
-        available = set(registry.names())
-        return [n for n in names if n in available]
-    return names

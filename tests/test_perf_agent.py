@@ -207,14 +207,16 @@ def test_tool_direct_flag_via_decorator_triggers_short_circuit():
     reg = Registry()
     reg.register(presenta_xyz._crotolamo_tool)
     conv = Conversation("SYS")
-    # direct_tools VACÍO: el short-circuit debe venir del flag Tool.direct.
+    # El nombre NO está en direct_tools: el short-circuit debe venir del flag
+    # Tool.direct. (El set no puede ir vacío: vacío apaga el short-circuit
+    # entero, flag incluido; ver test_auditoria_core_agent.py.)
     agent = ToolAgent(
         FakeLLM([
             ChatResponse(content="", tool_calls=[_tool_call("presenta_xyz")],
                          raw_message={"tool_calls": [{"function": {"name": "presenta_xyz"}}]}),
             ChatResponse(content="no debería usarse"),
         ]),
-        conv, registry=reg, guard=Guard(allowed_roots=[]), direct_tools=set(),
+        conv, registry=reg, guard=Guard(allowed_roots=[]), direct_tools={"otra_tool"},
     )
     reply = agent.handle_turn("dame eso")
     assert reply == "Resultado presentacional, patrón."

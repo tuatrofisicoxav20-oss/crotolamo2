@@ -10,6 +10,10 @@ import json
 import re
 from datetime import datetime
 
+from crotolamo.logging_setup import get_logger
+
+log = get_logger("core.hooks")
+
 # Preámbulos meta que el 3B a veces antepone ("parece que la herramienta 'x' no
 # acepta parámetros. Te resumo el resultado: ..."). Patrones ANCLADOS al inicio,
 # conservadores, para no tocar respuestas normales. Cada patrón consume su frase
@@ -112,13 +116,19 @@ def make_facts_prehook():
     def hook(text: str) -> str:
         if state["done"]:
             return text
-        state["done"] = True
         try:
             from crotolamo.persistence import facts
 
             ctx = facts.facts_context()
-        except Exception:
-            ctx = ""
+        except Exception as error:  # noqa: BLE001 - sin hechos, pero el turno sigue
+            # NO se marca como hecho: la marca iba antes de leer y un fallo
+            # puntual en el primer turno (sqlite bloqueada) dejaba al proceso
+            # sin hechos hasta reiniciar, sin una línea en el log. Se reintenta
+            # en el turno siguiente.
+            log.warning("no pude leer los hechos del patrón (reintento en el próximo turno): %s",
+                        error)
+            return text
+        state["done"] = True
         if ctx:
             return f"[contexto que ya sabes sobre el patrón:\n{ctx}]\n\n{text}"
         return text

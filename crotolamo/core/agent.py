@@ -7,10 +7,10 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from crotolamo.core.llm import LLMClient, LLMError
+from crotolamo.core.engine import LLMEngine
+from crotolamo.core.llm import LLMError
 from crotolamo.core.streaming import LiveStreamer as _LiveStreamer
 from crotolamo.core.tool_parsing import (
-    HARD_ERROR_PREFIXES as _HARD_ERROR_PREFIXES,  # noqa: F401 - re-export (compat)
     coerce_text_tool_calls as _coerce_text_tool_calls,
     is_hard_error as _is_hard_error,
 )
@@ -19,9 +19,14 @@ from crotolamo.core.memory import Conversation
 
 log = get_logger("core.agent")
 
+# Lo que se contesta cuando el modelo devuelve content vacío sin haber hecho nada.
+_EN_BLANCO = "Me quedé en blanco, patrón. Repíteme eso."
+
 
 class Agent:
-    def __init__(self, llm: LLMClient, conversation: Conversation) -> None:
+    # `llm` es el CONTRATO (LLMEngine), no el cliente de Ollama: build_agent
+    # también pasa aquí un GLMClient o un FallbackLLM.
+    def __init__(self, llm: LLMEngine, conversation: Conversation) -> None:
         self.llm = llm
         self.conversation = conversation
 
@@ -35,10 +40,12 @@ class Agent:
 
         try:
             response = self.llm.chat(self.conversation.to_messages())
+            reply = response.content or _EN_BLANCO
         except LLMError as error:
-            return str(error)
+            # El error ES la respuesta del turno: se anota y se emite como
+            # cualquier otra (ver el mismo caso en ToolAgent._handle_turn).
+            reply = str(error)
 
-        reply = response.content or "Me quedé en blanco, patrón. Repíteme eso."
         self.conversation.add_assistant(reply)
         if on_token is not None:
             on_token(reply)
@@ -74,7 +81,7 @@ class ToolAgent(Agent):
 
     def __init__(
         self,
-        llm: LLMClient,
+        llm: LLMEngine,
         conversation: Conversation,
         registry,
         guard,
@@ -99,7 +106,8 @@ class ToolAgent(Agent):
         # Short-circuit de retorno directo: nombres de tools "presentacionales"
         # cuyo output se devuelve tal cual (sin 2ª llamada al LLM). Si es None usa
         # el default sensato; pasa un set vacío para DESACTIVAR el short-circuit
-        # (comportamiento clásico de 2 llamadas, útil p.ej. para medir/comparar).
+        # (comportamiento clásico de 2 llamadas, útil p.ej. para medir/comparar),
+        # también el de las tools con el flag Tool.direct: ver _is_direct.
         self.direct_tools: set[str] = (
             set(DEFAULT_DIRECT_TOOLS) if direct_tools is None else set(direct_tools)
         )
@@ -176,7 +184,14 @@ class ToolAgent(Agent):
     def _is_direct(self, name: str) -> bool:
         """True si la tool es de retorno directo: o bien está en el set inyectado
         `direct_tools`, o bien su definición lleva el flag `Tool.direct=True`.
+
+        Un `direct_tools` VACÍO apaga el short-circuit entero, flag incluido: es
+        el interruptor que usa build_agent con GLM como cerebro ("todo lo razona
+        y redacta él"). Antes el flag se colaba por debajo y list_windows /
+        app_status devolvían su lista cruda sin pasar por el modelo.
         """
+        if not self.direct_tools:
+            return False
         if name in self.direct_tools:
             return True
         tool = self.registry.get(name)
@@ -235,6 +250,20 @@ class ToolAgent(Agent):
         schemas = self.route_fn(routing_text) if self.route_fn is not None else self.registry.schemas()
         known = set(self.registry.names())
 
+        # ¿Ya salió texto por on_token en este turno? Lo necesita la salida por
+        # LLMError de abajo para no pegar el error a una frase cortada a medias.
+        hablo = False
+
+        def _emit(chunk: str) -> None:
+            nonlocal hablo
+            hablo = True
+            on_token(chunk)
+
+        # (tool, resultado) de las iteraciones ANTERIORES de este turno. Lo miran
+        # el cierre por content vacío y el short-circuit: ambos necesitan saber
+        # si en el turno ya se hizo algo que el patrón todavía no ha oído.
+        previos: list[tuple[str, str]] = []
+
         for _ in range(self.max_iterations):
             # Una tool retirada a mitad de turno (un server MCP desconectado por
             # timeouts, M4) no debe seguir a la vista del modelo en la siguiente
@@ -248,7 +277,7 @@ class ToolAgent(Agent):
             # de pedirla; retenemos hasta saber si hubo tool_call. Sin tools (charla),
             # se habla en vivo.
             streamer = (
-                _LiveStreamer(on_token, hold_until_done=bool(schemas))
+                _LiveStreamer(_emit, hold_until_done=bool(schemas))
                 if on_token is not None else None
             )
             try:
@@ -259,7 +288,18 @@ class ToolAgent(Agent):
                 else:
                     response = self.llm.chat(self.conversation.to_messages(), tools=schemas)
             except LLMError as error:
-                return str(error)
+                # El error ES la respuesta del turno y sale como las demás. Antes
+                # solo se devolvía: (1) quien lee on_token (shell --stream, la
+                # voz en streaming) no veía ni oía nada, o una frase truncada y
+                # silencio; (2) el user quedaba sin assistant (o un bloque tool
+                # abierto si falló tras ejecutar tools) y al volver el motor el
+                # modelo recibía de golpe las órdenes sin contestar.
+                reply = str(error)
+                self.conversation.add_assistant(reply)
+                if on_token is not None:
+                    # Si ya se habló media frase en vivo, el error va en línea aparte.
+                    on_token(f"\n{reply}" if hablo else reply)
+                return reply
 
             calls = response.tool_calls
             native = bool(calls)
@@ -268,7 +308,11 @@ class ToolAgent(Agent):
                 calls = _coerce_text_tool_calls(response.content, known)
 
             if not calls:
-                reply = response.content or "Listo, patrón."
+                # Content vacío: "Listo" solo si en este turno corrió alguna tool
+                # (el modelo no tiene nada que añadir a lo hecho). Sin ninguna NO
+                # se hizo nada (contexto desbordado, respuesta solo-razonamiento) y
+                # "Listo" daba la orden por cumplida; se dice lo que el Agent base.
+                reply = response.content or ("Listo, patrón." if previos else _EN_BLANCO)
                 # M4: post-hooks transforman/limpian la respuesta final.
                 reply = self._apply(self.post_hooks, reply)
                 # Si retuvimos por sospecha de tool-call pero era texto, lo soltamos ahora.
@@ -297,9 +341,18 @@ class ToolAgent(Agent):
             # tal cual como respuesta final, ahorrándonos la 2ª llamada al LLM
             # (~7-9s en CPU). Casos con 2+ tools, tool no-directa o fallo duro
             # caen al comportamiento normal (otra iteración => 2ª llamada).
+            # "Exactamente una" es del TURNO, no de la iteración: si antes ya
+            # corrió otra tool ("busca mi tesis y dime la RAM"), devolver solo
+            # esta dejaba aquel resultado (o su fallo) sin contar; ahí redacta
+            # el modelo. Lo único previo que no estorba son los intentos fallidos
+            # de ESTA misma tool: de un reintento no hay nada más que decir.
             if len(results) == 1:
                 name, result = results[0]
-                if self._is_direct(name) and not _is_hard_error(result):
+                if (
+                    self._is_direct(name)
+                    and not _is_hard_error(result)
+                    and all(n == name and _is_hard_error(r) for n, r in previos)
+                ):
                     # Mismos post-hooks y misma actualización de memoria que el
                     # camino final normal (líneas del bloque `if not calls`).
                     reply = self._apply(self.post_hooks, result)
@@ -311,6 +364,7 @@ class ToolAgent(Agent):
                     return reply
             # Si no hubo short-circuit, volvemos a pedirle al LLM que decida con
             # los resultados a la vista.
+            previos.extend(results)
 
         # Agotadas las iteraciones. El historial acaba en un bloque tool sin
         # respuesta del asistente; si no cerramos con un assistant, el turno

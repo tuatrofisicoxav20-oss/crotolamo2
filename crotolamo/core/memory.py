@@ -70,10 +70,6 @@ class Conversation:
             self._history.append(Message("tool", content, name=name))
             self._trim()
 
-    def set_system(self, text: str) -> None:
-        with self._lock:
-            self._system = Message("system", text)
-
     def reset(self) -> None:
         with self._lock:
             self._history.clear()

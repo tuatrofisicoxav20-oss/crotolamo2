@@ -35,13 +35,11 @@ _RULES: list[tuple[str, str, dict[str, Any]]] = [
     (r"^pausa(la)?( la (musica|cancion|rola))?$", "music_control", {"action": "pause"}),
     (r"^(dale play|play|reanuda( la musica)?|sigue la musica)$",
      "music_control", {"action": "play"}),
-    (r"^(siguiente|saltala|salta)( (cancion|rola|tema))?$|^siguiente$",
-     "music_control", {"action": "next"}),
+    (r"^(siguiente|saltala|salta)( (cancion|rola|tema))?$", "music_control", {"action": "next"}),
     (r"^(anterior|regresa la (cancion|rola))$", "music_control", {"action": "previous"}),
     (r"^(para|quita|deten)( la)? (musica|cancion|rola)$",
      "music_control", {"action": "stop"}),
-    (r"^que ((cancion|rola|tema) )?(esta sonando|suena)( ahorita)?$|^que suena$",
-     "music_now", {}),
+    (r"^que ((cancion|rola|tema) )?(esta sonando|suena)( ahorita)?$", "music_now", {}),
     # --- ventanas / sistema (read-only) ---
     (r"^que (apps|ventanas|aplicaciones) tengo abiert(as|os)$|^que tengo abierto$",
      "list_windows", {}),
@@ -55,7 +53,7 @@ _COMPILED = [(re.compile(pattern), name, args) for pattern, name, args in _RULES
 
 # "abre <app>": solo si <app> es una app CONOCIDA (config [apps] o defaults);
 # si no, cae al LLM, que sabe distinguir apps de carpetas/URLs.
-_OPEN_APP = re.compile(r"^(abre(me)?|abrime|lanza) (la |el )?(?P<app>[\w+ .]{2,30})$")
+_OPEN_APP = re.compile(r"^(abre(me)?|abrime|lanza) (la |el )?(?P<app>[\w+ ]{2,30})$")
 
 
 def _known_apps() -> set[str]:
