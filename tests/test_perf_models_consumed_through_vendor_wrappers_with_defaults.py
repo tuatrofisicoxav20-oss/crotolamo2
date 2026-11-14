@@ -756,6 +756,11 @@ _OWW_REAL = """
     det = WakeWordDetector(model_name="hey_jarvis", threshold=0.5)
     disponible = det.available()
     tras_available = [m for m in ("sklearn", "scipy", "torch") if m in sys.modules]
+    # openWakeWord 0.5+ ceba su búfer de features con np.random al construir el
+    # Model (utils.AudioFeatures): sin fijar la semilla, dos Model de fábrica dan
+    # puntuaciones distintas sobre el MISMO audio (medido: hasta 0.005 en 0.6). La
+    # misma semilla antes de cada construcción hace la comparación exacta.
+    np.random.seed(1234)
     det._get_model()
     sesiones = list(creadas)
 
@@ -766,10 +771,26 @@ _OWW_REAL = """
     chunks = [audio[i:i + 512] for i in range(0, audio.size - 511, 512)]
     nuevos = [det.score(c) for c in chunks]
 
-    # Referencia: el Model del vendor construido como lo hacía el bucle de antes
-    # (el intento que cargaba en 0.4: wakeword_model_paths) y sin soltar el arena.
+    # Referencia: el Model del vendor construido como lo hacía el bucle de antes,
+    # con SUS mismos intentos y en el mismo orden (la firma cambia entre versiones:
+    # 0.4 acepta wakeword_model_paths; 0.6 solo wakeword_models e inference_framework,
+    # y sin él elige tflite). Fijar la firma de 0.4 rompía en 0.6 (CI en 3.11).
     from openwakeword.model import Model
-    ref = Model(wakeword_model_paths=[det._resolve_model_path()])
+    ruta = det._resolve_model_path()
+    ref = None
+    for kwargs in (
+        {"wakeword_models": [det.model_name], "inference_framework": "onnx"},
+        {"wakeword_model_paths": [ruta], "inference_framework": "onnx"},
+        {"wakeword_model_paths": [ruta]},
+        {"wakeword_models": [ruta]},
+    ):
+        try:
+            np.random.seed(1234)
+            ref = Model(**kwargs)
+            break
+        except Exception:
+            continue
+    assert ref is not None, "ningún intento del bucle de antes construyó el Model"
     viejos = [float(max(ref.predict(c).values())) for c in chunks]
     tras_puntuar = [m for m in ("sklearn", "scipy", "torch") if m in sys.modules]
 
