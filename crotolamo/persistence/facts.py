@@ -25,7 +25,9 @@ def _score(query: str, texto: str) -> float:
 
 
 def remember(texto: str, categoria: str = "general", db_path: Path | None = None) -> int:
-    return db.add_fact(texto.strip(), categoria.strip() or "general", db_path=db_path)
+    # `or ""`: la categoría es opcional y el modelo la manda a veces como `null`;
+    # con None.strip() la tool reventaba y el hecho no se guardaba.
+    return db.add_fact(texto.strip(), (categoria or "").strip() or "general", db_path=db_path)
 
 
 def recall(categoria: str | None = None, db_path: Path | None = None) -> list[dict]:
@@ -36,15 +38,23 @@ def forget(fact_id: int, db_path: Path | None = None) -> bool:
     return db.delete_fact(fact_id, db_path=db_path)
 
 
-def search(query: str, top: int = 5, db_path: Path | None = None) -> list[dict]:
+def search(query: str, top: int | None = 5, db_path: Path | None = None) -> list[dict]:
     """Busca hechos por relevancia fuzzy (memoria semántica ligera, Fase 6).
 
     Si las facts crecen mucho, aquí se enchufarían embeddings reales; por ahora
-    un ranking offline sin dependencias.
+    un ranking offline sin dependencias. `top=None` devuelve el ranking entero.
+
+    OJO: es un RANKING, no un filtro. El `> 0.0` no descarta casi nada (dos
+    frases cualesquiera comparten alguna letra y SequenceMatcher ya da > 0):
+    quien vaya a actuar sobre el resultado debe comprobar que el hecho trata de
+    lo pedido (ver tools/memoria._olvidar_sqlite).
     """
     rows = recall(db_path=db_path)
-    ranked = sorted(rows, key=lambda r: _score(query, r["texto"]), reverse=True)
-    return [r for r in ranked if _score(query, r["texto"]) > 0.0][:top]
+    # El score se calcula UNA vez por hecho: antes dos (al ordenar y al filtrar)
+    # y SequenceMatcher es lo caro. sort() es estable: el orden no cambia.
+    scored = [(_score(query, r["texto"]), r) for r in rows]
+    scored.sort(key=lambda par: par[0], reverse=True)
+    return [r for score, r in scored if score > 0.0][:top]
 
 
 def facts_context(db_path: Path | None = None, limit: int = 30) -> str:

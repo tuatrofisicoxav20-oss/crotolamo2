@@ -42,6 +42,7 @@ import os
 # mem0 (todos son perezosos, más abajo) y no es configurable a propósito.
 os.environ["MEM0_TELEMETRY"] = "False"
 
+import atexit  # noqa: E402
 import queue  # noqa: E402
 import re  # noqa: E402
 import threading  # noqa: E402
@@ -68,6 +69,9 @@ _GROQ_HOST = "api.groq.com"
 _GROQ_MODEL_FALLBACK = "openai/gpt-oss-120b"
 DEFAULT_TIMEOUT_BUSQUEDA_S = 1.5
 DEFAULT_USUARIO = "patron"
+# Lo más que el proceso espera AL SALIR a que termine la extracción pendiente (el
+# mismo tope que cerrar()): una nube colgada no puede dejar el shell sin terminar.
+_ESPERA_EXTRACCION_AL_SALIR_S = 5.0
 
 # La regla de contenido, UNA sola vez: la leen el modelo (descripciones de las
 # tools) y mem0 (instrucciones del prompt de extracción).
@@ -96,6 +100,11 @@ class MemoriaNoDisponible(RuntimeError):
     """La memoria semántica no puede usarse (falta mem0, config rota, backend caído)."""
 
 
+class BusquedaFallida(RuntimeError):
+    """Una búsqueda no terminó (tardó de más o el backend falló) con la memoria en
+    pie. NO es "sin recuerdos": quien contesta con el resultado debe decirlo."""
+
+
 class SecretoRechazado(ValueError):
     """El texto tiene pinta de credencial y no se guarda."""
 
@@ -105,8 +114,11 @@ class SecretoRechazado(ValueError):
 # ---------------------------------------------------------------------------
 
 _PREFIJOS_KEY = re.compile(
-    r"\b(?:sk|gsk|spak|ghp|gho|ghu|ghs|github_pat|xox[abps]|hf|AKIA|AIza|ya29|glpat|npm)"
+    r"\b(?:(?:sk|gsk|spak|ghp|gho|ghu|ghs|github_pat|xox[abps]|hf|glpat|npm)"
     r"[_\-][A-Za-z0-9_\-]{12,}"
+    # AWS y Google NO llevan separador tras el prefijo: dentro del grupo de arriba
+    # (que exige `_` o `-`) estas tres alternativas no casaban nunca.
+    r"|AKIA[0-9A-Z]{16}|AIza[A-Za-z0-9_\-]{30,}|ya29\.[A-Za-z0-9_\-.]{12,})"
 )
 _PEM = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
 _BEARER = re.compile(r"\bBearer\s+[A-Za-z0-9._\-]{16,}")
@@ -125,6 +137,21 @@ _PALABRA_CREDENCIAL = re.compile(
 _VALOR_TRAS_CREDENCIAL = re.compile(
     r"(?i)(?:[:=]\s*|\b(?:es|son|ser[ií]a|era)\s+)(?=\S*[\dA-Z_\-@#$%!*])\S{6,}"
 )
+# Lo mismo con un valor CORTO si lleva dígitos ("mi contraseña es 1234"): los 6
+# caracteres de arriba dejaban pasar PINs y contraseñas de 4-5. Un porcentaje
+# ("es 100% actitud") no cuenta.
+_VALOR_CON_DIGITO = re.compile(
+    r"(?i)(?:[:=]\s*|\b(?:es|son|ser[ií]a|era)\s+)(?!\d+(?:[.,]\d+)?%)(?=\S*\d)\S{4,}"
+)
+# Valor pegado a la palabra, sin "es" ni ":" ("usa la contraseña Gato2024! para
+# entrar", "mi password Tr0ub4dor&3xx"): solo si mezcla letras y dígitos.
+_VALOR_PEGADO = re.compile(r"\s+(?=\S*\d)(?=\S*[A-Za-z])\S{6,}")
+# "clave" a secas y los códigos numéricos (NIP, PIN, código de seguridad) SOLO
+# cuentan con un valor con dígitos detrás ("la clave del banco es 482913", "mi
+# nip es 4821"). Sin dígitos siguen pasando "palabra clave" y "la clave del éxito".
+_PALABRA_CODIGO = re.compile(
+    r"(?i)\b(?:clave|nip|pin|c[oó]digo\s+de\s+(?:seguridad|acceso))\b"
+)
 
 
 def parece_secreto(texto: str) -> bool:
@@ -139,7 +166,13 @@ def parece_secreto(texto: str) -> bool:
             or _JWT.search(texto) or _ALEATORIO.search(texto)):
         return True
     for m in _PALABRA_CREDENCIAL.finditer(texto):
-        if _VALOR_TRAS_CREDENCIAL.search(texto, m.end(), min(len(texto), m.end() + 60)):
+        fin = min(len(texto), m.end() + 60)
+        if (_VALOR_TRAS_CREDENCIAL.search(texto, m.end(), fin)
+                or _VALOR_CON_DIGITO.search(texto, m.end(), fin)
+                or _VALOR_PEGADO.match(texto, m.end())):
+            return True
+    for m in _PALABRA_CODIGO.finditer(texto):
+        if _VALOR_CON_DIGITO.search(texto, m.end(), min(len(texto), m.end() + 60)):
             return True
     return False
 
@@ -188,6 +221,12 @@ class Recuerdo:
     id: str
     texto: str
     score: float = 0.0
+
+
+def _clave_recuerdo(texto: str) -> str:
+    """Forma canónica para saber si dos recuerdos dicen LO MISMO: sin mayúsculas,
+    espacios de más ni punto final."""
+    return " ".join(texto.split()).casefold().rstrip(" .")
 
 
 class Backend(Protocol):
@@ -270,6 +309,27 @@ def _llm_config(cfg: MemoriaConfig, settings: Any) -> dict[str, Any]:
     return {"provider": "groq", "config": config}
 
 
+# Variables de entorno de las que el SDK de cada proveedor saca la key cuando la
+# config de mem0 no trae una (mem0/llms/openai.py y groq.py). Ollama no usa key.
+_ENVS_KEY_SDK: dict[str, tuple[str, ...]] = {
+    "openai": ("OPENAI_API_KEY", "OPENROUTER_API_KEY"),
+    "groq": ("GROQ_API_KEY",),
+}
+_KEY_RELLENO = "sin-key"
+
+
+def fijar_cache_modelos(ruta: Path) -> None:
+    """Hace que fastembed guarde el modelo de embeddings en `ruta`/modelos.
+
+    Por defecto usa <tmp>/fastembed_cache, y en Fedora /tmp es tmpfs: los ~240 MB
+    del modelo ocupaban RAM y se volvían a descargar en cada arranque (sin red, la
+    memoria no arrancaba). fastembed lee la variable al crear el modelo, así que
+    basta fijarla antes de Memory.from_config. setdefault: si el patrón ya la
+    exporta, manda la suya.
+    """
+    os.environ.setdefault("FASTEMBED_CACHE_PATH", str(ruta / "modelos"))
+
+
 class Mem0Backend:
     """Adaptador fino sobre `mem0.Memory`; todo perezoso (importa al primer uso)."""
 
@@ -278,6 +338,9 @@ class Mem0Backend:
         self._settings = settings
         self._mem: Any = None
         self._lock = threading.Lock()
+        # True (tras arrancar) si el LLM de extracción no tiene API key: la memoria
+        # funciona, pero extraer() no hace nada. Ver _config_arrancable.
+        self.sin_llm = False
 
     def config_mem0(self) -> dict[str, Any]:
         ruta = self.cfg.ruta
@@ -294,6 +357,27 @@ class Mem0Backend:
             "custom_instructions": INSTRUCCIONES_EXTRACCION,
         }
 
+    def _config_arrancable(self) -> dict[str, Any]:
+        """config_mem0() con una key de relleno si el LLM de extracción no tiene ninguna.
+
+        mem0 construye el cliente del LLM al ARRANCAR y los SDK (openai, groq)
+        lanzan si no hay key: no tener key de nube tumbaba TODA la memoria, también
+        buscar y recordar (que no usan LLM) y aunque extraer=false. Con el relleno
+        mem0 arranca y solo se apaga la extracción (ver `extraer`).
+        """
+        conf = self.config_mem0()
+        llm = conf["llm"]
+        envs = _ENVS_KEY_SDK.get(llm["provider"])
+        if envs and not llm["config"].get("api_key") and not any(
+                os.environ.get(env, "").strip() for env in envs):
+            llm["config"]["api_key"] = _KEY_RELLENO
+            self.sin_llm = True
+            if self.cfg.extraer:
+                log.warning("memoria: no hay API key para el LLM de extracción (%s); recordar "
+                            "y buscar funcionan, la extracción automática queda apagada",
+                            llm["provider"])
+        return conf
+
     def _memory(self) -> Any:
         with self._lock:
             if self._mem is None:
@@ -302,8 +386,18 @@ class Mem0Backend:
                 except ImportError as error:
                     raise MemoriaNoDisponible(
                         "falta mem0 (pip install -e '.[memoria]')") from error
-                self.cfg.ruta.mkdir(parents=True, exist_ok=True)
-                self._mem = Memory.from_config(self.config_mem0())
+                # CUALQUIER fallo al arrancar (Chroma ilegible, falta chromadb,
+                # fastembed o el SDK del proveedor, modelo sin descargar y sin red)
+                # es "memoria no disponible": la Memoria la marca rota UNA vez y las
+                # tools caen a la libreta SQLite. Con la excepción cruda no había
+                # respaldo y mem0 entero (modelo ONNX incluido) se reconstruía en
+                # cada turno, dos veces: búsqueda y extracción.
+                try:
+                    self.cfg.ruta.mkdir(parents=True, exist_ok=True)
+                    fijar_cache_modelos(self.cfg.ruta)
+                    self._mem = Memory.from_config(self._config_arrancable())
+                except Exception as error:  # noqa: BLE001
+                    raise MemoriaNoDisponible(f"mem0 no arrancó: {error}") from error
             return self._mem
 
     @staticmethod
@@ -316,9 +410,14 @@ class Mem0Backend:
         return [str(r.get("id")) for r in self._rows(result) if r.get("id")]
 
     def extraer(self, usuario: str, respuesta: str) -> list[str]:
+        mem = self._memory()
+        if self.sin_llm:
+            # Sin key no hay con qué extraer (ya se avisó al arrancar): ni se
+            # intenta, para no mandar cada turno a la nube con la key de relleno.
+            return []
         messages = [{"role": "user", "content": usuario},
                     {"role": "assistant", "content": respuesta}]
-        result = self._memory().add(messages, user_id=self.cfg.usuario, infer=True)
+        result = mem.add(messages, user_id=self.cfg.usuario, infer=True)
         return [str(r.get("memory", "")) for r in self._rows(result)
                 if r.get("event") in ("ADD", "UPDATE")]
 
@@ -351,7 +450,8 @@ class Memoria:
       la respuesta hablada NUNCA espera a la memoria; si tarda o falla, se sigue
       sin recuerdos y se loguea WARNING.
     - `extraer_en_fondo` solo ENCOLA; un hilo daemon llama a mem0 (que llama al LLM)
-      después de que Crotolamo ya habló.
+      después de que Crotolamo ya habló. Al salir del proceso se espera, acotado, a
+      que termine lo encolado (atexit; cerrar() hace lo mismo).
     - Un backend roto se marca UNA vez y todo pasa a no-op silencioso (INFO).
     """
 
@@ -366,6 +466,7 @@ class Memoria:
         self._cola: queue.Queue[Any] = queue.Queue()
         self._worker: threading.Thread | None = None
         self._worker_lock = threading.Lock()
+        self._vaciado_apuntado = False
         self._cerrada = False
 
     # --- estado ---
@@ -382,11 +483,9 @@ class Memoria:
             if self._roto is not None:
                 raise MemoriaNoDisponible(self._roto)
             if self._backend is None:
-                try:
-                    self._backend = Mem0Backend(self.cfg, self._settings)
-                except Exception as error:  # noqa: BLE001
-                    self._marcar_rota(str(error))
-                    raise MemoriaNoDisponible(str(error)) from error
+                # El constructor solo guarda la config (no puede fallar): mem0
+                # arranca, y falla, al primer uso, en Mem0Backend._memory.
+                self._backend = Mem0Backend(self.cfg, self._settings)
             return self._backend
 
     def _marcar_rota(self, motivo: str) -> None:
@@ -399,11 +498,20 @@ class Memoria:
         backend = self._get_backend()
         return backend.buscar(query, top_k, self.cfg.umbral)
 
-    def buscar(self, query: str, top_k: int | None = None,
-               timeout_s: float | None = None) -> list[Recuerdo]:
-        """Recuerdos relevantes, o [] si no hay memoria, tarda o falla (WARNING)."""
-        if not self.enabled or not query.strip():
+    def buscar_estricto(self, query: str, top_k: int | None = None,
+                        timeout_s: float | None = None) -> list[Recuerdo]:
+        """Como buscar(), pero [] significa SOLO "nada pasó el umbral".
+
+        Para quien va a CONTESTAR con el resultado (tools, CLI, olvidar): con el []
+        de buscar() un fallo o una tardanza se contaban como "no recuerdo nada" y
+        eso era lo que el modelo le repetía al patrón con el recuerdo guardado.
+        Lanza MemoriaNoDisponible si la memoria no está (y la marca rota) y
+        BusquedaFallida si esta búsqueda tardó de más o falló.
+        """
+        if not query.strip():
             return []
+        if not self.enabled:
+            raise MemoriaNoDisponible(self._roto or "la memoria semántica está apagada")
         k = top_k or self.cfg.top_k
         limite = self.cfg.timeout_busqueda_s if timeout_s is None else timeout_s
         future: Future[list[Recuerdo]] = self._pool.submit(self._buscar_sync, query, k)
@@ -411,12 +519,24 @@ class Memoria:
             return future.result(timeout=limite)
         except FutureTimeout:
             log.warning("memoria: la búsqueda tardó más de %.1fs; respondo sin recuerdos", limite)
-            return []
+            raise BusquedaFallida(f"la búsqueda tardó más de {limite:.1f}s") from None
         except MemoriaNoDisponible as error:
             self._marcar_rota(str(error))
-            return []
-        except Exception as error:  # noqa: BLE001 - la memoria nunca tumba la respuesta
+            raise
+        except Exception as error:  # noqa: BLE001 - se traduce: el llamador decide qué decir
             log.warning("memoria: búsqueda falló (%s); respondo sin recuerdos", error)
+            raise BusquedaFallida(str(error) or type(error).__name__) from error
+
+    def buscar(self, query: str, top_k: int | None = None,
+               timeout_s: float | None = None) -> list[Recuerdo]:
+        """Recuerdos relevantes, o [] si no hay memoria, tarda o falla (WARNING)."""
+        if not self.enabled:
+            return []
+        try:
+            return self.buscar_estricto(query, top_k, timeout_s)
+        except (MemoriaNoDisponible, BusquedaFallida):
+            # Ya está logueado. La versión del pre-hook: la memoria nunca tumba
+            # ni retrasa la respuesta hablada.
             return []
 
     def contexto(self, query: str) -> str:
@@ -434,7 +554,38 @@ class Memoria:
             return []
         if parece_secreto(texto):
             raise SecretoRechazado("eso tiene pinta de credencial y no lo guardo")
-        return self._get_backend().guardar(texto)
+        try:
+            backend = self._get_backend()
+            repetido = self._ya_guardado(backend, texto)
+            if repetido is not None:
+                return [repetido]
+            return backend.guardar(texto)
+        except MemoriaNoDisponible as error:
+            # Como buscar(): se marca rota aquí para que la siguiente llamada vaya
+            # directa al respaldo SQLite sin volver a arrancar mem0.
+            self._marcar_rota(str(error))
+            raise
+
+    def _ya_guardado(self, backend: Backend, texto: str) -> str | None:
+        """Id del recuerdo que ya dice exactamente esto, o None.
+
+        mem0.add(infer=False) crea SIEMPRE un recuerdo nuevo: repetir "acuérdate de
+        que X" (o `memoria migrar`) dejaba copias que ocupaban huecos del top_k y
+        que "olvida lo de X" borraba de una en una. Se mira el backend EN VIVO, sin
+        caché: otro proceso o un "olvida" pueden haberlo borrado, y contestar "ya
+        quedó" sin guardar sería peor que una copia. Por lo mismo, si la consulta
+        falla, el hecho se guarda igual.
+        """
+        clave = _clave_recuerdo(texto)
+        try:
+            for recuerdo in backend.todas():
+                if _clave_recuerdo(recuerdo.texto) == clave:
+                    return recuerdo.id
+        except MemoriaNoDisponible:
+            raise
+        except Exception as error:  # noqa: BLE001 - recordar no depende de listar
+            log.warning("memoria: no pude mirar si ya lo tenía (%s); lo guardo igual", error)
+        return None
 
     def extraer_en_fondo(self, usuario: str, respuesta: str) -> bool:
         """Encola el turno para que mem0 extraiga hechos DESPUÉS de hablar.
@@ -457,19 +608,18 @@ class Memoria:
         """Borra el recuerdo que MEJOR encaja con la descripción ("lo de mi perro").
 
         Devuelve el recuerdo borrado o None si nada pasó el umbral. Solo uno por
-        llamada: olvidar por voz debe ser conservador.
+        llamada: olvidar por voz debe ser conservador. Si la búsqueda no se pudo
+        hacer LANZA (MemoriaNoDisponible / BusquedaFallida): "no pude buscar" no
+        es "no había nada que olvidar".
         """
         if not self.enabled or not descripcion.strip():
             return None
-        candidatos = self.buscar(descripcion, top_k=3, timeout_s=10.0)
+        candidatos = self.buscar_estricto(descripcion, top_k=3, timeout_s=10.0)
         if not candidatos:
             return None
         mejor = candidatos[0]
         self._get_backend().borrar(mejor.id)
         return mejor
-
-    def olvidar_id(self, memoria_id: str) -> None:
-        self._get_backend().borrar(memoria_id)
 
     def todas(self) -> list[Recuerdo]:
         if not self.enabled:
@@ -484,6 +634,17 @@ class Memoria:
                     target=self._drenar, name="MemoriaExtraccion", daemon=True,
                 )
                 self._worker.start()
+            if not self._vaciado_apuntado:
+                # El hilo es daemon: al salir (run_shell vuelve con "salir", sin
+                # cerrar()) el intérprete lo mataba a media llamada al LLM y lo que
+                # el patrón contó en el último turno no se guardaba nunca.
+                atexit.register(self._vaciar_al_salir)
+                self._vaciado_apuntado = True
+
+    def _vaciar_al_salir(self) -> None:
+        # Corre en atexit, cuando los hilos daemon aún viven (os._exit se lo salta:
+        # el apagado por señal del listener tiene que llamar a cerrar() él mismo).
+        self.flush(timeout_s=_ESPERA_EXTRACCION_AL_SALIR_S)
 
     def _drenar(self) -> None:
         while True:
@@ -509,7 +670,7 @@ class Memoria:
                 self._cola.task_done()
 
     def flush(self, timeout_s: float = 5.0) -> bool:
-        """Espera a que el hilo procese lo encolado hasta ahora (tests, CLI)."""
+        """Espera a que el hilo procese lo encolado hasta ahora (tests, CLI, salida)."""
         if self._worker is None or not self._worker.is_alive():
             return self._cola.empty()
         listo = threading.Event()
@@ -538,6 +699,9 @@ class Memoria:
 
     def cerrar(self, timeout_s: float = 5.0) -> None:
         self._cerrada = True
+        # cerrar() ya vacía la cola (None va detrás de lo encolado): el vaciado de
+        # atexit sobra, y soltarlo no deja la Memoria referenciada hasta el final.
+        atexit.unregister(self._vaciar_al_salir)
         if self._worker is not None and self._worker.is_alive():
             self._cola.put(None)
             self._worker.join(timeout=timeout_s)
@@ -611,6 +775,37 @@ def make_memoria_posthook(memoria: Memoria) -> Callable[[str, str], None]:
 # CLI: python -m crotolamo memoria (migrar|listar|buscar|olvidar|calibrar)
 # ---------------------------------------------------------------------------
 
+def _cargar_calibrar() -> Callable[[list[str]], int] | None:
+    """El `main` de scripts/memoria_calibrar.py, o None si el script no está.
+
+    `scripts` no se empaqueta (pyproject solo incluye crotolamo* e interfaces*):
+    solo es importable con `python -m crotolamo` DESDE la raíz del repo. Con el
+    comando `crotolamo` o desde otra carpeta, `import scripts` reventaba con un
+    traceback; ahí el script se carga por su ruta en el repo (REPO_ROOT, la misma
+    ancla con la que settings encuentra config/), que no depende de dónde estés.
+    """
+    try:
+        from scripts.memoria_calibrar import main
+    except ImportError:
+        pass
+    else:
+        return main
+    import importlib.util
+
+    from crotolamo.settings import REPO_ROOT
+
+    ruta = REPO_ROOT / "scripts" / "memoria_calibrar.py"
+    if not ruta.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location("crotolamo_memoria_calibrar", ruta)
+    if spec is None or spec.loader is None:
+        return None
+    modulo = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(modulo)
+    calibrar: Callable[[list[str]], int] = modulo.main
+    return calibrar
+
+
 def run_cli(argv: list[str]) -> int:
     from crotolamo.settings import get_settings
 
@@ -620,8 +815,11 @@ def run_cli(argv: list[str]) -> int:
     resto = " ".join(argv[1:]).strip()
 
     if sub == "calibrar":
-        from scripts.memoria_calibrar import main as calibrar
-
+        calibrar = _cargar_calibrar()
+        if calibrar is None:
+            print("No encuentro scripts/memoria_calibrar.py junto al paquete: la calibración "
+                  "necesita el checkout completo del repo.")
+            return 1
         return calibrar(argv[1:])
 
     if not cfg.enabled:
@@ -633,14 +831,27 @@ def run_cli(argv: list[str]) -> int:
             from crotolamo.persistence import facts
 
             hechos = facts.recall()
-            n = 0
+            # `migrar` se puede repetir: es la única vía de traer lo que las tools
+            # apuntaron en SQLite mientras la memoria semántica estuvo caída, y
+            # antes duplicaba todo lo ya migrado. Lo que ya está se salta con UNA
+            # lectura de la memoria (recordar() tampoco lo duplicaría, pero
+            # listándola entera por cada hecho).
+            presentes = {_clave_recuerdo(r.texto) for r in memoria.todas()}
+            n = repetidos = 0
             for row in hechos:
+                texto = str(row["texto"])
+                if _clave_recuerdo(texto) in presentes:
+                    repetidos += 1
+                    continue
                 try:
-                    if memoria.recordar(str(row["texto"])):
+                    if memoria.recordar(texto):
                         n += 1
+                        presentes.add(_clave_recuerdo(texto))
                 except SecretoRechazado:
                     print(f"  saltado (pinta de secreto): #{row['id']}")
-            print(f"Migrados {n} de {len(hechos)} hechos de SQLite a la memoria semántica.")
+            ya_estaban = f" ({repetidos} ya estaban)" if repetidos else ""
+            print(f"Migrados {n} de {len(hechos)} hechos de SQLite a la memoria "
+                  f"semántica{ya_estaban}.")
             print("Los hechos siguen en SQLite; con [memoria].enabled = true ya no se inyectan.")
             return 0
         if sub == "listar":
@@ -655,7 +866,12 @@ def run_cli(argv: list[str]) -> int:
             if not resto:
                 print("Uso: crotolamo memoria buscar <pregunta>")
                 return 2
-            for r in memoria.buscar(resto, timeout_s=30.0):
+            # Estricto: sin mem0 (o si la búsqueda falla) esto no imprimía nada y
+            # salía con 0, igual que una búsqueda sin coincidencias.
+            recuerdos = memoria.buscar_estricto(resto, timeout_s=30.0)
+            if not recuerdos:
+                print("No encontré nada parecido.")
+            for r in recuerdos:
                 print(f"{r.score:.3f}  {r.texto}")
             return 0
         if sub == "olvidar":
@@ -669,6 +885,9 @@ def run_cli(argv: list[str]) -> int:
         return 2
     except MemoriaNoDisponible as error:
         print(f"Memoria no disponible: {error}")
+        return 1
+    except BusquedaFallida as error:
+        print(f"No pude buscar en la memoria: {error}")
         return 1
     finally:
         memoria.cerrar()

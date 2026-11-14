@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from crotolamo.core.memoria import parece_secreto
 from crotolamo.persistence import facts
 from crotolamo.tools.base import tool
 
@@ -16,6 +17,12 @@ def remember_fact(texto: str, categoria: str = "general") -> str:
     """
     if not texto.strip():
         return "¿Qué quieres que recuerde, patrón? No me diste nada."
+    # La regla de la memoria semántica (y de su respaldo en esta MISMA libreta)
+    # también vale aquí: NUNCA secretos. Esta tool es la de fábrica y se la
+    # saltaba; la credencial quedaba en claro en SQLite y el pre-hook de hechos
+    # la reenviaba al LLM (en la nube) al empezar cada sesión.
+    if parece_secreto(texto):
+        return "Eso tiene pinta de contraseña o clave, patrón; eso no lo guardo ni a la mala."
     facts.remember(texto, categoria)
     return f"Anotado, patrón. Lo recordaré: «{texto.strip()}»."
 
@@ -27,7 +34,10 @@ def recall_facts(categoria: str = "") -> str:
     Args:
         categoria: si se da, solo devuelve los hechos de esa categoría.
     """
-    rows = facts.recall(categoria.strip() or None)
+    # `or ""`: los modelos mandan `null` en un parámetro opcional y eso es "sin
+    # filtro", no un None.strip() que revienta la tool.
+    categoria = (categoria or "").strip()
+    rows = facts.recall(categoria or None)
     if not rows:
         return "No tengo hechos guardados, patrón." if not categoria else \
             f"No tengo hechos en la categoría '{categoria}', patrón."

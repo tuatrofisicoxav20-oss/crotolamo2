@@ -1,11 +1,12 @@
 """SQLite para Crotolamo. Respalda los atajos aprendidos (Fase 3, antes un JSON
-suelto en C1) y la memoria persistente de hechos + log de sesión (Fase 4).
+suelto en C1) y la memoria persistente de hechos (Fase 4).
 """
 
 from __future__ import annotations
 
 import json
 import sqlite3
+import unicodedata
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
@@ -23,13 +24,14 @@ CREATE TABLE IF NOT EXISTS facts (
     categoria    TEXT NOT NULL DEFAULT 'general',
     created_at   TEXT NOT NULL DEFAULT (datetime('now'))
 );
-CREATE TABLE IF NOT EXISTS session_log (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    role         TEXT NOT NULL,
-    content      TEXT NOT NULL,
-    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
-);
 """
+
+# Espera ante un fichero bloqueado (dos escritores: shell + listener sobre el
+# mismo .sqlite) antes de rendirse con "database is locked". Se fija AL ABRIR:
+# sqlite3.connect() ya trae 5 s de fábrica, así que el `PRAGMA busy_timeout=3000`
+# que se ejecutaba en cada operación no añadía espera; la bajaba a estos mismos
+# 3 s con una sentencia de más.
+_BUSY_TIMEOUT_S = 3.0
 
 
 def _default_db_path() -> Path:
@@ -66,14 +68,11 @@ def connect(db_path: Path | None = None) -> Iterator[sqlite3.Connection]:
     # vacío y toda tool de hechos/atajos respondía "no such table" hasta
     # reiniciar. Fichero ausente o vacío => el schema se vuelve a ejecutar.
     fresh = not _db_file_present(path)
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, timeout=_BUSY_TIMEOUT_S)
     conn.row_factory = sqlite3.Row
     try:
-        # busy_timeout es POR CONEXIÓN: dos escritores concurrentes (shell +
-        # listener sobre el mismo .sqlite) esperan hasta 3s en vez de reventar
-        # con "database is locked". WAL además deja LEER mientras se escribe;
-        # queda persistido en el fichero, pero re-pedirlo es idempotente y barato.
-        conn.execute("PRAGMA busy_timeout=3000")
+        # WAL deja LEER mientras se escribe; queda persistido en el fichero, pero
+        # re-pedirlo es idempotente y barato.
         conn.execute("PRAGMA journal_mode=WAL")
         key = path.resolve()
         if fresh or key not in _SCHEMA_READY:
@@ -121,27 +120,33 @@ def add_fact(texto: str, categoria: str = "general", db_path: Path | None = None
         return int(cur.lastrowid or 0)
 
 
+def _clave_categoria(categoria: str) -> str:
+    """Forma canónica de una etiqueta: sin mayúsculas, acentos ni espacios de más."""
+    sin_acentos = "".join(
+        c for c in unicodedata.normalize("NFD", categoria) if unicodedata.category(c) != "Mn"
+    )
+    return " ".join(sin_acentos.split()).casefold()
+
+
 def get_facts(categoria: str | None = None, db_path: Path | None = None) -> list[dict]:
-    query = "SELECT id, texto, categoria, created_at FROM facts"
-    params: tuple = ()
-    if categoria:
-        query += " WHERE categoria = ?"
-        params = (categoria,)
-    query += " ORDER BY id"
     with connect(db_path) as conn:
-        rows = conn.execute(query, params).fetchall()
-    return [dict(r) for r in rows]
+        rows = conn.execute(
+            "SELECT id, texto, categoria, created_at FROM facts ORDER BY id"
+        ).fetchall()
+    facts = [dict(r) for r in rows]
+    if not categoria:
+        return facts
+    # La etiqueta la escribe el modelo en cada llamada y no siempre igual
+    # ("Preferencias" al guardar, "preferencias" al consultar): con `categoria = ?`
+    # exacto la consulta decía que no había hechos habiéndolos. Se compara en
+    # Python porque NOCASE y lower() de SQLite solo pliegan ASCII ("MÚSICA" no
+    # casaría con "música"); sin índice sobre categoria, SQLite ya recorría toda
+    # la tabla.
+    clave = _clave_categoria(categoria)
+    return [f for f in facts if _clave_categoria(f["categoria"]) == clave]
 
 
 def delete_fact(fact_id: int, db_path: Path | None = None) -> bool:
     with connect(db_path) as conn:
         cur = conn.execute("DELETE FROM facts WHERE id = ?", (fact_id,))
         return cur.rowcount > 0
-
-
-# --- log de sesión ---
-def log_message(role: str, content: str, db_path: Path | None = None) -> None:
-    with connect(db_path) as conn:
-        conn.execute(
-            "INSERT INTO session_log (role, content) VALUES (?, ?)", (role, content)
-        )

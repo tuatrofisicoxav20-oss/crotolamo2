@@ -37,7 +37,14 @@ from crotolamo.tools.base import Registry
 
 
 class FakeBackend:
-    """Doble de mem0: ranking por solape de palabras, scores en la escala real."""
+    """Doble de mem0: ranking por solape de palabras.
+
+    OJO: los scores NO separan como los de mem0 real. Aquí lo que no solapa queda
+    bajo el umbral (0.02 < 0.03); con mem0 + Chroma lo que no tiene NADA que ver
+    también lo pasa (medido: «lo de mi coche» da 0.058 contra un recuerdo sobre
+    el humor) y se solapa con los aciertos. Este doble no sirve para probar que
+    algo "sin relación" se descarta: en el stack real eso no lo hace el umbral.
+    """
 
     def __init__(self, recuerdos: list[str] | None = None) -> None:
         self.items: dict[str, str] = {}
@@ -254,6 +261,9 @@ def test_olvidar_borra_el_mejor_candidato_y_solo_uno():
 
 
 def test_olvidar_sin_candidato_no_borra_nada():
+    # Fija SOLO "si la búsqueda no devuelve candidatos, no se borra nada". No
+    # prueba que una descripción sin relación no borre: con mem0 real esa
+    # búsqueda SÍ devuelve candidatos (ver la nota de FakeBackend).
     m, backend = _memoria(["uso Fedora"])
     assert m.olvidar("mi coche") is None
     assert backend.borrados == []

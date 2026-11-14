@@ -57,11 +57,19 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(argv or [])
     probar_groq = "--groq" in argv
 
-    from crotolamo.core.memoria import Mem0Backend, MemoriaConfig, MemoriaNoDisponible
+    from crotolamo.core.memoria import (
+        Mem0Backend,
+        MemoriaConfig,
+        MemoriaNoDisponible,
+        fijar_cache_modelos,
+    )
     from crotolamo.settings import get_settings
 
     settings = get_settings()
     cfg = MemoriaConfig.from_settings(settings)
+    # El modelo de embeddings sale de (o se baja a) la caché de la memoria REAL:
+    # con la ruta temporal de abajo se descargarían ~240 MB en cada calibración.
+    fijar_cache_modelos(cfg.ruta)
     tmp = Path(tempfile.mkdtemp(prefix="crotolamo_calib_"))
     cfg.ruta = tmp  # memoria TEMPORAL: la tuya no se toca
     cfg.enabled = True
@@ -101,8 +109,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\nsugerencia: [memoria].umbral = {sugerido:.3f}  (hoy: {cfg.umbral:g}); "
               "la calidad la da top_k chico, no el umbral")
 
-        if probar_groq:
-            print(f"\n== extracción real con el LLM ({cfg.llm_provider} / {cfg.llm_model}) ==")
+        if probar_groq and backend.sin_llm:
+            print("\nNo hay API key para el LLM de extracción: no puedo probar la extracción.")
+        elif probar_groq:
+            # Lo que mem0 usa DE VERDAD, no [memoria].llm_provider / llm_model sin
+            # resolver: con los valores de fábrica la cabecera decía "(auto / )".
+            llm = backend.config_mem0()["llm"]
+            print(f"\n== extracción real con el LLM ({llm['provider']} / "
+                  f"{llm['config']['model']}) ==")
             for usuario, respuesta in TURNOS_EXTRACCION:
                 t0 = time.time()
                 try:
