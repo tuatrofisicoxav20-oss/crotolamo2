@@ -60,13 +60,17 @@ _CATEGORIAS_FUERA = {"So", "Me", "Cf", "Cs", "Co", "Cn"}
 # Modificadores de emoji (tono de piel) y selectores de variación: no son
 # pronunciables y sin ellos el emoji base ya se fue por "So".
 _RANGOS_FUERA = ((0xFE00, 0xFE0F), (0x1F3FB, 0x1F3FF), (0xE0100, 0xE01EF))
+# Símbolos So que SÍ se pronuncian y llevan significado: el signo de grado
+# ("25°C", "gira 90°") es So como los emojis, pero Piper lo lee "grados";
+# quitarlo dejaba "veinticinco ce".
+_SIMBOLOS_PRONUNCIABLES = frozenset("°")
 
 
 def _sin_simbolos(text: str) -> str:
     out: list[str] = []
     for ch in text:
         cp = ord(ch)
-        if unicodedata.category(ch) in _CATEGORIAS_FUERA:
+        if unicodedata.category(ch) in _CATEGORIAS_FUERA and ch not in _SIMBOLOS_PRONUNCIABLES:
             continue
         if any(lo <= cp <= hi for lo, hi in _RANGOS_FUERA):
             continue
@@ -81,7 +85,7 @@ def limpiar_para_voz(texto: str) -> str:
     [texto](url) -> texto, URLs sueltas, títulos (#), viñetas (- * • y 1.),
     citas (>), reglas y separadores de tabla, emojis, y los restos de
     * _ ~ | > #. Colapsa los espacios. Texto normal (acentos, ñ, ¿¡, números,
-    horas, decimales) pasa intacto.
+    horas, decimales, grados) pasa intacto.
     """
     if not texto:
         return ""

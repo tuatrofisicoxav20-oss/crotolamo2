@@ -19,6 +19,8 @@ from __future__ import annotations
 import queue
 import re
 import threading
+import time
+from collections.abc import Callable
 from pathlib import Path
 
 from crotolamo.logging_setup import get_logger
@@ -42,21 +44,41 @@ _CANDIDATO = re.compile(r"(?<=[.!?¿¡\n])[*_~]*\s+")
 _ABREVIATURAS = {"sr", "sra", "srta", "dr", "dra", "etc", "ej", "p.ej", "vs", "av"}
 _PALABRA_ANTES = re.compile(r"([a-záéíóúüñ]+(?:\.[a-záéíóúüñ]+)*)\.$", re.IGNORECASE)
 # "1. Abre Spotify": el punto de un marcador de lista numerada al inicio de
-# línea no cierra frase (si no, "uno." se hablaría como frase suelta).
-_MARCADOR_LISTA = re.compile(r"(?:^|\n)[ \t]*\d{1,2}\.$")
+# línea no cierra frase (si no, "uno." se hablaría como frase suelta). Se
+# compara contra la línea actual entera (fullmatch).
+_MARCADOR_LISTA = re.compile(r"[ \t]*\d{1,2}\.")
+
+
+def _inicio_palabra(text: str, fin: int) -> int:
+    """Inicio de la racha de letras y puntos que termina justo antes de `fin`.
+
+    isalpha() es un superconjunto de la clase de _PALABRA_ANTES (también con
+    IGNORECASE): ninguna coincidencia de esa regex que acabe en `fin` puede
+    empezar antes de este índice, así que buscar desde aquí da lo mismo que
+    buscar en todo el prefijo.
+    """
+    i = fin
+    while i > 0 and (text[i - 1] == "." or text[i - 1].isalpha()):
+        i -= 1
+    return i
 
 
 def _cierra_frase(text: str, start: int, end: int) -> bool:
-    """True si el candidato (los espacios en text[start:end]) es fin de frase real."""
+    """True si el candidato (los espacios en text[start:end]) es fin de frase real.
+
+    Solo mira la COLA antes del punto (la línea actual y la última palabra), con
+    pos/endpos y sin copiar: antes se copiaba y escaneaba text[:start] entero por
+    cada candidato, y segmentar era cuadrático en la longitud de la respuesta
+    (cúbico por token en streaming, con una lista numerada sin punto final).
+    """
     if text[start - 1] != ".":
         return True  # ! ? ¡ ¿ y salto de línea cortan siempre
     despues = text[end] if end < len(text) else ""
-    antes = text[:start]
-    if len(antes) >= 2 and antes[-2].isdigit() and despues.isdigit():
+    if start >= 2 and text[start - 2].isdigit() and despues.isdigit():
         return False  # decimal partido: "40. 5"
-    if _MARCADOR_LISTA.search(antes):
+    if _MARCADOR_LISTA.fullmatch(text, text.rfind("\n", 0, start) + 1, start):
         return False  # marcador de lista numerada, no fin de frase
-    m = _PALABRA_ANTES.search(antes)
+    m = _PALABRA_ANTES.search(text, _inicio_palabra(text, start), start)
     if m:
         palabra = m.group(1).lower()
         if palabra in _ABREVIATURAS:
@@ -97,6 +119,10 @@ class TTS:
     def __init__(self, voice_model: Path) -> None:
         self.voice_model = Path(voice_model)
         self._voice = None  # PiperVoice perezoso, cargado una sola vez
+        # El hilo WarmVoice del listener precalienta la voz mientras el hilo
+        # principal ya habla ("Crotolamo escuchando"): sin lock, los dos veían
+        # _voice en None y cargaban el modelo dos veces (CPU y RAM dobles).
+        self._voice_lock = threading.Lock()
         self._stop_flag = threading.Event()  # M3.1: señal de corte thread-safe
 
     @classmethod
@@ -110,12 +136,17 @@ class TTS:
         return self.voice_model.exists()
 
     def _get_voice(self):
-        """Carga PiperVoice una sola vez y la cachea."""
-        if self._voice is None:
-            from piper import PiperVoice
+        """Carga PiperVoice una sola vez y la cachea (aunque la pidan dos hilos)."""
+        voice = self._voice  # camino caliente sin lock: ya cargada
+        if voice is None:
+            with self._voice_lock:
+                # Doble comprobación: otro hilo pudo cargarla mientras esperábamos.
+                if self._voice is None:
+                    from piper import PiperVoice
 
-            self._voice = PiperVoice.load(str(self.voice_model))
-        return self._voice
+                    self._voice = PiperVoice.load(str(self.voice_model))
+                voice = self._voice
+        return voice
 
     def synthesize_pcm(self, text: str):
         """Devuelve (audio_int16 ndarray, sample_rate) sintetizado por Piper.
@@ -132,7 +163,17 @@ class TTS:
         sample_rate = int(chunks[0].sample_rate)
         return audio, sample_rate
 
-    def speak(self, text: str) -> None:
+    def speak(self, text: str, *, should_abort: Callable[[], bool] | None = None) -> None:
+        """Habla `text`. `should_abort` (opcional): se consulta junto a la bandera
+        de stop antes de sintetizar y en cada rebanada de audio; True = cortar.
+
+        Existe porque stop() SOLO no basta (V4): _speak_streaming limpia la
+        bandera al entrar (si no, un corte mataría todas las frases siguientes),
+        así que un stop() del barge-in que cae entre el is_current() de quien
+        llama y ese clear() se pierde y la frase del turno ya abortado suena
+        entera. Quien sabe de turnos (la Boca) pasa `lambda: not
+        state.is_current(turno)`: así el corte no depende del instante del stop().
+        """
         # ÚNICO punto de limpieza para voz: por aquí pasa todo lo que se habla
         # (StreamSpeaker, speak_sentences, MouthThread, say), sea cual sea el
         # motor. Markdown, emojis y URLs se quitan ANTES de sintetizar; el corte
@@ -151,29 +192,39 @@ class TTS:
             return
 
         try:
-            self._speak_streaming(text)
+            self._speak_streaming(text, should_abort)
         except Exception as error:  # noqa: BLE001 - una voz rota no debe matar el agente
             log.warning("error sintetizando/reproduciendo con Piper: %s", error)
 
-    def _speak_streaming(self, text: str) -> bool:
+    def _speak_streaming(
+        self, text: str, should_abort: Callable[[], bool] | None = None,
+    ) -> bool:
         """Sintetiza y reproduce por CHUNKS conforme Piper los genera.
 
         Antes se sintetizaba la frase ENTERA (list + concatenate) y recién ahí
         sonaba: la latencia a la primera palabra era toda la síntesis. Ahora el
         primer chunk suena en cuanto existe. Se escribe en rebanadas cortas
-        (~90ms) vigilando el stop, así el corte (barge-in) sigue siendo casi
-        inmediato. Devuelve False si se cortó a media frase.
+        (~90ms) vigilando el stop (y `should_abort`), así el corte (barge-in)
+        sigue siendo casi inmediato. Devuelve False si se cortó a media frase.
         """
         import numpy as np
         import sounddevice as sd
 
+        def _cortar() -> bool:
+            return self._stop_flag.is_set() or (should_abort is not None and should_abort())
+
+        # Turno ya abortado antes de empezar: ni cargar/sintetizar ni abrir audio.
+        if should_abort is not None and should_abort():
+            return False
         voice = self._get_voice()
         self._stop_flag.clear()
         stream = None
+        cortado = False
         step = 2048  # muestras por escritura: corte perceptible en <100ms
         try:
             for chunk in voice.synthesize(text):
-                if self._stop_flag.is_set():
+                if _cortar():
+                    cortado = True
                     return False
                 audio = np.ascontiguousarray(chunk.audio_int16_array).reshape(-1)
                 if audio.size == 0:
@@ -184,14 +235,17 @@ class TTS:
                     )
                     stream.start()
                 for i in range(0, audio.size, step):
-                    if self._stop_flag.is_set():
+                    if _cortar():
+                        cortado = True
                         return False
                     stream.write(audio[i:i + step])
             return True
         finally:
             if stream is not None:
                 try:
-                    if self._stop_flag.is_set():
+                    # abort() tira lo que queda en el búfer; stop() solo lo
+                    # dejaría sonar hasta el final.
+                    if cortado or self._stop_flag.is_set():
                         stream.abort()
                     stream.stop()
                     stream.close()
@@ -274,6 +328,11 @@ class StreamSpeaker:
         self._buffer = ""
         self._spoke = False
         self._q: queue.Queue[str | None] = queue.Queue()
+        # finish() se rindió (C6): el hilo no habla ni una frase más de la cola.
+        self._cancelled = threading.Event()
+        # Cuándo tomó el hilo su última frase: el plazo de finish() se mide
+        # desde aquí (por frase), no desde que lo llamaron.
+        self._avance = time.monotonic()
         self._thread = threading.Thread(
             target=self._worker, name="StreamSpeaker", daemon=True
         )
@@ -282,7 +341,8 @@ class StreamSpeaker:
     def _worker(self) -> None:
         while True:
             sentence = self._q.get()
-            if sentence is None:
+            self._avance = time.monotonic()
+            if sentence is None or self._cancelled.is_set():
                 return
             if not self._spoke:
                 self._spoke = True
@@ -309,11 +369,40 @@ class StreamSpeaker:
             self._q.put(piece)
 
     def finish(self, timeout_s: float = 120.0) -> bool:
-        """Habla lo que quede en el buffer, espera la cola y devuelve si habló."""
+        """Habla lo que quede en el buffer, espera la cola y devuelve si habló.
+
+        `timeout_s` es el plazo POR FRASE (desde que el hilo la toma, o desde
+        esta llamada si fue después), no un tope a la respuesta: una respuesta
+        larga que avanza se espera entera; solo un TTS colgado (sink de audio
+        trabado: PipeWire reiniciado, Bluetooth que se fue) lo agota (C6). Antes
+        era un join total y, al vencer, el hilo seguía vivo: quien llama ya
+        seguía (HUD idle, escucha del followup) y la cola sonaba ENCIMA de la
+        grabación, que el STT tomaba por una orden. Ahora se cancela el hilo.
+        """
         tail = self._buffer.strip()
         self._buffer = ""
         if tail:
             self._q.put(tail)
         self._q.put(None)
-        self._thread.join(timeout=timeout_s)
+        inicio = time.monotonic()
+        while self._thread.is_alive():
+            restante = max(self._avance, inicio) + timeout_s - time.monotonic()
+            if restante <= 0:
+                self._cancelar(timeout_s)
+                break
+            self._thread.join(timeout=restante)
         return self._spoke
+
+    def _cancelar(self, timeout_s: float) -> None:
+        """El TTS no avanzó en `timeout_s`: ni una frase más y cortar la que suena.
+
+        stop() no desbloquea una escritura trabada en el dispositivo, pero deja
+        el corte marcado: cuando el audio se destraba, _speak_streaming aborta en
+        la siguiente rebanada y el hilo sale sin tocar el resto de la cola.
+        """
+        self._cancelled.set()
+        log.warning("StreamSpeaker: el TTS no avanzó en %g s; corto la voz", timeout_s)
+        try:
+            self.tts.stop()
+        except Exception as error:  # noqa: BLE001 - finish() corre en un finally
+            log.warning("StreamSpeaker: no pude cortar el TTS: %s", error)

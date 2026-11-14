@@ -117,7 +117,7 @@ def _tts_capturando(tmp_path: Path, monkeypatch) -> tuple[TTS, list[str]]:
     tts = TTS(modelo)
     hablado: list[str] = []
 
-    def _fake_engine(text: str) -> bool:
+    def _fake_engine(text: str, should_abort=None) -> bool:
         hablado.append(text)
         return True
 
