@@ -17,11 +17,12 @@
    ese punto como la palabra "punto". Ahora lo primero que suelta un streamer
    va en frase aparte ("\n") si el Emitter del turno ya habló.
 
-   Pendiente fuera de esta unidad (core/agent.py): si la llamada del preámbulo
-   acaba en una tool directa (short-circuit), `flush_if_held` no emite el
-   resultado porque ese streamer ya está "en vivo". El streamer no puede
-   distinguir un resultado de tool del content que ya soltó (los tests de
-   fase6 y fallback fijan que en vivo no se repite nada); el agente sí.
+   Lo que quedaba fuera de esta unidad (core/agent.py) ya está: si la llamada
+   del preámbulo acaba en una tool directa (short-circuit), `flush_if_held` no
+   emitía el resultado porque ese streamer ya estaba "en vivo". El streamer no
+   puede distinguir un resultado de tool del content que ya soltó (los tests
+   de fase6 y fallback fijan que en vivo no se repite nada); el agente sí, y
+   ahora lo emite él por el Emitter del turno, en frase aparte.
 """
 
 from __future__ import annotations
@@ -291,10 +292,11 @@ def test_agente_sentence_preambulo_tool_y_respuesta_se_hablan_por_separado():
                                       "Voy a revisar la memoria ahora mismo.", _RESPUESTA]
 
 
-@pytest.mark.xfail(strict=False, reason=(
-    "core/agent.py: el short-circuit llama a flush_if_held de un streamer que ya "
-    "soltó el preámbulo; debe emitir el resultado aparte (emit('\\n' + reply))"))
 def test_agente_sentence_preambulo_y_tool_directa_se_oye_el_resultado():
+    # Sin xfail: el short-circuit de core/agent.py emite el resultado por el
+    # Emitter del turno, en frase aparte si ya sonó algo (el arreglo de u03).
+    # Un solo mecanismo: el streamer no distingue el resultado de una tool del
+    # content que ya soltó; el agente sí. Este test lo fija también desde u12.
     from tests.test_perf_llm_turn_is_one_atomic_blocking_call import _agente, _Guion, _Oido
 
     llm = _Guion([(_PREAMBULO, True)], tools=("ram_probe",))

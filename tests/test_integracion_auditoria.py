@@ -815,3 +815,106 @@ def test_ctrl_c_en_un_turno_sigue_sin_tragarse(monkeypatch):
     monkeypatch.setattr(builtins, "input", lambda prompt="": "hola")
     with pytest.raises(KeyboardInterrupt):
         shell.run_shell([])
+
+
+# --- revisión final u18: el guard aprende el cwd del server MCP (Tool.path_base) ------
+# El guard ya clasificaba las relativas de una tool MCP contra `tool.path_base`,
+# pero nadie lo ponía: con un server de verdad seguía resolviendo contra el CWD.
+
+def test_build_tools_lleva_el_cwd_del_server_a_path_base():
+    from crotolamo.mcp.bridge import MCPServerConfig, _build_tools
+
+    con_cwd = MCPServerConfig(name="s", command=["x"], cwd="/srv")
+    [tool] = _build_tools(Registry(), con_cwd, [{"name": "leer"}])
+    assert tool.path_base == Path("/srv")
+    [tool] = _build_tools(Registry(), MCPServerConfig(name="s", command=["x"]), [{"name": "leer"}])
+    assert tool.path_base is None
+    # Una tool nativa no trae base: la suya es [paths].relative_base (o el CWD).
+    assert Tool(name="t", func=lambda: "", description="d", parameters={}).path_base is None
+
+
+def test_relativa_a_un_server_mcp_con_cwd_en_zona_de_confirmacion_pregunta(tmp_path, monkeypatch):
+    """De punta a punta, con el fake server por stdio: Crotolamo corre desde su
+    repo (zona libre, como el .service) y el server desde ~/proyectos/privado.
+    path=".env" es el .env del SERVER: antes pasaba sin preguntar."""
+    from crotolamo.core import router
+    from crotolamo.core.memory import Conversation
+    from crotolamo.mcp import bridge
+    from crotolamo.safety.guard import Guard
+    from crotolamo.settings import Settings
+
+    home = (tmp_path / "home").resolve()
+    libre = home / "Documentos"
+    repo = libre / "crotolamo2"
+    privado = home / "proyectos" / "privado"
+    repo.mkdir(parents=True)
+    privado.mkdir(parents=True)
+    monkeypatch.chdir(repo)
+    servers = {"git": {"command": [sys.executable, str(REPO / "tests" / "fake_mcp_server.py")],
+                       "cwd": str(privado)}}
+    settings = Settings(raw={"mcp": {"enabled": True, "timeout_s": 5, "startup_timeout_s": 5,
+                                     "servers": servers}}, user="test", home=home)
+    registry = Registry()
+    bridge.close_all()
+    try:
+        bridge.register_mcp_tools(registry, settings)
+        tool = registry.get("mcp_git_echo")  # solo lectura: sin confirmación de por sí
+        assert tool is not None and tool.safe
+        guard = Guard(allowed_roots=[libre], confirm_roots=[home])
+        decision = guard.check(tool, {"text": "x", "path": ".env"})
+        assert decision.allowed and decision.needs_confirmation, decision
+        assert decision.reason == f"fuera de la zona libre: {privado / '.env'}. ¿Lo hago?"
+        preguntas: list[str] = []
+        agente = ToolAgent(llm=None, conversation=Conversation("SYS"), registry=registry,
+                           guard=guard, confirm_fn=lambda r: preguntas.append(r) or False)
+        assert agente._execute_call("mcp_git_echo", {"text": "x", "path": ".env"}) \
+            == "Cancelado por el patrón."
+        assert preguntas == [decision.reason]
+    finally:
+        bridge.close_all()
+        for name in router.dynamic_groups():
+            router.unregister_group(name)
+
+
+# --- revisión final u23: re-anotar un hecho sin categoría no le quita la suya --------
+
+def _hechos(dbp: Path) -> list[tuple[str, str]]:
+    from crotolamo.persistence import facts
+
+    return [(f["texto"], f["categoria"]) for f in facts.recall(db_path=dbp)]
+
+
+def test_reanotar_un_hecho_sin_categoria_conserva_su_etiqueta(tmp_path):
+    """remember_fact trae categoria="general" por defecto: el modelo que volvía a
+    guardar '(preferencias) mi editor es geany' sin categoría lo dejaba en
+    '(general)' y recall_facts('preferencias') ya no lo encontraba."""
+    from crotolamo.persistence import facts
+
+    dbp = tmp_path / "libreta.sqlite"
+    facts.remember("mi editor es geany", "preferencias", db_path=dbp)
+    facts.remember("Mi editor es geany.", db_path=dbp)
+    facts.remember("mi editor es geany", " General ", db_path=dbp)
+    facts.remember("mi editor es geany", None, db_path=dbp)  # type: ignore[arg-type]
+    assert _hechos(dbp) == [("mi editor es geany", "preferencias")]
+    assert [f["texto"] for f in facts.recall("preferencias", db_path=dbp)] == [
+        "mi editor es geany"]
+
+
+def test_reanotar_con_otra_categoria_la_sigue_cambiando(tmp_path):
+    """Solo la categoría por defecto hereda: una explícita manda, y un hecho que
+    nunca tuvo etiqueta sigue en general."""
+    from crotolamo.persistence import db, facts
+
+    dbp = tmp_path / "libreta.sqlite"
+    facts.remember("uso Fedora", "preferencias", db_path=dbp)
+    facts.remember("uso Fedora", "sistema", db_path=dbp)
+    facts.remember("tomo café", db_path=dbp)
+    facts.remember("Tomo café.", db_path=dbp)
+    assert _hechos(dbp) == [("uso Fedora", "sistema"), ("Tomo café.", "general")]
+    # Una libreta de antes, con copias: hereda la etiqueta de la más reciente que tenía.
+    db.add_fact("mi perro se llama Tletl", "mascotas", db_path=dbp)
+    db.add_fact("Mi perro se llama Tletl.", "familia", db_path=dbp)
+    db.add_fact("mi perro se llama tletl", db_path=dbp)
+    facts.remember("mi perro se llama Tletl", db_path=dbp)
+    assert _hechos(dbp)[-1] == ("mi perro se llama Tletl", "familia")
+    assert len(_hechos(dbp)) == 3

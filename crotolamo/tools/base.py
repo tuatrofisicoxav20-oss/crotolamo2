@@ -204,6 +204,14 @@ class Tool:
     # tocaba) y las lecturas de la libreta SQLite (LANE_LIBRETA). None = carril
     # propio.
     parallel_lane: str | None = None
+    # Directorio contra el que la tool abre sus rutas relativas cuando no es el
+    # CWD de este proceso: el `cwd` del server MCP que la sirve
+    # ([mcp.servers.<name>].cwd, que el cliente pasa a Popen). El guard clasifica
+    # ahí las relativas de las tools MCP (strict_args=False); sin ella, un server
+    # con cwd en ~/proyectos/privado leía ".env" sin preguntar porque el guard la
+    # miraba contra el CWD del .service (el repo, zona libre). None = el CWD que
+    # hereda. Las nativas no la usan: se anclan a [paths].relative_base.
+    path_base: Path | None = None
 
     def schema(self) -> dict[str, Any]:
         """Formato que espera Ollama en el campo `tools`."""

@@ -112,6 +112,11 @@ def all_shortcuts(db_path: Path | None = None) -> dict[str, dict]:
 
 
 # --- hechos (memoria persistente) ---
+# La categoría por defecto (la del schema y la de remember_fact sin categoría),
+# en la forma canónica de _clave_categoria.
+_GENERAL = "general"
+
+
 def add_fact(texto: str, categoria: str = "general", db_path: Path | None = None) -> int:
     with connect(db_path) as conn:
         cur = conn.execute(
@@ -141,9 +146,19 @@ def add_fact_unique(
     buscada = clave(texto)
     with connect(db_path) as conn:
         conn.execute("BEGIN IMMEDIATE")
-        filas = conn.execute("SELECT id, texto FROM facts").fetchall()
-        repetidas = [(f["id"],) for f in filas if clave(f["texto"]) == buscada]
-        conn.executemany("DELETE FROM facts WHERE id = ?", repetidas)
+        filas = conn.execute("SELECT id, texto, categoria FROM facts").fetchall()
+        repetidas = [f for f in filas if clave(f["texto"]) == buscada]
+        conn.executemany("DELETE FROM facts WHERE id = ?", [(f["id"],) for f in repetidas])
+        # "general" es lo que pone remember_fact cuando el modelo no manda
+        # categoría, no una etiqueta elegida: re-guardar sin ella un hecho de
+        # "preferencias" lo dejaba en "(general)" y recall_facts("preferencias")
+        # ya no lo encontraba (antes de quitar copias, la fila etiquetada se
+        # quedaba). Hereda la de la sustituida más reciente que tenía una; una
+        # categoría explícita sigue mandando.
+        if _clave_categoria(categoria) == _GENERAL:
+            etiquetadas = [f for f in repetidas if _clave_categoria(f["categoria"]) != _GENERAL]
+            if etiquetadas:
+                categoria = max(etiquetadas, key=lambda f: f["id"])["categoria"]
         cur = conn.execute(
             "INSERT INTO facts (texto, categoria) VALUES (?, ?)", (texto, categoria)
         )

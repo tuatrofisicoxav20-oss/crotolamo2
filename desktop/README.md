@@ -65,19 +65,25 @@ instalador lo pise: `systemctl --user edit crotolamo.service`.
 ### Ventanas de Hyprland desde el servicio
 
 Las tools de ventanas (`list_windows`, `app_status`, `focus_window`, `close_window`)
-usan `hyprctl`, que necesita `HYPRLAND_INSTANCE_SIGNATURE`. `crotolamo.service`
-arranca con `default.target` y solo ve esa variable si la sesión la exporta a
-systemd: añade a `~/.config/hypr/hyprland.conf` la línea
+usan `hyprctl`, que tiene que saber a qué Hyprland hablarle. `crotolamo.service`
+arranca con `default.target`, antes de que Hyprland exista, y se queda con el
+entorno con el que nació: sin `HYPRLAND_INSTANCE_SIGNATURE`, o con la de un
+Hyprland que ya se cerró o se cayó. Por eso las tools buscan solas la instancia
+viva en `$XDG_RUNTIME_DIR/hypr/<firma>/` (`/run/user/<uid>/hypr/` si no hay
+`XDG_RUNTIME_DIR`), el mismo sitio que mira `hyprctl`. Viva = tiene su
+`.socket.sock` y el PID de `hyprland.lock` sigue existiendo; si hay varias, la
+que arrancó más tarde. Con esa firma llaman `hyprctl -i <firma> ...` (también al
+enfocar y al cerrar). Si la variable del entorno apunta a una instancia viva, se
+usa esa tal cual, sin `-i`.
 
-```
-exec-once = dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP HYPRLAND_INSTANCE_SIGNATURE
-```
+No hace falta exportar nada a systemd ni reiniciar el servicio tras el login o
+tras reiniciar Hyprland: la línea `exec-once = dbus-update-activation-environment ...`
+en `~/.config/hypr/hyprland.conf` ya no es necesaria (si ya la tienes, no estorba).
 
-y reinicia el servicio (`systemctl --user restart crotolamo`): un proceso que ya
-corría no ve lo que se exporta después. Si falta, Crotolamo contesta «hyprctl se
-quejó, patrón: HYPRLAND_INSTANCE_SIGNATURE not set! (is hyprland running?)» y lo
-deja en el registro.
-(Receta sin validar todavía en la laptop.)
+Si Crotolamo contesta «hyprctl se quejó, patrón: HYPRLAND_INSTANCE_SIGNATURE not
+set! (is hyprland running?)», ahora solo quiere decir que no hay ningún Hyprland
+corriendo (ninguna instancia viva en esa carpeta); lo deja también en el registro.
+(Probado con un `hyprctl` de mentira que imita al real; falta validarlo en la laptop.)
 
 ## Desinstalar
 

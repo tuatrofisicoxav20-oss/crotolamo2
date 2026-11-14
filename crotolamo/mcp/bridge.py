@@ -48,6 +48,7 @@ import threading
 import time
 from concurrent.futures import Future
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
 
 from crotolamo.core import router
@@ -662,6 +663,11 @@ def _build_tools(
             parallel_safe=tool_is_read_only(raw_tool.get("annotations")),
             # Las de un server, en fila dentro del lote: comparten pipe y strikes.
             parallel_lane=f"mcp:{server.name}",
+            # Donde el server abre las relativas: su `cwd` (ya con ~ y $VAR
+            # expandidos por _parse_server). Sin esto el guard las clasificaba
+            # contra el CWD de Crotolamo. Una relativa se queda relativa: se
+            # resuelve contra el CWD del proceso, como hace Popen.
+            path_base=Path(server.cwd) if server.cwd else None,
         ))
     return tools
 
