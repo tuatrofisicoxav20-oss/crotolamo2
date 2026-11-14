@@ -44,13 +44,15 @@ from typing import Any
 
 try:
     from crotolamo.core.engine import GLM, resolve_backend
-    from crotolamo.core.glm import API_KEY_ENVS, DEFAULT_BASE_URL, DEFAULT_MODEL
+    from crotolamo.core.glm import (API_KEY_ENVS, DEFAULT_BASE_URL, DEFAULT_MODEL,
+                                    _key_cabe_en_header)
     from crotolamo.settings import LOCAL_CONFIG, Settings, load_settings
     from crotolamo.voice import runtime as voice_runtime
 except ModuleNotFoundError:  # ejecutado como script suelto
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from crotolamo.core.engine import GLM, resolve_backend
-    from crotolamo.core.glm import API_KEY_ENVS, DEFAULT_BASE_URL, DEFAULT_MODEL
+    from crotolamo.core.glm import (API_KEY_ENVS, DEFAULT_BASE_URL, DEFAULT_MODEL,
+                                    _key_cabe_en_header)
     from crotolamo.settings import LOCAL_CONFIG, Settings, load_settings
     from crotolamo.voice import runtime as voice_runtime
 
@@ -83,6 +85,13 @@ _DOCTOR_DEFAULTS: dict[str, Any] = {
 _KEY_FIX = (
     'Ponla en ~/.config/crotolamo/env como CROTOLAMO_GLM_API_KEY="..." (sin export; '
     "chmod 600) y vuelve a arrancar Crotolamo."
+)
+# Lo que el runtime le dice al patrón con una key que no cabe en la cabecera
+# (GLMClient._headers): mismo diagnóstico, para que el doctor no diga otra cosa.
+_KEY_RARA = "trae caracteres raros (¿comillas o un espacio invisible al copiarla?)"
+_KEY_RARA_FIX = (
+    'Vuelve a pegarla en ~/.config/crotolamo/env, en UNA línea y entre comillas rectas: '
+    'CROTOLAMO_GLM_API_KEY="..." (sin export); luego vuelve a arrancar Crotolamo.'
 )
 
 
@@ -158,8 +167,16 @@ def _import_error(module: str) -> str | None:
     return _try_import(module)[1]
 
 
+class _SinRedirecciones(urllib.request.HTTPRedirectHandler):
+    """No sigue redirecciones: el 3xx llega como HTTPError, igual que al runtime."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def _urlopen(req: urllib.request.Request | str, timeout: float) -> Any:
-    """`urlopen` SIN proxy: la sonda va por el mismo camino de red que Crotolamo.
+    """`urlopen` SIN proxy NI redirecciones: la sonda va por el mismo camino de
+    red que Crotolamo.
 
     `urllib.request.urlopen` usa el opener global, que trae el ProxyHandler por
     defecto (lee http_proxy/https_proxy del entorno). El runtime habla con la
@@ -167,9 +184,13 @@ def _urlopen(req: urllib.request.Request | str, timeout: float) -> Any:
     variable de proxy en el entorno los veredictos divergían (nube u Ollama en
     rojo con Crotolamo conectando bien, o en verde cuando el runtime no sale).
     ProxyHandler({}) lo sustituye por uno vacío, igual que _hass/_frigate.
+    HTTPTransport tampoco sigue redirecciones (GLMClient falla el turno con "me
+    mandó a otra dirección"): con el HTTPRedirectHandler de serie el doctor
+    seguía el 301 de un base_url con http://, reenviaba el Bearer al destino y
+    daba llm-nube ✅ con cada turno roto. _SinRedirecciones lo sustituye.
     Sustituible en tests.
     """
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _SinRedirecciones())
     return opener.open(req, timeout=timeout)
 
 
@@ -213,11 +234,23 @@ def _probe_cloud(base_url: str, model: str, key: str,
     timeout. La key solo viaja en la cabecera: jamás entra en el detalle.
     """
     url = f"{base_url.rstrip('/')}/models"
+    if not _key_cabe_en_header(key):
+        # Ni se manda: el runtime la rechaza antes de tocar la red (GLMAuthError)
+        # y http.client reventaba con la cabecera ENTERA en el mensaje (la key en
+        # repr, que _scrub no reconocía) o, con un TAB, la mandaba y daba ✅.
+        return Check("llm-nube", False, f"no pruebo la nube ({url}): la key {_KEY_RARA}",
+                     _KEY_RARA_FIX)
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}"})
     try:
         with _urlopen(req, timeout=timeout) as resp:
             body = resp.read()
     except urllib.error.HTTPError as error:
+        if 300 <= error.code < 400:
+            destino = (error.headers.get("Location") if error.headers else None) or "no sé dónde"
+            return Check("llm-nube", False,
+                         f"la nube redirige ({error.code}) {url} a {destino}: Crotolamo no "
+                         "sigue redirecciones y cada turno fallaría",
+                         "Corrige [llm.glm].base_url con la dirección final (¿https://?).")
         if error.code in (401, 403):
             return Check("llm-nube", False, f"key inválida o caducada ({error.code} de {url})",
                          "Genera una key nueva en el proveedor y actualiza "
@@ -318,14 +351,21 @@ def _listener_pids() -> list[int]:
 
 
 def _as_date(raw: Any) -> date | None:
-    """Fecha TOML (date/datetime) o ISO en string; None si no hay. Lanza si es basura."""
+    """Fecha TOML (date/datetime) o ISO en string; None si no hay. Lanza si es basura.
+
+    "No hay" es SOLO None (sin la clave) o un texto en blanco (el "" documentado
+    para no vigilarla). Un 20261129 sin guiones (TOML lo lee como int) o una
+    lista devolvían None y el aviso de caducidad desaparecía en silencio.
+    """
+    if raw is None:
+        return None
     if isinstance(raw, datetime):
         return raw.date()
     if isinstance(raw, date):
         return raw
-    if isinstance(raw, str) and raw.strip():
-        return date.fromisoformat(raw.strip())
-    return None
+    if isinstance(raw, str):
+        return date.fromisoformat(raw.strip()) if raw.strip() else None
+    raise ValueError(f"no es una fecha: {raw!r}")
 
 
 def _piper_model_status(settings: Settings) -> Check:
@@ -405,6 +445,13 @@ def _nota_backend(ctx: _Ctx) -> str:
 
 def _check_llm_key(ctx: _Ctx) -> list[Check]:
     env = _key_env()
+    if env and not _key_cabe_en_header(os.environ[env].strip()):
+        # Misma regla que GLMClient._headers: con comillas tipográficas, un U+200B
+        # o un salto de línea, CADA turno es GLMAuthError y se cae a Ollama. Un
+        # ✅ "presente" aquí escondía justo el error de copia-pega que más pasa.
+        return [Check("llm-key", False,
+                      f"la key de {env} {_KEY_RARA}: Crotolamo la rechaza y va a caer a "
+                      f"Ollama local{_nota_backend(ctx)}", _KEY_RARA_FIX)]
     if env:
         return [Check("llm-key", True, f"presente en {env}{_nota_backend(ctx)}")]
     return [Check("llm-key", False,
@@ -560,7 +607,9 @@ def _check_aec(ctx: _Ctx) -> list[Check]:
 
 
 def _check_ollama(ctx: _Ctx) -> list[Check]:
-    host = str(ctx.settings.llm.get("host", "http://localhost:11434"))
+    # Sin la barra final, como LLMClient: con ella se pedía //api/tags y el router
+    # de Ollama (gin) contesta 404 a lo que el runtime sí alcanza.
+    host = str(ctx.settings.llm.get("host", "http://localhost:11434")).rstrip("/")
     model = str(ctx.settings.llm.get("model", "qwen2.5-coder:7b"))
     rol = "respaldo local" if ctx.backend == GLM else "motor principal"
     tags = _ollama_tags(host)
@@ -932,9 +981,27 @@ def _secretos(ctx: _Ctx) -> list[str]:
     return [v for v in valores if len(v) >= 4]  # algo tan corto no es una key
 
 
+def _formas(secreto: str) -> set[str]:
+    """Cómo puede aparecer un secreto en el texto de una excepción ajena.
+
+    Crudo; en repr de str (un salto de línea sale como \\n); en repr de bytes
+    latin-1 (lo que pone http.client en "Invalid header value b'Bearer …'", que
+    escribe \\xf1 donde el str dice ñ); y cada línea suelta, por si el mensaje
+    trae solo un trozo. Una key pegada en dos líneas salía ENTERA por esas
+    formas: el texto crudo trae un salto real y el mensaje, su escape.
+    """
+    formas = {secreto, repr(secreto)[1:-1], secreto.encode("unicode_escape").decode("ascii")}
+    formas.update(linea for linea in secreto.splitlines() if len(linea) >= 4)
+    return {f for f in formas if len(f) >= 4}
+
+
 def _scrub(text: str, secretos: list[str]) -> str:
-    for secreto in secretos:
-        text = text.replace(secreto, "«oculto»")
+    # De la forma más larga a la más corta: si una línea suelta se tapa antes, la
+    # forma escapada completa ya no casa y la otra mitad, con su \xf1 en vez de
+    # la ñ (que su línea suelta no reconoce), quedaría a la vista.
+    formas = {forma for secreto in secretos for forma in _formas(secreto)}
+    for forma in sorted(formas, key=len, reverse=True):
+        text = text.replace(forma, "«oculto»")
     return text
 
 

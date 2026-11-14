@@ -47,8 +47,11 @@ _CONNECTORS = frozenset({
 # (verbo) no es "esta" (determinante), "él/mí/tú" (pronombres) no son
 # "el/mi/tu". Como _norm quita los acentos, sin esta lista un "sí" a secas o un
 # "¿dónde está?" contaban como frase a medias y reabrían la escucha antes de
-# actuar. Se comparan CON acento, antes de normalizar.
-_TONIC_CLOSERS = frozenset({"sí", "él", "mí", "tú", "está"})
+# actuar. Se comparan CON acento, antes de normalizar. Los interrogativos
+# tónicos son la misma clase: "¿por qué?", "¿a dónde?", "¿hasta cuándo?" o
+# "dime cómo" terminan la pregunta, y sin tilde chocaban con los conectores
+# "que/donde/cuando/como" (reabrían 2.5 s y pegaban a la orden lo que sonara).
+_TONIC_CLOSERS = frozenset({"sí", "él", "mí", "tú", "está", "qué", "cómo", "cuándo", "dónde"})
 
 # Verbos transitivos que, SOLOS, piden objeto: "abre" (¿qué?), "mueve" (¿qué?).
 # Solo aplican cuando la transcripción es UNA palabra; "pausa" o "siguiente"
@@ -76,7 +79,14 @@ def seems_incomplete(text: str) -> bool:
     if not words:
         return False
     # NFC: Whisper puede entregar la tilde como carácter combinante suelto.
-    if unicodedata.normalize("NFC", body.lower()).split()[-1] in _TONIC_CLOSERS:
+    last = unicodedata.normalize("NFC", body.lower()).split()[-1]
+    # Una palabra que ABRE con ¿/¡ es una pregunta o exclamación de una sola
+    # palabra ("¿Y?", "¿Cómo?", "¡Abre!"): Whisper ya la abrió y la cerró. Se
+    # dice a propósito; antes solo salía bien porque el "¿" pegado a la palabra
+    # le impedía coincidir con un conector o un verbo colgado.
+    if last[0] in "¿¡":
+        return False
+    if last in _TONIC_CLOSERS:
         return False
     if words[-1] in _CONNECTORS:
         return True
