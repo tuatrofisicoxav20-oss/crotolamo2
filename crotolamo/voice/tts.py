@@ -319,7 +319,12 @@ class StreamSpeaker:
         speaker = StreamSpeaker(tts, on_first=...)
         reply = agent.handle_turn(cmd, on_token=speaker.feed)
         spoke = speaker.finish()   # habla la cola restante y espera; True si habló
-        if not spoke: tts.speak_sentences(reply)  # fallback (p.ej. error del LLM)
+        if not spoke: tts.speak_sentences(reply)  # fallback (un stream que no emitió nada)
+
+    El error de un LLM caído ya no necesita el fallback: el agente lo emite por
+    on_token (tras un salto de línea si ya se había hablado algo). Ese salto
+    suelto no corta frase aquí: el loop simple lo convierte en frase aparte
+    (interfaces/listener.py, _AvisoEnFraseAparte).
     """
 
     def __init__(self, tts: TTS, on_first=None) -> None:

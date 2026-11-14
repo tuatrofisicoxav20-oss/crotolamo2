@@ -41,6 +41,12 @@ class Mode(Enum):
 # pausar/reanudar la escucha por voz SIN matar el proceso. El loop lo sondea.
 CONTROL_PATH = Path.home() / ".crotolamo" / "control.json"
 
+# Canal de estado (loop -> HUD y panel): el archivo que publica SharedState vía
+# make_file_publisher. Vivía solo en interfaces/listener.py; aquí queda junto a
+# CONTROL_PATH, una sola definición por lado del contrato (el del escritorio es
+# desktop/common/ipc.py, y los tests cruzan las dos).
+HUD_STATE_PATH = Path.home() / ".crotolamo" / "hud_state.json"
+
 
 def read_control_enabled(path: Path = CONTROL_PATH) -> bool:
     """Lee el flag de escucha del canal de control. Default-SEGURO.

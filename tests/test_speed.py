@@ -55,9 +55,11 @@ def test_stream_speaker_ignora_espacios_sueltos():
     tts = _FakeTTS()
     sp = StreamSpeaker(tts)
     sp.feed(".  \n  ")
-    assert sp.finish() is True or tts.spoken == [] or True  # no debe reventar
-    # lo importante: nada de frases vacías
+    sp.finish()  # no debe reventar
+    # lo importante: nada de frases vacías. Un "." suelto sí puede llegar al TTS:
+    # limpiar_para_voz lo deja en "" y TTS.speak no suena nada.
     assert all(s.strip() for s in tts.spoken)
+    assert tts.spoken in ([], ["."])
 
 
 # --- beam_size configurable ---

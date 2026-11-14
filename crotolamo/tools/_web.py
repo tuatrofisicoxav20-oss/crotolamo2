@@ -85,9 +85,11 @@ def is_public_url(url: str) -> bool:
     otra página. Sin este filtro podría pedir `http://localhost:11434` (el propio
     Ollama) o `http://169.254.169.254` (metadatos de nube): eso es SSRF.
 
-    OJO: esto es el pre-check barato (lo usa read_page para responder en
-    personaje sin descargar nada). La garantía fuerte contra rebinding vive en
-    _http_get, que valida y PINNEA la misma resolución.
+    OJO: la garantía (y el bloqueo) de verdad vive en _http_get, que valida y
+    PINNEA la misma resolución en cada salto. read_page ya no lo usa de
+    pre-check (gastaba un getaddrinfo y llamaba "red interna" a un DNS que no
+    resuelve); queda como consulta suelta y por compatibilidad (search lo
+    re-exporta).
     """
     host = urlparse(url).hostname
     if not host:
@@ -276,7 +278,15 @@ def _http_get(url: str, timeout: float = 10.0) -> tuple[str, str]:
     """
     current = url
     for _ in range(_MAX_REDIRECTS + 1):
-        conn, path = _pinned_connection(current, timeout)
+        try:
+            conn, path = _pinned_connection(current, timeout)
+        except http.client.HTTPException as error:
+            # El constructor de HTTPConnection rechaza un host con caracteres de
+            # control (un NUL: getaddrinfo corta ahí y resuelve, http.client no)
+            # con InvalidURL, que no es OSError: se escapaba como "reventó".
+            # Nunca llegó a conectar: es una URL inválida, no un hueco SSRF.
+            raise urllib.error.URLError(
+                f"URL inválida para un GET ({error!r})") from error
         try:
             conn.request("GET", path, headers={"User-Agent": _USER_AGENT})
             response = conn.getresponse()

@@ -192,12 +192,28 @@ def confirmation_from_answer(answer: str) -> bool:
     Una PREGUNTA no es una confirmación clara: "¿se va a borrar todo?" o "¿y si
     mejor lo dejamos?" confirmaban por el "va"/"si" que llevan dentro y la tool
     delicada corría. Whisper conserva "¿"/"?" (normalize_text no los toca).
+
+    Tampoco una frase larga que lleva un "si" o un "va" DENTRO ("mmm, si eso
+    borra todo mejor espera", "el paquete va en camino", la tele de fondo): el
+    "si" sin tilde seguido de otra palabra es la conjunción (el sí lleva tilde, o
+    va solo o con coma), y un sí se dice PRIMERO, así que la palabra que confirma
+    tiene que estar entre las dos primeras. Lo dudoso cuenta como "no" (lo
+    seguro): un "claro que sí" obliga a repetirlo, no borra nada.
     """
     if contains_any(answer, CANCEL_VARIANTS):
         return False
     if "?" in answer or "¿" in answer:
         return False
-    return contains_any(_sin_va_de_futuro(answer), CONFIRM_VARIANTS)
+    # Sobre el texto CRUDO: normalize_for_wake quita la tilde que distingue el
+    # sí afirmativo del si condicional.
+    sin_condicional = _SI_CONDICIONAL.sub(" ", answer)
+    palabras = _sin_va_de_futuro(sin_condicional).split()
+    return contains_any(" ".join(palabras[:2]), CONFIRM_VARIANTS)
+
+
+# "si" SIN tilde seguido directamente de otra palabra: la conjunción ("si eso
+# borra...", "a ver si llueve"), no un sí. "sí", "si" a secas o "si," no entran.
+_SI_CONDICIONAL = re.compile(r"\bsi\b(?=\s+[^\W\d_])", re.IGNORECASE)
 
 
 def _sin_va_de_futuro(text: str) -> str:

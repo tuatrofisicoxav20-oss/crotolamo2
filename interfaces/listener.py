@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -30,6 +31,7 @@ from crotolamo.voice.media_aware import (
 )
 from crotolamo.voice.state import (
     CONTROL_PATH,
+    HUD_STATE_PATH,
     Mode,
     SharedState,
     make_file_publisher,
@@ -43,8 +45,10 @@ from interfaces.shell import build_agent
 
 log = get_logger("listener")
 
-# Ruta canónica del archivo de estado para el HUD.
-_HUD_STATE_PATH = Path.home() / ".crotolamo" / "hud_state.json"
+# Ruta canónica del archivo de estado para el HUD. Se define UNA vez en
+# crotolamo/voice/state.py, junto a CONTROL_PATH (el otro lado del contrato con
+# desktop/common/ipc.py); aquí solo se toma, para que los tests la redirijan.
+_HUD_STATE_PATH = HUD_STATE_PATH
 
 # Cadencia del sondeo del canal de control (panel -> loop) en el modo simple:
 # la misma del loop concurrente (VoiceLoop.run espera 0.3s entre sondeos).
@@ -322,7 +326,8 @@ def _graceful_exit(signum, _frame) -> None:
     NOTA: os._exit(0) omite finally/atexit, por eso escribimos el idle HUD AQUÍ,
     antes de salir, en vez de confiar en stop() o un finally exterior. Por la
     misma razón se restaura aquí la música atenuada (ducking): un Ctrl-C a media
-    orden no debe dejar Spotify bajito.
+    orden no debe dejar Spotify bajito. Y se espera (acotado) la extracción de
+    memoria del último turno, que el atexit de la Memoria ya no alcanzaría.
 
     El idle va AL FINAL, pegado a os._exit: los demás hilos siguen corriendo
     mientras se restaura la música y se cierran los servers MCP, y lo que
@@ -334,8 +339,35 @@ def _graceful_exit(signum, _frame) -> None:
         pass
     _restore_media_best_effort()
     _terminate_mcp_best_effort()
+    _flush_memoria_best_effort()
     _final_idle_best_effort()
     os._exit(0)
+
+
+def _flush_memoria_best_effort(timeout_s: float = 2.0) -> None:
+    """os._exit se salta el vaciado atexit de la Memoria: el hecho que el patrón
+    contó en el último turno (su extracción corre en un hilo de fondo) se perdía
+    al parar el servicio. Acotado y sin propagar.
+
+    No construye nada: si nadie usó la Memoria (o su módulo ni se importó) no
+    hay nada pendiente. flush() vuelve en el acto con la cola vacía, así que un
+    apagado sin extracciones pendientes no tarda más. Va en un hilo aparte con
+    join acotado: el manejador corre en el hilo principal, que pudo quedar
+    interrumpido DENTRO de un put() a la cola de la Memoria (en el loop simple
+    el turno se atiende en él) con el candado de la cola tomado, y un flush()
+    ahí mismo lo esperaría para siempre.
+    """
+    try:
+        modulo = sys.modules.get("crotolamo.core.memoria")
+        memoria = getattr(modulo, "_MEMORIA", None)
+        if memoria is None:
+            return
+        hilo = threading.Thread(target=memoria.flush, kwargs={"timeout_s": timeout_s},
+                                name="MemoriaFlush", daemon=True)
+        hilo.start()
+        hilo.join(timeout=timeout_s + 0.5)
+    except Exception:  # noqa: BLE001 — nunca propagar desde aquí
+        pass
 
 
 def _terminate_mcp_best_effort() -> None:
@@ -371,6 +403,40 @@ def _install_signal_handlers() -> None:
             signal.signal(sig, _graceful_exit)
         except (ValueError, OSError):
             pass  # p.ej. si no estamos en el hilo principal
+
+
+class _AvisoEnFraseAparte:
+    """on_token del loop simple: el aviso de un LLM que se cae a media respuesta
+    se habla como frase PROPIA, no pegado a la frase cortada.
+
+    El agente lo emite como su último token, on_token("\\n" + aviso), y devuelve
+    el aviso. StreamSpeaker no corta en un salto de línea suelto (cómo suenan
+    los saltos en general es decisión pendiente, voice-runtime#18), así que se
+    oía "La capital de Francia es GLM no respondió a tiempo...". Por eso un
+    token que empieza por salto se retiene hasta el siguiente, y entonces pasa
+    tal cual (la misma segmentación de siempre, un token más tarde), o hasta el
+    final del turno: si era "\\n" + la respuesta, va tras un salto doble, que sí
+    cierra frase.
+    """
+
+    def __init__(self, feed: Callable[[str], None]) -> None:
+        self._feed = feed
+        self._retenido: str | None = None
+
+    def __call__(self, token: str) -> None:
+        retenido, self._retenido = self._retenido, None
+        if retenido is not None:
+            self._feed(retenido)
+        if token.startswith("\n"):
+            self._retenido = token
+        else:
+            self._feed(token)
+
+    def cerrar(self, reply: str) -> None:
+        """Fin del turno: suelta lo retenido, como frase aparte si era el aviso."""
+        retenido, self._retenido = self._retenido, None
+        if retenido is not None:
+            self._feed("\n" + retenido if retenido == "\n" + reply else retenido)
 
 
 def _run_simple_loop(
@@ -549,8 +615,10 @@ def _run_simple_loop(
                         speaker = StreamSpeaker(
                             tts, on_first=lambda: hud_state.set_mode(Mode.SPEAKING)
                         )
+                        on_token = _AvisoEnFraseAparte(speaker.feed)
                         try:
-                            reply, roto = atender(command, on_token=speaker.feed)
+                            reply, roto = atender(command, on_token=on_token)
+                            on_token.cerrar(reply)
                             # La respuesta al HUD (y a la consola) en cuanto se
                             # conoce, ANTES de finish(): este espera a que se
                             # hable la cola entera, y publicarla después dejaba
@@ -711,6 +779,22 @@ def run_listen(argv: list[str] | None = None) -> int:
     # (modelo puente) hasta entrenar un modelo propio de "crotolamo".
     wake_detector = WakeWordDetector.from_settings(settings)
     use_oww = settings.wake.get("use_oww", True) and wake_detector.available()
+    if use_oww:
+        # El modelo se carga AQUÍ, antes de elegir el loop: se cargaba en el
+        # primer chunk, dentro del hilo del oído, y con un oww_model malo (ruta
+        # que no existe, pesos que faltan) el asistente decía "Crotolamo
+        # escuchando" y el oído se rendía al instante: sordo, o reiniciado por
+        # systemd sin fin. No es trabajo extra: el primer chunk lo pagaba igual.
+        # Si no carga, el wake difuso (Whisper) no lo necesita. Un detector sin
+        # carga explícita (solo la interfaz de wake) se usa tal cual.
+        cargar_modelo = getattr(wake_detector, "_get_model", None)
+        if callable(cargar_modelo):
+            try:
+                cargar_modelo()
+            except VoiceUnavailable as error:
+                log.warning("openWakeWord no carga (%s); uso el wake difuso", error)
+                print(str(error), flush=True)
+                use_oww = False
 
     # Wake consciente de la música (media_aware.py), compartido por los dos
     # loops: un sondeo en segundo plano dice si algo suena (umbral de wake más
@@ -820,7 +904,12 @@ def run_listen(argv: list[str] | None = None) -> int:
                                    hud_publisher=hud_gate.publish, control_path=CONTROL_PATH,
                                    ducker=ducker)
             voice_loops.append(voice_loop)
-            voice_loop.run()
+            # run() devuelve != 0 si murió un hilo del loop (el oído que se
+            # rindió ante un micro que no vuelve): ese código sale del proceso
+            # para que systemd (Restart=on-failure) reinicie al listener sordo.
+            # Antes se devolvía 0 siempre y el servicio quedaba "inactive", sin
+            # reintento. Un run() sin código cuenta como apagado normal.
+            codigo = voice_loop.run() or 0
         finally:
             # Escribir idle final al salir del loop (KeyboardInterrupt, stop(), etc.).
             # Si _graceful_exit llegó primero (os._exit), este bloque no ejecuta;
@@ -829,7 +918,7 @@ def run_listen(argv: list[str] | None = None) -> int:
             # a media frase) todavía puede publicar después.
             media.stop()
             hud_gate.close_with_idle()
-        return 0
+        return codigo
 
     modo = "openWakeWord" if use_oww else "wake difuso (Whisper)"
     say(f"Crotolamo escuchando, patrón. (modo simple, wake: {modo})")
@@ -860,4 +949,10 @@ def run_listen(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(run_listen())
+    from crotolamo.logging_setup import setup_logging
+
+    # Como script (`python interfaces/listener.py --simple`) no se pasa por
+    # crotolamo.__main__: run_listen() a secas ignoraba --simple/--barge-in, y sin
+    # setup_logging los INFO se perdían y los WARNING salían sin formato.
+    setup_logging()
+    raise SystemExit(run_listen(sys.argv[1:]))

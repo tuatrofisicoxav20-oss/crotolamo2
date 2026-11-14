@@ -332,7 +332,11 @@ class Registry:
         return new
 
     def schemas(self) -> list[dict[str, Any]]:
-        return [t.schema() for t in self._tools.values()]
+        # Sobre una COPIA: el bridge MCP retira tools desde un hilo de fondo
+        # cuando un server muere solo, y un pop a media comprensión (t.schema()
+        # es Python, suelta el GIL) lanzaba "dictionary changed size during
+        # iteration" en pleno turno. list() de los valores es atómico.
+        return [t.schema() for t in list(self._tools.values())]
 
     def run(self, name: str, arguments: dict[str, Any]) -> str:
         tool = self._tools.get(name)

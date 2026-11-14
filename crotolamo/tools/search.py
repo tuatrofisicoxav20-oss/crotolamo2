@@ -157,13 +157,14 @@ def read_page(url: str) -> str:
     if scheme not in ("http", "https"):
         return f"Solo puedo leer páginas http o https, patrón, no '{scheme}://'."
 
-    if not _web.is_public_url(url):
-        return _BLOQUEO_RED_INTERNA
-
+    # Sin pre-check is_public_url: _http_get valida el PRIMER salto con la misma
+    # regla antes de conectar (y con la resolución que pinnea). El pre-check
+    # trataba "el DNS no resuelve" (sin wifi, dominio mal escrito) como "red
+    # interna" y repetía el getaddrinfo de cada lectura.
     try:
         content_type, body = _web._http_get(url, timeout=12.0)
     except _web.BlockedRedirectError:
-        # Un 3xx quiso llevarnos a la red interna: mismo bloqueo que la URL directa.
+        # La URL directa o un 3xx apuntan a la red interna: SSRF bloqueado.
         return _BLOQUEO_RED_INTERNA
     except urllib.error.HTTPError as error:
         return f"La página respondió con error {error.code}, patrón. No pude leerla."
@@ -177,7 +178,11 @@ def read_page(url: str) -> str:
     if mime == "text/plain":
         text = "\n".join(" ".join(line.split()) for line in body.splitlines() if line.strip())
     else:
-        extractor = _web._PageTextExtractor()
+        # Con tope: de la página solo se conservan _MAX_PAGE_CHARS caracteres y
+        # parsear el resto (hasta 1.5 MB en HTMLParser de Python puro) era
+        # trabajo tirado. El extractor para tras PASARSE del tope, así que el
+        # truncado de abajo sigue viendo que la página era más larga.
+        extractor = _web._PageTextExtractor(max_chars=_MAX_PAGE_CHARS)
         extractor.feed(body)
         text = extractor.text()
 

@@ -39,9 +39,11 @@ _SOBRE_LO_QUE_SUENA = frozenset({"pause", "play-pause", "next", "previous", "sto
 _LISTADO = "{{playerName}}\t{{status}}\t{{artist}} — {{title}}"
 
 
-def _player_arg(player: str = "") -> list[str]:
+def _player_arg(player: str | None = "") -> list[str]:
     """Si se pide un reproductor concreto (p.ej. spotify), restringe a él."""
-    p = player.strip().lower()
+    # `or ""`: un `"player": null` del modelo es "sin reproductor", el activo;
+    # antes reventaba en .strip() y volvía como "Argumentos inválidos".
+    p = (player or "").strip().lower()
     return ["-p", p] if p else []
 
 
