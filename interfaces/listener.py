@@ -46,6 +46,19 @@ log = get_logger("listener")
 # Ruta canónica del archivo de estado para el HUD.
 _HUD_STATE_PATH = Path.home() / ".crotolamo" / "hud_state.json"
 
+# Cadencia del sondeo del canal de control (panel -> loop) en el modo simple:
+# la misma del loop concurrente (VoiceLoop.run espera 0.3s entre sondeos).
+_CONTROL_POLL_S = 0.3
+
+# Edad mínima para barrer un temporal de la escritura atómica (ver
+# _sweep_stale_tmp): una publicación tarda milisegundos, así que uno más viejo
+# que esto es un huérfano; uno reciente puede ser una escritura EN CURSO.
+_TMP_STALE_S = 60.0
+
+# Lo que se dice cuando un turno revienta en el loop simple: la misma frase que
+# el BrainThread del loop concurrente (crotolamo/voice/threads.py) en el mismo caso.
+_TURNO_ROTO = "Se me trabaron los cables, patrón. Vuelve a intentarlo."
+
 
 @dataclass
 class ListenerConfig:
@@ -149,6 +162,133 @@ def _write_idle_hud(path: Path = _HUD_STATE_PATH) -> None:
         pass
 
 
+class _HudGate:
+    """Publicador de hud_state.json con compuerta de apagado.
+
+    El idle final tiene que ser lo ÚLTIMO que se escribe. Sin compuerta, otro
+    hilo (la Boca arrancando la siguiente frase, el Cerebro) podía publicar
+    DESPUÉS del idle —o tener su os.replace a medias cuando se escribía— y el
+    HUD, que no sabe si el proceso sigue vivo, se quedaba en "HABLANDO" hasta
+    el siguiente arranque. close_with_idle() cierra el paso, espera a la
+    publicación en curso y solo entonces escribe el idle; lo que llegue después
+    se descarta.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+        self._write = make_file_publisher(self.path)
+        # RLock y no Lock: el manejador de señal corre en el hilo principal, que
+        # pudo ser interrumpido A MEDIA publicación (en el loop simple publica
+        # él) o dentro de otro manejador (dos Ctrl-C seguidos). Con un Lock
+        # normal el cierre esperaría un candado que tiene su propio hilo.
+        self._lock = threading.RLock()
+        self._closed = False
+
+    def publish(self, state_dict: dict) -> None:
+        with self._lock:
+            if not self._closed:
+                self._write(state_dict)
+
+    def close_with_idle(self, lock_timeout_s: float = 1.0) -> None:
+        """Cierra la compuerta y escribe el idle final. Nunca propaga.
+
+        La espera del candado está acotada (como Ducker.emergency_restore): si
+        un hilo se quedó colgado a media escritura, con el proceso saliendo es
+        mejor escribir el idle sin el candado que no escribirlo.
+        """
+        self._closed = True
+        acquired = self._lock.acquire(timeout=lock_timeout_s)
+        try:
+            _write_idle_hud(self.path)
+        finally:
+            if acquired:
+                self._lock.release()
+
+
+# Compuerta viva (si la hay), para que el apagado por señal cierre las
+# publicaciones antes del idle final. Ver _graceful_exit.
+_ACTIVE_HUD_GATE: _HudGate | None = None
+
+
+def _final_idle_best_effort() -> None:
+    """Idle final desde el manejador de señal: por la compuerta si el loop ya
+    publica; si la señal llegó antes (cargando modelos), el idle a secas."""
+    gate = _ACTIVE_HUD_GATE
+    try:
+        if gate is not None:
+            gate.close_with_idle()
+        else:
+            _write_idle_hud()
+    except Exception:  # noqa: BLE001 — nunca propagar desde aquí
+        pass
+
+
+def _sweep_stale_tmp(directory: Path, older_than_s: float = _TMP_STALE_S) -> int:
+    """Borra los temporales huérfanos de la escritura atómica; devuelve cuántos.
+
+    os._exit a media publicación (entre mkstemp y os.replace) deja un
+    tmpXXXXXXXX.tmp en ~/.crotolamo que nadie limpiaba. Solo se tocan archivos
+    con el patrón de mkstemp(suffix=".tmp") y más viejos que `older_than_s`:
+    uno reciente puede ser una escritura en curso del panel (control.json usa
+    el mismo esquema). Best-effort: jamás lanza.
+    """
+    removed = 0
+    try:
+        limit = time.time() - older_than_s
+        for tmp in Path(directory).glob("tmp*.tmp"):
+            try:
+                if tmp.is_file() and tmp.stat().st_mtime < limit:
+                    tmp.unlink()
+                    removed += 1
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return removed
+
+
+def _start_control_watcher(
+    hud_state: SharedState,
+    control_path: Path,
+    poll_s: float = _CONTROL_POLL_S,
+) -> Callable[[], None]:
+    """Vigía del canal de control para el loop SIMPLE; devuelve su stop().
+
+    Ahí el hilo principal se queda BLOQUEADO esperando el wake (openWakeWord
+    con timeout None, o la ventana de Whisper del difuso) y no puede sondear
+    control.json: sin esto, hud_state.json seguía con enabled=true hasta el
+    siguiente wake y el switch "Escuchar por voz" del panel se revertía solo.
+    El vigía solo PUBLICA el flag; quien decide no escuchar es el loop.
+
+    Igual que VoiceLoop._poll_control: el JSON se relee solo si cambió el mtime,
+    y archivo ausente o ilegible => escucha activa (default-seguro).
+    """
+    stop = threading.Event()
+
+    def _watch() -> None:
+        last_mtime: float | None = None
+        while not stop.wait(poll_s):
+            try:
+                mtime = os.stat(control_path).st_mtime
+            except OSError:
+                last_mtime = None
+                hud_state.set_enabled(True)
+                continue
+            if mtime != last_mtime:
+                last_mtime = mtime
+                hud_state.set_enabled(read_control_enabled(control_path))
+
+    thread = threading.Thread(target=_watch, name="ControlWatch", daemon=True)
+    thread.start()
+
+    def _stop() -> None:
+        stop.set()
+        if thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+
+    return _stop
+
+
 # Ducker vivo (si lo hay), para que el apagado por señal devuelva la música a
 # su volumen: os._exit se salta los finally que la restaurarían. Ver _graceful_exit.
 _ACTIVE_DUCKER: Ducker | None = None
@@ -183,14 +323,18 @@ def _graceful_exit(signum, _frame) -> None:
     antes de salir, en vez de confiar en stop() o un finally exterior. Por la
     misma razón se restaura aquí la música atenuada (ducking): un Ctrl-C a media
     orden no debe dejar Spotify bajito.
+
+    El idle va AL FINAL, pegado a os._exit: los demás hilos siguen corriendo
+    mientras se restaura la música y se cierran los servers MCP, y lo que
+    publicaran en ese rato pisaba un idle escrito antes.
     """
     try:
         print("Crotolamo apagado, patrón.", flush=True)
     except Exception:  # noqa: BLE001
         pass
     _restore_media_best_effort()
-    _write_idle_hud()
     _terminate_mcp_best_effort()
+    _final_idle_best_effort()
     os._exit(0)
 
 
@@ -207,8 +351,22 @@ def _terminate_mcp_best_effort() -> None:
 
 
 def _install_signal_handlers() -> None:
-    """SIGINT (Ctrl-C) y SIGTERM (systemd stop) -> apagado limpio e inmediato."""
-    for sig in (signal.SIGINT, signal.SIGTERM):
+    """SIGINT (Ctrl-C), SIGTERM (systemd stop) y SIGHUP (cerrar la terminal)
+    -> apagado limpio e inmediato.
+
+    SIGHUP: el .desktop lanza `kitty --hold -e launch.sh` y cerrar esa ventana
+    manda SIGHUP; su acción por defecto mataba el proceso sin _graceful_exit
+    (Spotify bajito, HUD en "HABLANDO", servers MCP huérfanos en su propia
+    sesión). Salvo que llegue ignorada (`nohup`): eso es pedir sobrevivir al
+    cierre de la terminal, y no se pisa.
+    """
+    sigs = [signal.SIGINT, signal.SIGTERM]
+    try:
+        if signal.getsignal(signal.SIGHUP) is not signal.SIG_IGN:
+            sigs.append(signal.SIGHUP)
+    except (ValueError, OSError):
+        pass
+    for sig in sigs:
         try:
             signal.signal(sig, _graceful_exit)
         except (ValueError, OSError):
@@ -247,12 +405,50 @@ def _run_simple_loop(
                 rounds=cfg.endpoint_rounds, continue_timeout_s=cfg.endpoint_continue_s,
                 hotwords=cfg.hotwords, min_audio_s=0.3,
             )
+        # hotwords también aquí: sin endpointing inteligente la orden sigue
+        # siendo un COMANDO (post-wake) y lleva el mismo sesgo que en la rama
+        # smart y en el loop concurrente.
         return stt.listen_once(silence_ms=cfg.silence_ms, start_timeout_s=start_timeout_s,
-                               min_audio_s=0.3)
+                               hotwords=cfg.hotwords, min_audio_s=0.3)
 
+    def atender(command: str, on_token: Callable[[str], None] | None = None) -> tuple[str, bool]:
+        """agent.handle_turn que no propaga: devuelve (respuesta, reventó).
+
+        Como el BrainThread: un turno roto (un hook, la DB, la memoria; los
+        LLMError ya vuelven como respuesta) se DICE en personaje. Antes caía al
+        `except` de afuera, que solo imprimía "Error en el listener": el patrón
+        daba la orden y oía silencio, y se perdía la ventana de followup.
+        """
+        try:
+            if on_token is None:
+                return agent.handle_turn(command), False
+            return agent.handle_turn(command, on_token=on_token), False
+        except Exception as error:  # noqa: BLE001 - un turno roto no mata el loop
+            log.exception("el turno reventó: %s", error)
+            return _TURNO_ROTO, True
+
+    # El aviso de espera sale UNA vez por periodo de espera (como con
+    # openWakeWord, que bloquea hasta el wake). El difuso vuelve al tope del
+    # bucle tras cada ventana de 6 s sin activación, y reimprimirlo ahí eran
+    # dos líneas a stdout/journald cada 6 s de silencio. Se rearma con lo que
+    # cierra la espera: un wake, una pausa del panel o un error.
+    espera_anunciada = False
     while True:
         try:
-            print("\nEsperando palabra de activación...", flush=True)
+            # Escucha pausada desde el panel: se consulta el flag en CADA vuelta,
+            # antes de abrir el micrófono. Antes solo se miraba tras un wake: la
+            # pausa no se publicaba (el switch del panel se revertía solo) y el
+            # wake difuso seguía transcribiendo el ambiente con la escucha
+            # "pausada". En pausa no se escucha nada: se duerme y se vuelve a mirar.
+            enabled = read_control_enabled()
+            hud_state.set_enabled(enabled)
+            if not enabled:
+                espera_anunciada = False
+                time.sleep(_CONTROL_POLL_S)
+                continue
+            if not espera_anunciada:
+                print("\nEsperando palabra de activación...", flush=True)
+                espera_anunciada = True
             try:
                 if use_oww:
                     # Detector dedicado: bloquea hasta la activación; no transcribe,
@@ -291,11 +487,14 @@ def _run_simple_loop(
             except VoiceUnavailable as error:
                 print(str(error))
                 return 1
+            # Hubo wake: pase lo que pase después, la próxima espera se anuncia.
+            espera_anunciada = False
 
-            # Escucha pausada desde el panel: ignora este wake por completo (mismo
-            # efecto visible que en el loop concurrente: decir "crotolamo" no hace
-            # nada). El poll bloqueante del wake no se puede interrumpir, así que
-            # consultamos el flag AQUÍ, justo tras dispararse.
+            # Escucha pausada desde el panel MIENTRAS se esperaba el wake: ignora
+            # este wake por completo (mismo efecto visible que en el loop
+            # concurrente: decir "crotolamo" no hace nada). El poll bloqueante
+            # del wake no se puede interrumpir, así que el flag se vuelve a
+            # consultar AQUÍ, justo tras dispararse.
             if not read_control_enabled():
                 hud_state.set_enabled(False)
                 continue
@@ -314,6 +513,10 @@ def _run_simple_loop(
                 # no, acuse según config: "beep" suena SIN bloquear (la grabación
                 # abre de inmediato y el patrón puede hablar ya); "voz" es el
                 # clásico "Te escucho" (~1s de espera); "off" nada — solo el HUD.
+                # new_turn() ANTES de LISTENING, como el loop concurrente: limpia
+                # el texto (la respuesta anterior) que set_mode republicaba bajo
+                # "ESCUCHANDO" hasta transcribir la orden nueva.
+                hud_state.new_turn()
                 hud_state.set_mode(Mode.LISTENING)
                 if inline_cmd:
                     command = inline_cmd
@@ -340,26 +543,33 @@ def _run_simple_loop(
                     # stream_speak: habla cada frase EN CUANTO el LLM la cierra,
                     # en vez de esperar la respuesta completa (la primera palabra
                     # suena segundos antes). Fallback al camino clásico si el
-                    # streamer no llegó a hablar (p.ej. LLMError devuelto como
-                    # texto sin pasar por on_token).
+                    # streamer no llegó a hablar (una respuesta que no pasó por
+                    # on_token) o si el turno reventó (ver atender).
                     if cfg.stream_speak:
                         speaker = StreamSpeaker(
                             tts, on_first=lambda: hud_state.set_mode(Mode.SPEAKING)
                         )
                         try:
-                            reply = agent.handle_turn(command, on_token=speaker.feed)
+                            reply, roto = atender(command, on_token=speaker.feed)
+                            # La respuesta al HUD (y a la consola) en cuanto se
+                            # conoce, ANTES de finish(): este espera a que se
+                            # hable la cola entera, y publicarla después dejaba
+                            # la orden del patrón bajo "HABLANDO" y la respuesta
+                            # ya dicha.
+                            hud_state.set_text(reply)
+                            print(reply, flush=True)
                         finally:
                             spoke = speaker.finish()
-                        print(reply, flush=True)
-                        hud_state.set_text(reply)
-                        if not spoke and reply.strip():
+                        # roto: el aviso nunca pasó por el streamer; lo que este
+                        # haya dicho es la respuesta cortada, así que va aparte.
+                        if (roto or not spoke) and reply.strip():
                             hud_state.set_mode(Mode.SPEAKING)
                             try:
                                 tts.speak_sentences(reply)
                             except Exception as error:  # noqa: BLE001
                                 log.warning("voz falló: %s", error)
                     else:
-                        reply = agent.handle_turn(command)
+                        reply, _ = atender(command)
                         print(reply, flush=True)
                         hud_state.set_text(reply)
                         hud_state.set_mode(Mode.SPEAKING)
@@ -371,6 +581,9 @@ def _run_simple_loop(
 
                     if cfg.followup_s <= 0:
                         break
+                    # La ventana de followup es una orden nueva (sin wake): turno
+                    # nuevo y texto limpio, igual que tras un wake.
+                    hud_state.new_turn()
                     hud_state.set_mode(Mode.LISTENING)
                     print("(sigo escuchando...)", flush=True)
                     command = wake.strip_wake_word(
@@ -385,6 +598,7 @@ def _run_simple_loop(
             return 0
         except Exception as error:  # noqa: BLE001
             print(f"Error en el listener: {error}", flush=True)
+            espera_anunciada = False
             time.sleep(1)
         finally:
             # idle en TODAS las salidas del cuerpo (continue, fin de turno,
@@ -412,8 +626,54 @@ def make_deny_with_notice(say: Callable[[str], None]) -> Callable[[str], bool]:
     return deny_with_notice
 
 
+def _make_notice_say(
+    say: Callable[[str], None],
+    tts: Any,
+    get_state: Callable[[], SharedState | None],
+) -> Callable[[str], None]:
+    """say() del aviso de make_deny_with_notice en el loop CONCURRENTE (V9).
+
+    El aviso se dice desde el Cerebro, DENTRO de agent.handle_turn, y el modo
+    seguía en THINKING: el HUD decía "pensando" mientras sonaba y, con
+    --barge-in, el oído juzgaba el eco con las reglas de THINKING (sin gracia
+    ni margen de umbral), así que el eco del propio aviso lo cortaba y abría un
+    turno fantasma. Aquí suena en SPEAKING, como una frase de la Boca, y al
+    terminar se vuelve a THINKING: el LLM sigue con el turno.
+
+    Si el modo ya no es THINKING, un barge-in abrió otro turno (el patrón está
+    dictando la orden nueva) y lo del turno viejo se descarta, como su
+    respuesta: hablar encima metía el aviso en esa grabación. `get_state` da el
+    estado del VoiceLoop, que se arma DESPUÉS del agente; sin él, say() a secas.
+    """
+
+    def _say(text: str) -> None:
+        state = get_state()
+        if state is None:
+            say(text)
+            return
+        turn = state.turn_id
+        if not state.compare_and_set_mode(Mode.THINKING, Mode.SPEAKING):
+            log.info("aviso de un turno ya interrumpido, no lo digo: %s", text)
+            return
+        print(text, flush=True)
+        try:
+            # El corte va atado al turno: un stop() del barge-in que cae justo
+            # antes de que el TTS arranque no se pierde (V4).
+            tts.speak(text, should_abort=lambda: not state.is_current(turn))
+        except Exception as error:  # noqa: BLE001
+            log.warning("voz falló: %s", error)
+        finally:
+            # Solo si nadie cambió el modo mientras sonaba: el LISTENING de un
+            # barge-in no se pisa.
+            state.compare_and_set_mode(Mode.SPEAKING, Mode.THINKING)
+
+    return _say
+
+
 def run_listen(argv: list[str] | None = None) -> int:
     _install_signal_handlers()
+    # Temporales que dejó un apagado anterior a media publicación del HUD.
+    _sweep_stale_tmp(_HUD_STATE_PATH.parent)
     settings = get_settings()
     cfg = ListenerConfig.from_settings(settings)
     stt = STT.from_settings(settings)  # 'base' para el comando
@@ -488,7 +748,14 @@ def run_listen(argv: list[str] | None = None) -> int:
     def voice_confirm(reason: str) -> bool:
         say(reason + " Di 'confirmo' o 'cancela', patrón.")
         try:
-            answer = wake_stt.listen_once(silence_ms=cfg.wake_silence_ms, max_seconds=5)
+            # C5: la respuesta la transcribe el modelo de la ORDEN, no el 'tiny'
+            # del wake (solo para la palabra de activación): un mishear vale "no"
+            # (lo seguro) y el patrón tenía que repetir la orden entera. Mismas
+            # ventanas (respuesta de una palabra) y sin hotwords: no es un
+            # comando. min_audio_s: si nadie contestó, "" (un "no") sin pasar el
+            # silencio por Whisper.
+            answer = stt.listen_once(silence_ms=cfg.wake_silence_ms, max_seconds=5,
+                                     min_audio_s=0.3)
         except VoiceUnavailable:
             return False
         return wake.confirmation_from_answer(answer)
@@ -503,7 +770,13 @@ def run_listen(argv: list[str] | None = None) -> int:
     allow_barge_in = ("--barge-in" in argv) and ("--no-barge-in" not in argv)
     concurrente = not simple and use_oww
 
-    confirm_fn = make_deny_with_notice(say) if concurrente else voice_confirm
+    # El aviso concurrente suena con el modo del VoiceLoop (ver _make_notice_say),
+    # que todavía no existe: se engancha al crearlo, más abajo.
+    voice_loops: list[Any] = []
+    notice_say = _make_notice_say(
+        say, tts, lambda: voice_loops[0].state if voice_loops else None
+    )
+    confirm_fn = make_deny_with_notice(notice_say) if concurrente else voice_confirm
     try:
         agent, _ = build_agent(confirm_fn=confirm_fn)
     except Exception as error:  # noqa: BLE001
@@ -530,24 +803,32 @@ def run_listen(argv: list[str] | None = None) -> int:
 
     threading.Thread(target=_warm_llm, name="WarmLLM", daemon=True).start()
 
+    # HUD: los dos loops publican el estado en tiempo real al archivo canónico,
+    # por la compuerta que el apagado cierra antes del idle final (_HudGate).
+    global _ACTIVE_HUD_GATE
+    hud_gate = _HudGate(_HUD_STATE_PATH)
+    _ACTIVE_HUD_GATE = hud_gate  # para el apagado por señal (os._exit)
+
     if concurrente:
         from crotolamo.voice.loop import VoiceLoop
 
         modo_bi = "barge-in (auriculares)" if allow_barge_in else "half-duplex"
         say(f"Crotolamo escuchando, patrón. (concurrente, {modo_bi})")
-        # HUD: activar publicación de estado en tiempo real al archivo canónico.
-        hud_publisher = make_file_publisher(_HUD_STATE_PATH)
         try:
-            VoiceLoop(agent, stt, tts, wake_detector,
-                      allow_barge_in=allow_barge_in, silence_ms=cfg.silence_ms,
-                      hud_publisher=hud_publisher, control_path=CONTROL_PATH,
-                      ducker=ducker).run()
+            voice_loop = VoiceLoop(agent, stt, tts, wake_detector,
+                                   allow_barge_in=allow_barge_in, silence_ms=cfg.silence_ms,
+                                   hud_publisher=hud_gate.publish, control_path=CONTROL_PATH,
+                                   ducker=ducker)
+            voice_loops.append(voice_loop)
+            voice_loop.run()
         finally:
             # Escribir idle final al salir del loop (KeyboardInterrupt, stop(), etc.).
             # Si _graceful_exit llegó primero (os._exit), este bloque no ejecuta;
-            # _write_idle_hud() ya fue llamado desde el manejador de señal.
+            # el idle ya se escribió desde el manejador de señal. Por la
+            # compuerta: stop() hace join con timeout y un hilo rezagado (la Boca
+            # a media frase) todavía puede publicar después.
             media.stop()
-            _write_idle_hud()
+            hud_gate.close_with_idle()
         return 0
 
     modo = "openWakeWord" if use_oww else "wake difuso (Whisper)"
@@ -556,12 +837,15 @@ def run_listen(argv: list[str] | None = None) -> int:
     # HUD: el modo simple también publica el estado en tiempo real (el bucle
     # concurrente ya lo hacía). Reutilizamos SharedState para garantizar el MISMO
     # esquema JSON que el HUD espera.
-    hud_state = SharedState(publisher=make_file_publisher(_HUD_STATE_PATH))
+    hud_state = SharedState(publisher=hud_gate.publish)
     # Estado inicial de la escucha desde el canal de control (default: activa).
     hud_state.set_enabled(read_control_enabled())
     # Publicar SIEMPRE el estado inicial: pisa un hud_state.json rancio de un
     # proceso anterior que murió a medio turno (set_enabled solo publica si cambia).
     hud_state.publish_now()
+    # Mientras el loop está bloqueado esperando el wake, la pausa del panel la
+    # publica este vigía (ver _start_control_watcher).
+    stop_control_watch = _start_control_watcher(hud_state, CONTROL_PATH)
 
     try:
         return _run_simple_loop(
@@ -570,8 +854,9 @@ def run_listen(argv: list[str] | None = None) -> int:
             hud_state=hud_state, say=say, media=media, ducker=ducker,
         )
     finally:
+        stop_control_watch()
         media.stop()
-        _write_idle_hud()
+        hud_gate.close_with_idle()
 
 
 if __name__ == "__main__":
