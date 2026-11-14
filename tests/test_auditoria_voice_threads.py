@@ -134,8 +134,7 @@ def test_un_turno_del_loop_no_republica_estados_identicos():
     finally:
         vl.stop()
     assert publicado == [
-        ("idle", 1, ""),                 # wake: turno nuevo
-        ("listening", 1, ""),
+        ("listening", 1, ""),            # wake: turno nuevo y a escuchar, de una vez
         ("thinking", 1, ""),             # fin de la orden
         ("thinking", 1, "abre youtube"),  # frase reconocida
         ("thinking", 1, respuesta),      # respuesta que se va a hablar
@@ -679,7 +678,7 @@ def test_un_falso_wake_sin_voz_no_manda_audio_a_whisper():
     assert to_wav.llamadas == 0, "armó el audio de una captura sin voz"
     assert stt_q.empty(), "mandó a Whisper una captura sin ningún chunk con voz"
     assert state.get_mode() is Mode.IDLE
-    assert publicado == ["idle", "listening", "idle"]  # turno nuevo, escucha, reposo
+    assert publicado == ["listening", "idle"]  # turno nuevo y escucha (una), reposo
     # Cerrar la captura sigue limpiando la RNN del VAD, como al cerrar una orden.
     assert vad.eventos[-1] == "reset", vad.eventos
 

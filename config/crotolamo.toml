@@ -381,13 +381,26 @@ wake_max_seconds = 8.0
 # --- Wake con música sonando ---
 # Con Spotify/YouTube sonando, Whisper transcribe letras y de vez en cuando algo
 # suena a "crotolamo" (falsos despertares); y ya despierto, la música tapa la
-# orden. Un hilo sondea playerctl (MPRIS) en segundo plano y cachea si hay algún
+# orden. Un hilo vigila playerctl (MPRIS) en segundo plano y cachea si hay algún
 # reproductor en Playing: con música el wake exige un umbral más alto y, al
 # activarse, la música se atenúa hasta que Crotolamo termina de responder (se
 # restaura al volumen EXACTO que tenía). La voz propia (Piper) nunca cuenta como
 # música. Sin playerctl instalado, todo esto es un no-op.
+# media_watch: cómo se entera de que cambió lo que suena.
+#   "follow" = un solo `playerctl --follow` vivo avisa de cada cambio: lo que
+#              empieza a sonar se ve en milisegundos. Sin música, solo un
+#              playerctl de seguridad cada 5 min (~12 por hora; con "poll", uno
+#              cada media_poll_s: 2.400 por hora). Mientras suena música, uno
+#              cada media_poll_s, igual que "poll" (los avisos no suman más), y
+#              la música que para se ve con él. Si playerctl --follow no
+#              arranca o se muere, vuelve solo al sondeo de abajo y lo
+#              reintenta; un playerctl que no responde se repite cada
+#              media_poll_s hasta que responda.
+#   "poll"   = el sondeo de antes, tal cual (un playerctl cada media_poll_s).
+#              Ponlo si el seguidor se porta raro con tus reproductores.
 wake_threshold_media = 0.85   # umbral del wake difuso mientras algo suena (playerctl en Playing); sin música se usa [wake].threshold
-media_poll_s = 1.5            # cada cuánto se sondea en segundo plano si hay música (caché; el oído nunca espera)
+media_watch = "follow"        # "follow" (eventos de playerctl --follow) | "poll" (el sondeo de antes)
+media_poll_s = 1.5            # cadencia del sondeo (con "poll", o mientras --follow no está); con "follow", la consulta mientras suena música y el tope de una por evento (caché; el oído nunca espera)
 wake_duck = true              # atenuar la música al activarse y restaurarla al terminar
 wake_duck_volume = 0.2        # fracción del volumen actual mientras Crotolamo escucha y responde
 
@@ -464,6 +477,11 @@ timeout_s = 20
 # Presupuesto para arrancar cada server (lanzar + handshake + lista de tools).
 # Si no llega, se avisa en el log y se salta: un server caído NUNCA impide que
 # Crotolamo arranque. Súbelo si un server tarda (p.ej. npx descargando).
+# Con varios servers, arrancan A LA VEZ (el arranque espera al más lento, no a
+# la suma): el presupuesto de cada uno corre mientras los demás también
+# arrancan y comparten CPU y red (varios npx descargando a la vez, el
+# calentamiento de la voz). Si alguno se salta por tiempo solo cuando arranca
+# junto a los demás, súbelo.
 startup_timeout_s = 15
 # Cuándo pedir confirmación antes de ejecutar una tool MCP:
 #   "destructive" = pregunta salvo que el server declare la tool como de solo

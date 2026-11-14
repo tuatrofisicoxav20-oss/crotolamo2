@@ -26,6 +26,20 @@ from crotolamo.voice.tts import split_sentences
 log = get_logger("voice.loop")
 
 END = object()  # sentinel: fin de la respuesta de un turno
+STOP = object()  # sentinel: apagado (lo mete en cada cola el Wakeable de VoiceLoop)
+
+
+def _get_timeout(shutdown) -> float | None:
+    """Timeout de la espera en cola de Mouth/Brain/Stt.
+
+    Con el apagado de VoiceLoop (notify.Wakeable) la cola se espera SIN
+    timeout: set() mete un STOP en ella y el hilo sale al instante. Antes la
+    espera expiraba cada 0.2 s solo para releer el flag (900 despertares por
+    minuto entre los tres, en reposo). Con un threading.Event normal (hilos
+    armados sueltos, como en los tests) nadie mete el STOP: se conserva el
+    sondeo y su contrato de salir en menos de 2 s.
+    """
+    return None if getattr(shutdown, "wakes_waiters", False) else 0.2
 
 
 @dataclass
@@ -46,11 +60,14 @@ class MouthThread(threading.Thread):
         self.shutdown = shutdown
 
     def run(self) -> None:
+        timeout = _get_timeout(self.shutdown)
         while not self.shutdown.is_set():
             try:
-                item = self.q.get(timeout=0.2)
+                item = self.q.get(timeout=timeout)
             except queue.Empty:
                 continue
+            if item is STOP:
+                return
             if item is END:
                 # Terminó la respuesta de un turno; si nadie habló nuevo, a IDLE.
                 # Comprobar y cambiar de una vez (V5): mirar SPEAKING y luego
@@ -92,11 +109,15 @@ class BrainThread(threading.Thread):
         self.shutdown = shutdown
 
     def run(self) -> None:
+        timeout = _get_timeout(self.shutdown)
         while not self.shutdown.is_set():
             try:
-                command, turn = self.cmd_q.get(timeout=0.2)
+                item = self.cmd_q.get(timeout=timeout)
             except queue.Empty:
                 continue
+            if item is STOP:
+                return
+            command, turn = item
             # El turno ya cambió (barge-in mientras esperaba en cola): ignora.
             # Turno y THINKING de una vez (V5): un barge-in entre los dos
             # quedaba pisado y el loop se quedaba en "pensando" para siempre.
@@ -144,11 +165,15 @@ class SttThread(threading.Thread):
         self.hotwords = hotwords
 
     def run(self) -> None:
+        timeout = _get_timeout(self.shutdown)
         while not self.shutdown.is_set():
             try:
-                audio, turn = self.in_q.get(timeout=0.2)
+                item = self.in_q.get(timeout=timeout)
             except queue.Empty:
                 continue
+            if item is STOP:
+                return
+            audio, turn = item
             # `audio` puede ser un ndarray EN MEMORIA (camino caliente, sin
             # disco) o un Path a WAV (compat/tests). El WAV se borra pase lo
             # que pase: si el turno se abortó (barge-in) entre el encolado y
@@ -185,12 +210,21 @@ class SttThread(threading.Thread):
 
 
 def _drain_queue(q: queue.Queue) -> None:
-    """Saca todo de la cola sin bloquear."""
+    """Saca todo de la cola sin bloquear.
+
+    El STOP del apagado NO se tira: si un barge-in que coincide con el apagado
+    lo tirara, la Boca, que espera sin timeout, se quedaría bloqueada para
+    siempre en una cola ya vacía.
+    """
+    stop = False
     try:
         while True:
-            q.get_nowait()
+            if q.get_nowait() is STOP:
+                stop = True
     except queue.Empty:
         pass
+    if stop:
+        q.put(STOP)
 
 
 class EarThread(threading.Thread):
@@ -375,8 +409,8 @@ class EarThread(threading.Thread):
             if time.monotonic() < self._idle_grace_until:
                 return
             if self.wake_fn(chunk):
-                self._turn = self.state.new_turn()
-                self.state.set_mode(Mode.LISTENING)
+                # Turno nuevo y a escuchar: UNA publicación (ver new_turn).
+                self._turn = self.state.new_turn(mode=Mode.LISTENING)
                 self._start_command(preroll=[chunk])
 
         elif mode is Mode.LISTENING:
@@ -411,8 +445,8 @@ class EarThread(threading.Thread):
             if self.allow_barge_in and self._is_patron_voice(chunk, mode):
                 self.tts.stop()            # corta el audio YA
                 _drain_queue(self.tts_q)   # tira las frases viejas
-                self._turn = self.state.new_turn()  # invalida turnos viejos
-                self.state.set_mode(Mode.LISTENING)
+                # Invalida los turnos viejos y pasa a escuchar: UNA publicación.
+                self._turn = self.state.new_turn(mode=Mode.LISTENING)
                 # La racha del VAD ya es voz del patrón y el arranque de su orden:
                 # va ENTERA (antes solo su último chunk y la primera sílaba, los
                 # barge_in_min_chunks - 1 chunks previos, se perdía).

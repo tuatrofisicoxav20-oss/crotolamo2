@@ -218,16 +218,24 @@ class SharedState:
         with self._lock:
             return self._turn_id
 
-    def new_turn(self) -> int:
+    def new_turn(self, mode: Mode | None = None) -> int:
         """Arranca un turno nuevo (wake o barge-in). Devuelve el id nuevo.
 
         El texto visible se limpia: es de la interacción anterior (la última
         respuesta hablada) y el HUD lo pintaba bajo "ESCUCHANDO" hasta que el
         STT publicaba la frase nueva.
+
+        ``mode``: el modo del turno nuevo, cambiado bajo el MISMO lock. Un wake
+        es una sola transición (turno nuevo, a escuchar) y se publica UNA vez;
+        new_turn() y luego set_mode(LISTENING) eran dos escrituras de
+        hud_state.json (y dos despertares del HUD), la primera con un "idle" de
+        un turno que ya no estaba en reposo.
         """
         with self._lock:
             self._turn_id += 1
             self._text = ""
+            if mode is not None:
+                self._mode = mode
             _turn = self._turn_id
         # Publicar FUERA del lock
         self._publish()

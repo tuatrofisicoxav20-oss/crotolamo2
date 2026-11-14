@@ -51,7 +51,7 @@ log = get_logger("listener")
 _HUD_STATE_PATH = HUD_STATE_PATH
 
 # Cadencia del sondeo del canal de control (panel -> loop) en el modo simple:
-# la misma del loop concurrente (VoiceLoop.run espera 0.3s entre sondeos).
+# la misma del loop concurrente cuando no tiene inotify (loop._CONTROL_POLL_S).
 _CONTROL_POLL_S = 0.3
 
 # Edad mínima para barrer un temporal de la escritura atómica (ver
@@ -90,6 +90,7 @@ class ListenerConfig:
     # Wake con música sonando (ver crotolamo/voice/media_aware.py).
     threshold_media: float = 0.85
     media_poll_s: float = 1.5
+    media_watch: str = "follow"  # "follow" (eventos) | "poll" (el sondeo de antes)
     duck: bool = True
     duck_volume: float = 0.2
 
@@ -102,11 +103,13 @@ class ListenerConfig:
             variants=settings.wake.get("variants"),
             # Con música en Playing el wake difuso exige más (la música mete
             # falsos despertares) y el reproductor se atenúa mientras dura la
-            # interacción. media_poll_s: cadencia del sondeo en segundo plano.
+            # interacción. media_poll_s: cadencia del sondeo de respaldo;
+            # media_watch: eventos de playerctl --follow o el sondeo de antes.
             threshold_media=sane_media_threshold(
                 threshold, voice.get("wake_threshold_media", 0.85), "[voice].wake_threshold_media",
             ) or threshold,
             media_poll_s=voice.get("media_poll_s", 1.5),
+            media_watch=voice.get("media_watch", "follow"),
             duck=voice.get("wake_duck", True),
             duck_volume=voice.get("wake_duck_volume", 0.2),
             wake_silence_ms=voice.get("wake_silence_ms", 400),
@@ -296,6 +299,9 @@ def _start_control_watcher(
 # Ducker vivo (si lo hay), para que el apagado por señal devuelva la música a
 # su volumen: os._exit se salta los finally que la restaurarían. Ver _graceful_exit.
 _ACTIVE_DUCKER: Ducker | None = None
+# MediaMonitor vivo: su `playerctl --follow` es un hijo de larga vida que
+# os._exit no cerraría. Ver _graceful_exit.
+_ACTIVE_MEDIA: MediaMonitor | None = None
 
 
 def _restore_media_best_effort() -> None:
@@ -337,6 +343,11 @@ def _graceful_exit(signum, _frame) -> None:
         print("Crotolamo apagado, patrón.", flush=True)
     except Exception:  # noqa: BLE001
         pass
+    # El seguidor de playerctl PRIMERO (no espera a nadie): con systemctl stop
+    # muere a la vez que nosotros, y el monitor tiene que saberse parado antes
+    # de que reponer la música (hasta segundos con D-Bus colgado) lo haga pasar
+    # por una caída del seguidor (WARNING falso y un playerctl más al salir).
+    _terminate_media_follower_best_effort()
     _restore_media_best_effort()
     _terminate_mcp_best_effort()
     _flush_memoria_best_effort()
@@ -378,6 +389,18 @@ def _terminate_mcp_best_effort() -> None:
         from crotolamo.mcp import bridge
 
         bridge.terminate_all()
+    except Exception:  # noqa: BLE001 — nunca propagar desde aquí
+        pass
+
+
+def _terminate_media_follower_best_effort() -> None:
+    """SIGTERM al `playerctl --follow` del MediaMonitor (lo mismo que a los
+    servers MCP): os._exit se salta el stop() que lo terminaría."""
+    media = _ACTIVE_MEDIA
+    if media is None:
+        return
+    try:
+        media.terminate_children()
     except Exception:  # noqa: BLE001 — nunca propagar desde aquí
         pass
 
@@ -579,11 +602,11 @@ def _run_simple_loop(
                 # no, acuse según config: "beep" suena SIN bloquear (la grabación
                 # abre de inmediato y el patrón puede hablar ya); "voz" es el
                 # clásico "Te escucho" (~1s de espera); "off" nada — solo el HUD.
-                # new_turn() ANTES de LISTENING, como el loop concurrente: limpia
-                # el texto (la respuesta anterior) que set_mode republicaba bajo
-                # "ESCUCHANDO" hasta transcribir la orden nueva.
-                hud_state.new_turn()
-                hud_state.set_mode(Mode.LISTENING)
+                # Turno nuevo Y a escuchar en una publicación, como el loop
+                # concurrente: limpia el texto (la respuesta anterior) que
+                # set_mode republicaba bajo "ESCUCHANDO" hasta transcribir la
+                # orden nueva.
+                hud_state.new_turn(mode=Mode.LISTENING)
                 if inline_cmd:
                     command = inline_cmd
                 else:
@@ -651,8 +674,7 @@ def _run_simple_loop(
                         break
                     # La ventana de followup es una orden nueva (sin wake): turno
                     # nuevo y texto limpio, igual que tras un wake.
-                    hud_state.new_turn()
-                    hud_state.set_mode(Mode.LISTENING)
+                    hud_state.new_turn(mode=Mode.LISTENING)
                     print("(sigo escuchando...)", flush=True)
                     command = wake.strip_wake_word(
                         listen_command(start_timeout_s=cfg.followup_s)
@@ -800,16 +822,18 @@ def run_listen(argv: list[str] | None = None) -> int:
     # loops: un sondeo en segundo plano dice si algo suena (umbral de wake más
     # alto, en el difuso y en openWakeWord) y el ducker atenúa el reproductor
     # mientras Crotolamo escucha y responde. Sin playerctl, todo es no-op.
-    global _ACTIVE_DUCKER
+    global _ACTIVE_DUCKER, _ACTIVE_MEDIA
     media_backends: list[MediaBackend] = [PlayerctlBackend()]
     media = MediaMonitor(media_backends, poll_s=cfg.media_poll_s,
                          threshold_normal=cfg.threshold,
-                         threshold_media=cfg.threshold_media)
+                         threshold_media=cfg.threshold_media,
+                         watch=cfg.media_watch)
     ducker = Ducker(media_backends, factor=cfg.duck_volume, enabled=cfg.duck)
     _ACTIVE_DUCKER = ducker  # para el apagado por señal (os._exit)
+    _ACTIVE_MEDIA = media
     wake_detector.attach_media(media)
-    # El sondeo (un playerctl cada media_poll_s, para siempre) solo tiene
-    # sentido si alguna de las dos defensas está activa; si no, ni se arranca
+    # El monitor (un playerctl --follow vivo, o un playerctl cada media_poll_s)
+    # solo tiene sentido si alguna de las dos defensas está activa; si no, ni se arranca
     # (is_playing() queda en False y todo sigue como sin música).
     oww_media = wake_detector.threshold_media
     media_util = (
@@ -865,6 +889,7 @@ def run_listen(argv: list[str] | None = None) -> int:
         agent, _ = build_agent(confirm_fn=confirm_fn)
     except Exception as error:  # noqa: BLE001
         print(f"No pude armar el agente, patrón: {error}")
+        media.stop()  # sin dejar vivo su playerctl --follow
         return 1
 
     # Calentar el LLM en segundo plano: el PRIMER comando arranca llama en frío

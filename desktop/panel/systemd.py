@@ -11,6 +11,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable
+from typing import Any
 
 log = logging.getLogger("crotolamo.desktop.panel.systemd")
 
@@ -97,6 +98,20 @@ def _do_async(*args: str,
             on_done(res)
 
     threading.Thread(target=worker, daemon=True, name="panel-systemctl").start()
+
+
+def spawn_reaped(args: list[str], **kwargs: Any) -> subprocess.Popen:
+    """Popen de un proceso que vive por su cuenta + un hilo que lo espera.
+
+    Nadie más hace wait() de lo que el panel lanza suelto (la terminal con el
+    `journalctl -f`): al cerrarlo quedaba <defunct> hasta que otro subprocess del
+    panel disparaba la limpieza interna de subprocess, y con la ventana oculta
+    no hay tick que lo haga. El OSError de Popen (terminal ausente) se propaga
+    tal cual, antes de arrancar ningún hilo.
+    """
+    proc = subprocess.Popen(args, **kwargs)
+    threading.Thread(target=proc.wait, daemon=True, name="panel-reap").start()
+    return proc
 
 
 def _uptime_text(st: dict[str, str], now_us: int | None = None) -> str:

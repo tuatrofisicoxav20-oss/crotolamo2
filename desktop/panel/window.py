@@ -1,8 +1,9 @@
 """Ventana del panel de control (GTK3 + Adwaita).
 
 Rendimiento: query_state() (subprocess systemctl, hasta 8 s de timeout) corre
-en un hilo daemon y entrega el resultado con GLib.idle_add — el hilo GTK nunca
-se bloquea; igual las acciones (systemd._do_async) y el journalctl de respaldo.
+en UN hilo daemon de vida larga, dormido entre consultas, y entrega el resultado
+con GLib.idle_add — el hilo GTK nunca se bloquea; las acciones
+(systemd._do_async) y el journalctl de respaldo, en un hilo por clic.
 El tick periódico vive entre las señales map/unmap (ocultar o destruir la
 ventana lo para; minimizarla NO, GTK3 no desmapea al minimizar) y un tick con el
 mismo estado no repinta nada.
@@ -39,6 +40,7 @@ from .systemd import (  # noqa: E402
     _uptime_text,
     query_state,
     run,
+    spawn_reaped,
 )
 from .terminal import _find_terminal  # noqa: E402
 
@@ -47,9 +49,10 @@ log = logging.getLogger("crotolamo.desktop.panel")
 POLL_MS = 1500
 
 # Lo que el patrón acaba de pedir con un switch se sostiene hasta que el estado
-# publicado lo confirme o pasen HOLD_S segundos. El loop sondea control.json
-# cada ~0.3 s (y `systemctl enable` también tarda): un tick, o una consulta ya
-# en vuelo, que caía antes repintaba el valor viejo y el switch rebotaba ~1.5 s.
+# publicado lo confirme o pasen HOLD_S segundos. El loop ve control.json por
+# inotify (cada ~0.3 s sin él o en --simple) y `systemctl enable` tarda: un
+# tick, o una consulta ya en vuelo, que caía antes repintaba el valor viejo y el
+# switch rebotaba ~1.5 s.
 # Pasado el plazo manda lo publicado: el switch nunca miente por mucho tiempo.
 HOLD_S = 3.0
 
@@ -151,6 +154,12 @@ class Panel(Gtk.ApplicationWindow):
         # icono y Button.set_label rehace su etiqueta hija; todo pide relayout).
         self._visual: tuple[str, str] | None = None
         self._big_look: tuple[str, str] | None = None
+        # Un solo hilo de consulta para toda la vida de la ventana: refresh() lo
+        # despierta con _wake (antes, un hilo nuevo por tick: 40 por minuto con
+        # la ventana abierta). Nace en el primer refresh; destroy lo para.
+        self._wake = threading.Event()
+        self._worker: threading.Thread | None = None
+        self._closing = False
 
         # --- barra de titulo minimalista (nativa GNOME) ---
         header = Gtk.HeaderBar(title="Crotolamo")
@@ -262,6 +271,7 @@ class Panel(Gtk.ApplicationWindow):
         # consulta systemctl (minimizar no desmapea en GTK3: ahí sigue).
         self.connect("map", self._on_map)
         self.connect("unmap", self._on_unmap)
+        self.connect("destroy", self._on_destroy)
         self.show_all()
 
     # --- ciclo de refresco (hilo de trabajo + idle_add) -------------------------
@@ -282,15 +292,47 @@ class Panel(Gtk.ApplicationWindow):
         return True  # seguir llamando
 
     def refresh(self) -> None:
-        """Dispara una consulta de estado en un hilo; no bloquea el hilo GTK."""
-        if self._query_inflight:
+        """Pide una consulta de estado al hilo de trabajo; no bloquea el hilo GTK.
+
+        Como antes, un refresco que cae con la consulta anterior aún en vuelo
+        se descarta: las mismas consultas, sin un hilo nuevo por cada una.
+        """
+        if self._query_inflight or self._closing:
             return
         self._query_inflight = True
-        threading.Thread(target=self._query_worker, daemon=True).start()
+        if self._worker is None:
+            self._worker = threading.Thread(target=self._query_worker, daemon=True,
+                                            name="panel-query")
+            self._worker.start()
+        self._wake.set()
 
     def _query_worker(self) -> None:
-        st = query_state()
-        GLib.idle_add(self._on_state_ready, st)
+        """Hilo de consulta: duerme en _wake (sin reloj) hasta el próximo refresh."""
+        while True:
+            self._wake.wait()
+            self._wake.clear()
+            if self._closing:
+                return
+            try:
+                st = query_state()
+            except Exception as exc:  # noqa: BLE001 — el hilo no puede morir
+                # Antes la excepción mataba el hilo con _query_inflight en True y
+                # el panel no volvía a refrescar. Se pinta como lo que es (no se
+                # pudo preguntar a systemd), igual que un systemctl que revienta.
+                log.exception("No pude consultar el estado del servicio: %s", exc)
+                st = {QUERY_ERROR: str(exc) or type(exc).__name__}
+            if self._closing:
+                return  # ventana destruida mientras consultaba: nada que pintar
+            GLib.idle_add(self._on_state_ready, st)
+
+    def _on_destroy(self, *_a) -> None:
+        """Ventana destruida: el hilo de consulta termina en cuanto lo ve.
+
+        Sin join: el hilo GTK nunca espera a systemctl (la única espera larga
+        del hilo es la de run(), acotada a 8 s) y es daemon.
+        """
+        self._closing = True
+        self._wake.set()
 
     def _on_state_ready(self, st: dict[str, str]) -> bool:
         self._query_inflight = False
@@ -315,6 +357,20 @@ class Panel(Gtk.ApplicationWindow):
         self.big.set_label(label)
 
     @staticmethod
+    def _set_switch(switch: Gtk.Switch, active: bool) -> None:
+        """set_active solo si cambia, comparando con el switch DE VERDAD (como
+        _set_text): lo que movió un clic se corrige igual en el siguiente tick."""
+        if switch.get_active() != active:
+            switch.set_active(active)
+
+    @staticmethod
+    def _set_sensitive(widget: Gtk.Widget, sensitive: bool) -> None:
+        """set_sensitive solo si cambia; contra el widget, no contra una caché:
+        los clics apagan el botón grande por su cuenta."""
+        if widget.get_sensitive() != sensitive:
+            widget.set_sensitive(sensitive)
+
+    @staticmethod
     def _set_text(label: Gtk.Label, text: str) -> None:
         """set_label solo si cambia: en GTK3 cada set_label rehace el layout.
 
@@ -336,7 +392,7 @@ class Panel(Gtk.ApplicationWindow):
             # sin respuesta de systemd no se adivina «no arranca con la sesión»
             shown, self._autostart_hold = _resolve_hold(self._autostart_hold,
                                                         unit_state == "enabled")
-            self.autostart.set_active(shown)
+            self._set_switch(self.autostart, shown)
         # reflejar el modo guardado en el env file (lectura cacheada por mtime)
         cur_key = KEY_BY_ARGS.get(read_mode_args(), "half")
         if self.mode.get_active_id() != cur_key:
@@ -346,10 +402,10 @@ class Panel(Gtk.ApplicationWindow):
         # Salvo un clic recién hecho que el loop aún no recogió (HOLD_S).
         shown, self._listen_hold = _resolve_hold(self._listen_hold,
                                                  read_listening_enabled())
-        self.listen_sw.set_active(shown)
+        self._set_switch(self.listen_sw, shown)
         self._syncing = False
         # Pausar la escucha solo tiene sentido con el servicio corriendo.
-        self.listen_sw.set_sensitive(active == "active")
+        self._set_sensitive(self.listen_sw, active == "active")
 
         if query_error is not None:
             # systemctl no contestó (sin bus de usuario, timeout): NO es «Apagado»
@@ -393,7 +449,7 @@ class Panel(Gtk.ApplicationWindow):
                 self._action_error = None  # el servicio cambió: el aviso ya no aplica
         self._set_text(self.status, status)
         self._set_text(self.sub, subtitle)
-        self.big.set_sensitive(big_ok)
+        self._set_sensitive(self.big, big_ok)
 
     # --- acciones -------------------------------------------------------------
     def _systemctl(self, *args: str) -> None:
@@ -483,7 +539,7 @@ class Panel(Gtk.ApplicationWindow):
         term = _find_terminal()
         if term:
             try:
-                subprocess.Popen(term + cmd)
+                spawn_reaped(term + cmd)  # con quien la espere: cerrarla no deja zombi
                 return
             except Exception as exc:  # noqa: BLE001
                 log.warning("No se pudo abrir la terminal %s: %s", term, exc)
