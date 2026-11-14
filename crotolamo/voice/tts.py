@@ -63,6 +63,8 @@ _PALABRA_ANTES = re.compile(r"([a-záéíóúüñ]+(?:\.[a-záéíóúüñ]+)*)\
 # línea no cierra frase (si no, "uno." se hablaría como frase suelta). Se
 # compara contra la línea actual entera (fullmatch).
 _MARCADOR_LISTA = re.compile(r"[ \t]*\d{1,2}\.")
+# Marcador de bloque de código markdown: entre dos, nada corta frase (ver _split).
+_CERCA = "```"
 
 
 def _inicio_palabra(text: str, fin: int) -> int:
@@ -109,18 +111,52 @@ def _split(text: str, *, final: bool) -> tuple[list[str], str]:
 
     Con final=False (streaming) un '.' seguido solo de espacios al final del
     buffer se queda en el resto: sin ver el siguiente carácter no se puede
-    distinguir un fin de frase de un decimal/abreviatura a medias.
+    distinguir un fin de frase de un decimal/abreviatura a medias. Por lo
+    mismo, dentro de un bloque ``` aún abierto no se corta: puede cerrarse.
     """
     pieces: list[str] = []
     start = 0
+    # Cercas ``` vistas antes del candidato: con un número impar está DENTRO de
+    # un bloque de código y no corta. Así el bloque llega ENTERO a speak() y
+    # limpiar_para_voz lo descarta completo; partido (cada línea en blanco,
+    # sangría o '.\n' del código cortaba) cada trozo solo traía una cerca
+    # suelta y el código se leía en voz alta. Se cuenta por tramos: lineal.
+    cercas = visto = 0
+    # Con final=True el texto ya no crece: una última cerca que nunca cierra (el
+    # LLM no la cerró, o se cayó dentro del bloque) no abre ningún bloque y
+    # desde ella se corta como siempre. Si no, todo lo que la sigue sonaba de
+    # UNA pieza: el aviso del LLM caído pegado al código, y una "frase" de
+    # minutos que el plazo por frase de StreamSpeaker.finish() cortaba.
+    tope = len(text)
+    if final and text.count(_CERCA) % 2:
+        tope = text.rfind(_CERCA)  # antes de ella hay un número par de cercas
     for m in _CANDIDATO.finditer(text):
         if m.end() >= len(text) and not final and text[m.start() - 1] == ".":
             break  # falta contexto: esperar más tokens
+        # Un candidato no empieza ni sigue a un acento grave: ninguna racha ```
+        # queda partida entre dos tramos (el tope sí cae en una: es el último).
+        hasta = min(m.start(), tope)
+        cercas += text.count(_CERCA, visto, hasta)
+        visto = hasta
+        if cercas % 2:
+            continue  # dentro de un bloque de código
         if not _cierra_frase(text, m.start(), m.end()):
             continue
         pieces.append(text[start:m.start()])
         start = m.end()
     return [p.strip() for p in pieces if p.strip()], text[start:]
+
+
+def _fin_cerca_abierta(text: str) -> int | None:
+    """Dónde acaba la cerca ``` que deja abierto un bloque en `text`, o None si
+    sus cercas van en pares. Cuenta como _split (str.count: de izquierda a
+    derecha y sin solapar), así que la paridad es la misma que allí."""
+    abierta: int | None = None
+    i = text.find(_CERCA)
+    while i >= 0:
+        abierta = None if abierta is not None else i + len(_CERCA)
+        i = text.find(_CERCA, i + len(_CERCA))
+    return abierta
 
 
 def split_sentences(text: str) -> list[str]:
@@ -137,7 +173,9 @@ class SentenceFeeder:
     La usan StreamSpeaker (loop simple) y el BrainThread del loop concurrente
     ([voice].stream_speak_concurrent); antes cada uno iba a tener la suya. Misma
     regla que split_sentences (_split): un '.' al final del buffer se retiene
-    hasta ver el siguiente carácter (¿decimal? ¿abreviatura?). `emit` recibe
+    hasta ver el siguiente carácter (¿decimal? ¿abreviatura?), y un bloque de
+    código ``` hasta su cerca de cierre (o hasta flush). Como solo se corta
+    fuera de un bloque, el buffer siempre empieza fuera de uno. `emit` recibe
     cada frase cerrada y `fed` cuenta las emitidas.
     """
 
@@ -145,21 +183,48 @@ class SentenceFeeder:
         self._emit = emit
         self._buffer = ""
         self.fed = 0
+        # Con un bloque ``` abierto en el buffer: desde dónde buscar su cerca de
+        # cierre (None: fuera de bloque).
+        self._cierre_desde: int | None = None
 
     def feed(self, token: str) -> None:
         self._buffer += token
+        if self._cierre_desde is not None:
+            # Dentro del bloque nada corta hasta su cierre (y lo de antes de la
+            # cerca ya se decidió: no cortaba), así que solo se busca la cerca en
+            # lo nuevo. Re-segmentar el buffer entero en cada token era
+            # cuadrático: 2 s de CPU para un bloque de 19 KB en trozos de 4.
+            if self._buffer.find(_CERCA, self._cierre_desde) < 0:
+                # Las 2 últimas posiciones aún pueden empezar una cerca partida.
+                self._cierre_desde = max(self._cierre_desde,
+                                         len(self._buffer) - len(_CERCA) + 1)
+                return
         pieces, self._buffer = _split(self._buffer, final=False)
+        self._cierre_desde = _fin_cerca_abierta(self._buffer)
         for piece in pieces:
             self.fed += 1
             self._emit(piece)
 
     def flush(self) -> None:
-        """Fin de la respuesta: lo que quedó sin cerrar frase va como frase."""
-        tail = self._buffer.strip()
+        """Fin de la respuesta: lo que quedó sin cerrar frase va como frase.
+
+        Lo retenido tras una cerca ``` que nunca cerró (el LLM no la cerró o se
+        cayó dentro del bloque) sale aquí, como la cola de siempre, pero en sus
+        frases de siempre (_split con final=True): el aviso del LLM caído queda
+        en frase aparte y no pegado al código. Sin esa cerca, igual que antes.
+        """
+        pieces: list[str] = []
+        tail = self._buffer
         self._buffer = ""
+        if self._cierre_desde is not None:
+            self._cierre_desde = None
+            pieces, tail = _split(tail, final=True)
+        tail = tail.strip()
         if tail:
+            pieces.append(tail)
+        for piece in pieces:
             self.fed += 1
-            self._emit(tail)
+            self._emit(piece)
 
 
 class _AvisoEnFraseAparte:

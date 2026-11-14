@@ -18,9 +18,7 @@
    código sonaba ("import json", "with open..."). El arreglo vive en
    crotolamo/voice/tts.py (_split no corta con un número impar de cercas
    antes del candidato) y crotolamo/core/streaming.py (la sonda incremental
-   de "sentence" lleva la misma paridad): fuera de esta unidad. Hasta que
-   aterrice, estos tests son xfail ESTRICTOS: al arreglarse pasan a XPASS y
-   fallan, y quien lo arregle quita la marca.
+   de "sentence" lleva la misma paridad): fuera de esta unidad.
 """
 
 from __future__ import annotations
@@ -123,10 +121,6 @@ _RESPUESTAS_CON_CODIGO = {
 # Palabras que solo están DENTRO de los bloques: ninguna debe sonar.
 _CODIGO = ("import", "json", "datos", "print", "return", "suma", "sudo", "dnf", "Instala",
            "Lee el archivo")
-_PENDIENTE_TTS = pytest.mark.xfail(
-    strict=True,
-    reason="arreglo en crotolamo/voice/tts.py::_split y core/streaming.py (otra unidad)",
-)
 
 
 @pytest.fixture
@@ -157,7 +151,6 @@ def test_de_una_pieza_el_bloque_ya_se_descartaba(respuesta, tts_que_anota):
     assert not [w for w in _CODIGO if w in hablado[0]], hablado
 
 
-@_PENDIENTE_TTS
 @pytest.mark.parametrize("respuesta", _RESPUESTAS_CON_CODIGO.values(),
                          ids=_RESPUESTAS_CON_CODIGO.keys())
 def test_speak_sentences_no_lee_el_codigo(respuesta, tts_que_anota):
@@ -166,7 +159,6 @@ def test_speak_sentences_no_lee_el_codigo(respuesta, tts_que_anota):
     _sin_codigo(hablado, respuesta)
 
 
-@_PENDIENTE_TTS
 @pytest.mark.parametrize("respuesta", _RESPUESTAS_CON_CODIGO.values(),
                          ids=_RESPUESTAS_CON_CODIGO.keys())
 def test_split_sentences_mas_speak_no_lee_el_codigo(respuesta, tts_que_anota):
@@ -177,7 +169,6 @@ def test_split_sentences_mas_speak_no_lee_el_codigo(respuesta, tts_que_anota):
     _sin_codigo(hablado, respuesta)
 
 
-@_PENDIENTE_TTS
 @pytest.mark.parametrize("respuesta", _RESPUESTAS_CON_CODIGO.values(),
                          ids=_RESPUESTAS_CON_CODIGO.keys())
 @pytest.mark.parametrize("paso", [1, 3, 7])

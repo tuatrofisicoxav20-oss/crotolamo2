@@ -170,6 +170,10 @@ class LiveStreamer:
         self._scan = 0
         self._cut = 0
         self._closed = False
+        # Cercas ``` contadas hasta `_fenced_to` (la paridad de `_split`: dentro
+        # de un bloque de código ningún candidato cierra frase).
+        self._fences = 0
+        self._fenced_to = 0
 
     def _probe(self, chunk: str) -> str:
         """La regla de "sentence" sobre lo acumulado: "json" (pinta a tool-call:
@@ -203,17 +207,22 @@ class LiveStreamer:
         acumulado en cada token era cuadrático (0,4 s de CPU para una lista
         numerada de 9 KB, en cada turno con tools a la vista). Un candidato
         seguido ya de algo que no es espacio está decidido para siempre:
-        `_cierra_frase` solo mira hacia atrás y un carácter adelante. Así cada
-        token solo escanea lo nuevo y la cola aún indecisa.
+        `_cierra_frase` solo mira hacia atrás y un carácter adelante, y la
+        paridad de cercas ``` (dentro de un bloque de código no se corta) solo
+        hacia atrás. Así cada token solo escanea lo nuevo y la cola aún indecisa.
         """
         # Perezoso: core no carga el paquete de voz al importarse.
         from crotolamo.voice import tts
 
         head, end = self._head, len(self._head)
         closed, cut = self._closed, self._cut
+        fences, fenced_to = self._fences, self._fenced_to
         floor = None
         for m in tts._CANDIDATO.finditer(head, self._scan):
             start, stop = m.span()
+            # Por tramos, como `_split`: un candidato nunca parte una racha ```.
+            fences += head.count(tts._CERCA, fenced_to, start)
+            fenced_to = start
             if stop >= end:
                 # Toca el final: puede alargarse con más espacio y, si es un
                 # punto, sin ver lo que sigue no se sabe si cierra (_split
@@ -221,12 +230,13 @@ class LiveStreamer:
                 floor = start
                 if head[start - 1] == ".":
                     break
-            if tts._cierra_frase(head, start, stop):
+            if fences % 2 == 0 and tts._cierra_frase(head, start, stop):
                 # `_split` descarta las piezas en blanco, pero la 1ª nunca lo
                 # está (`head` empieza sin espacio): cerrar una ya es "cerró".
                 closed, cut = True, stop
             if floor is None:
                 self._scan, self._closed, self._cut = stop, closed, cut
+                self._fences, self._fenced_to = fences, fenced_to
         if floor is None:
             # Sin candidato indeciso, uno nuevo solo puede empezar en la racha
             # final de énfasis ("Listo.**" espera su espacio).

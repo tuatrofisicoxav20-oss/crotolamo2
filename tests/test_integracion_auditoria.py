@@ -927,3 +927,176 @@ def test_reanotar_con_otra_categoria_la_sigue_cambiando(tmp_path):
     facts.remember("mi perro se llama Tletl", db_path=dbp)
     assert _hechos(dbp)[-1] == ("mi perro se llama Tletl", "familia")
     assert len(_hechos(dbp)) == 3
+
+
+# --- idx 0 (final-u30v): un bloque de código no se lee línea a línea ----------------
+# La segmentación (split_sentences, SentenceFeeder y la sonda de "sentence" de
+# LiveStreamer) no corta dentro de un bloque ```: llega ENTERO a limpiar_para_voz, que
+# lo descarta (los tests de la unidad están en test_revision_final_u30v.py). Aquí: la
+# cota de una cerca que nunca cierra, la sonda y el coste en streaming.
+
+# Una cerca sin cerrar no abre bloque: lo que la sigue se corta como siempre (las
+# frases esperadas son las de antes del arreglo, iguales). `antes_del_flush` es lo
+# que el streaming ya soltó cuando llega la cerca: el resto sale en flush.
+_SIN_CERRAR = {
+    "corte dentro del codigo": (
+        "Así se lee:\n```python\nimport json\n\ndatos = json.load(f)\nprint(datos)",
+        ["Así se lee:\n```python\nimport json", "datos = json.load(f)\nprint(datos)"], 0),
+    "prosa tras la cerca": (
+        "Prueba esto.\n\n```bash\nsudo dnf install x\n\nY luego reinicia. Listo.",
+        ["Prueba esto.", "```bash\nsudo dnf install x", "Y luego reinicia.", "Listo."], 1),
+}
+
+
+@pytest.mark.parametrize("paso", [1, 3, 7])
+@pytest.mark.parametrize("texto,esperado,antes_del_flush", _SIN_CERRAR.values(),
+                         ids=_SIN_CERRAR.keys())
+def test_una_cerca_que_nunca_cierra_se_corta_como_antes(texto, esperado, antes_del_flush,
+                                                       paso):
+    """Antes de la cota, todo lo que seguía a la cerca era UNA pieza: el aviso del
+    LLM caído pegado al código y una frase de minutos que el plazo por frase de
+    StreamSpeaker.finish() cortaba. Sale en flush (no más tarde que la cola de
+    siempre) y en sus frases de siempre."""
+    from crotolamo.voice.tts import SentenceFeeder, split_sentences
+
+    assert split_sentences(texto) == esperado
+    frases: list[str] = []
+    feeder = SentenceFeeder(frases.append)
+    for i in range(0, len(texto), paso):
+        feeder.feed(texto[i:i + paso])
+    assert frases == esperado[:antes_del_flush]
+    feeder.flush()
+    assert frases == esperado
+    assert feeder.fed == len(esperado)
+
+
+def test_el_aviso_del_llm_caido_dentro_de_un_bloque_va_en_frase_aparte(monkeypatch):
+    """El LLM se cae con el bloque ``` abierto: el aviso no sale pegado al código."""
+    llm = _LlmQueSeCaeAMedias(["Así se lee:\n```python\nimport json\n\n", "datos = json.load(f)"],
+                              "GLM no respondió a tiempo, patrón. (timed out)")
+    dicho = _hablar_un_turno(monkeypatch, _agente_real(llm))
+    assert dicho == ["Así se lee:\n```python\nimport json", "datos = json.load(f)",
+                     "GLM no respondió a tiempo, patrón.", "(timed out)"]
+
+
+def test_la_sonda_de_sentence_no_cierra_frase_dentro_del_codigo():
+    """release="sentence" suelta cuando la 1ª frase cerró y le sigue texto: la
+    sangría de un bloque no es fin de frase (en lo que se habla tampoco). Antes
+    soltaba en la 'p' de 'print'; ahora, tras el bloque, en la 'L' de 'Listo'."""
+    from crotolamo.core.streaming import LiveStreamer
+
+    texto = "Así:\n```python\nfor x in lista:\n    print(x)\n```\n\nListo. Ya quedó."
+    dichos: list[str] = []
+    s = LiveStreamer(dichos.append, hold_until_done=True, release="sentence")
+    soltado = [i for i, c in enumerate(texto) if s.feed(c)]
+    assert texto[:soltado[0] + 1].endswith("```\n\nL"), texto[:soltado[0] + 1]
+    assert "".join(dichos) == texto
+
+
+def test_el_feeder_no_resegmenta_un_bloque_largo_en_cada_token(monkeypatch):
+    """Retener el bloque hasta su cierre no puede volver cuadrático el streaming:
+    re-segmentar el buffer entero en cada token costaba 2 s de CPU por un bloque
+    de 19 KB en trozos de 4 caracteres. Cada carácter se escanea pocas veces."""
+    from crotolamo.voice import tts
+
+    codigo = "".join(f"def f{i}(x):\n    # Paso {i}.\n    return x + {i}\n\n"
+                     for i in range(300))
+    texto = "Así queda:\n\n```python\n" + codigo + "```\n\nListo, patrón."
+    escaneado: list[int] = []
+    original = tts._split
+
+    def contado(text, *, final):
+        escaneado.append(len(text))
+        return original(text, final=final)
+
+    monkeypatch.setattr(tts, "_split", contado)
+    frases: list[str] = []
+    feeder = tts.SentenceFeeder(frases.append)
+    for i in range(0, len(texto), 4):
+        feeder.feed(texto[i:i + 4])
+    feeder.flush()
+    assert frases == ["Así queda:", "```python\n" + codigo + "```", "Listo, patrón."]
+    assert sum(escaneado) <= 3 * len(texto), sum(escaneado)
+
+
+_PIEZAS_CON_CERCAS = ["```", "```python\n", "``", "`", "````", "Hola", "x", "Dr", "12", ".",
+                      ". ", "!", "?", "\n", "\n\n", "    ", " ", "**", "1."]
+
+
+def _feeder_de_referencia(trozos: list[str]) -> list[str]:
+    """SentenceFeeder sin atajos: el buffer entero por `_split` en cada trozo."""
+    from crotolamo.voice import tts
+
+    buffer, frases = "", []
+    for trozo in trozos:
+        buffer += trozo
+        piezas, buffer = tts._split(buffer, final=False)
+        frases += piezas
+    if buffer.count(tts._CERCA) % 2:
+        piezas, buffer = tts._split(buffer, final=True)
+        frases += piezas
+    if buffer.strip():
+        frases.append(buffer.strip())
+    return frases
+
+
+def test_el_feeder_que_espera_la_cerca_corta_igual_que_resegmentar_todo():
+    """Esperar el cierre del bloque buscando la cerca solo en lo nuevo es una
+    optimización pura: mismas frases que re-segmentar todo en cada trozo,
+    también con cercas partidas entre trozos y rachas de 4 acentos graves."""
+    import random
+
+    from crotolamo.voice import tts
+
+    rnd = random.Random(20261114)
+    for _ in range(3000):
+        texto = "".join(rnd.choice(_PIEZAS_CON_CERCAS) for _ in range(rnd.randint(0, 30)))
+        trozos, i = [], 0
+        while i < len(texto):
+            n = rnd.randint(1, 6)
+            trozos.append(texto[i:i + n])
+            i += n
+        frases: list[str] = []
+        feeder = tts.SentenceFeeder(frases.append)
+        for trozo in trozos:
+            feeder.feed(trozo)
+        feeder.flush()
+        assert frases == _feeder_de_referencia(trozos), trozos
+
+
+# --- idx 1 (final-u50): smoke_voz no arranca la pre-síntesis -------------------------
+
+def test_smoke_circular_no_arranca_el_hilo_de_presintesis(monkeypatch, tmp_path):
+    """Con [voice].tts_presynth = true circular() solo usa available() y
+    synthesize_pcm(), que sintetiza directo con Piper: el hilo TtsPresintesis
+    (que arrancan prepare() y speak()) no llega a existir y no hay nada que
+    cerrar. Si el smoke llegara a hablar, necesitaría un dueño (close())."""
+    import numpy as np
+
+    from crotolamo.voice.tts import TTS
+    from scripts import smoke_voz
+
+    class _Chunk:
+        audio_int16_array = np.full(2205, 1000, dtype=np.int16)
+        sample_rate = 22050
+
+    class _Voz:
+        def synthesize(self, text):
+            return [_Chunk()]
+
+    class _Stt:
+        def transcribe(self, audio, hotwords=None):
+            return "crotolamo prueba uno dos tres"
+
+    modelo = tmp_path / "voz.onnx"
+    modelo.write_bytes(b"onnx de mentira")
+    tts = TTS(modelo, presynth=True)
+    tts._voice = _Voz()
+    monkeypatch.setattr(smoke_voz, "get_settings", lambda: object())
+    monkeypatch.setattr(smoke_voz, "TTS", SimpleNamespace(from_settings=lambda s: tts))
+    monkeypatch.setattr(smoke_voz, "STT", SimpleNamespace(from_settings=lambda s: _Stt()))
+    # Solo los hilos nuevos: otro test pudo dejar el suyo (daemon) vivo.
+    antes = set(threading.enumerate())
+    assert smoke_voz.circular() == 0
+    assert tts._presint_hilo is None
+    assert [t.name for t in set(threading.enumerate()) - antes] == []
