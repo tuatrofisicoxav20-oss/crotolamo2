@@ -39,12 +39,19 @@ apagarlo** sin tocar la terminal. Se integra en Fedora como una app más del men
 
 El instalador:
 1. Hace **backup** y apaga el servicio viejo de Crotolamo 1 (`crotolamo-listener.service`).
-2. Instala `crotolamo.service` apuntando a **este** repo y su `.venv`.
+2. Instala `crotolamo.service` (la escucha) y `crotolamo-hud.service` (el overlay
+   que aparece al convocarlo) con la ruta real de **este** repo y su `.venv`, lo
+   hayas clonado donde lo hayas clonado. Si ya había uno distinto (editado a mano),
+   lo guarda antes como `*.bak-FECHA`.
 3. Copia el icono y el lanzador (`Crotolamo` aparece en el menú de apps).
-4. Lo habilita para iniciar con la sesión.
+4. Los habilita para iniciar con la sesión (el HUD arranca con la sesión gráfica;
+   `--start` enciende la escucha y solo reinicia el HUD si ya corría).
 
 Requisitos: Ollama corriendo, el `.venv` con la extra `[voice]`, y los modelos de
-voz en `voices/` (lo normal del proyecto).
+voz en `voices/` (lo normal del proyecto). Si el repo no está en
+`~/Documentos/crotolamo2`, apunta `[paths].voces` a su `voices/` en
+`config/crotolamo.local.toml`. Para cambiar algo de un servicio sin que el
+instalador lo pise: `systemctl --user edit crotolamo.service`.
 
 ## Uso
 
@@ -56,8 +63,8 @@ voz en `voices/` (lo normal del proyecto).
 ## Desinstalar
 
 ```bash
-systemctl --user disable --now crotolamo.service
-rm ~/.config/systemd/user/crotolamo.service
+systemctl --user disable --now crotolamo.service crotolamo-hud.service
+rm ~/.config/systemd/user/crotolamo.service ~/.config/systemd/user/crotolamo-hud.service
 rm ~/.local/share/applications/crotolamo.desktop
 rm ~/.local/share/icons/hicolor/scalable/apps/crotolamo.svg
 systemctl --user daemon-reload

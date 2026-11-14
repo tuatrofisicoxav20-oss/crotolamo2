@@ -6,7 +6,11 @@ After=default.target pipewire.service wireplumber.service
 Wants=pipewire.service
 
 [Service]
-Type=simple
+# exec, no simple: con simple systemd da el servicio por arrancado al hacer fork,
+# y un ExecStart que no existe (repo movido, .venv borrado) dejaba `systemctl
+# start` en 0. Con exec espera al execve y el arranque falla de verdad.
+Type=exec
+# install.sh cambia esta ruta (y la de ExecStart) por la real del repo.
 WorkingDirectory=%h/Documentos/crotolamo2
 # El modo de escucha (half-duplex / barge-in / simple) lo escribe la ventana de
 # control en este archivo como CROTOLAMO_LISTEN_ARGS. El guion inicial lo hace

@@ -33,6 +33,14 @@ fi
 
 run() { echo "→ $PY -m crotolamo $*"; echo; "$PY" -m crotolamo "$@"; }
 
+# En el menú, una opción que sale con != 0 (el doctor con un REQUERIDO en rojo, el
+# listener sin voz, el smoke fallido) no puede tumbar el launcher: con `set -e` el
+# script moría ahí, justo cuando hace falta probar la siguiente opción. Se avisa
+# del código y se vuelve al menú. El modo directo (`./launch.sh doctor`) sí lo
+# propaga. Ojo: nada de `set +e` en el bucle; un `read` en EOF (Ctrl-D) tiene que
+# seguir cerrando el menú en vez de repintarlo sin fin.
+menu() { "$@" || echo "(salió con código $?)"; }
+
 case "${1:-}" in
     version) run --version ;;
     doctor)  run doctor ;;
@@ -56,13 +64,13 @@ case "${1:-}" in
             read -rp "Opción > " opt
             echo
             case "$opt" in
-                1) run doctor ;;
-                2) run shell --stream ;;
-                3) run listen --no-barge-in ;;
-                4) run listen --barge-in ;;
-                5) run listen --simple ;;
-                6) "$PY" scripts/smoke_voz.py ;;
-                7) run --version ;;
+                1) menu run doctor ;;
+                2) menu run shell --stream ;;
+                3) menu run listen --no-barge-in ;;
+                4) menu run listen --barge-in ;;
+                5) menu run listen --simple ;;
+                6) menu "$PY" scripts/smoke_voz.py ;;
+                7) menu run --version ;;
                 0|q|salir) echo "Hasta luego, patrón."; exit 0 ;;
                 *) echo "Opción no válida." ;;
             esac

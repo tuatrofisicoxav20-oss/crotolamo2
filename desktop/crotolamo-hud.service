@@ -8,7 +8,8 @@ PartOf=graphical-session.target
 [Service]
 Type=simple
 Environment=PYTHONUNBUFFERED=1
-# python3 del SISTEMA (trae gi/Gtk3), NO el venv del proyecto.
+# python3 del SISTEMA (trae gi/Gtk3), NO el venv del proyecto. install.sh cambia
+# la ruta del repo por la real.
 ExecStart=/usr/bin/python3 %h/Documentos/crotolamo2/desktop/crotolamo_hud.py
 # Si arranca antes de que el compositor esté listo, reintenta.
 Restart=on-failure
