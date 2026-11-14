@@ -17,7 +17,10 @@ MouthThread             → habla solo el turno vigente (descarta lo viejo)
 ```
 
 - `crotolamo/voice/state.py` — `SharedState`, `Mode`, `turn_id`.
-- `crotolamo/voice/loop.py` — los 4 threads + `VoiceLoop` (orquestador).
+- `crotolamo/voice/threads.py` — los 4 threads (`EarThread`, `SttThread`,
+  `BrainThread`, `MouthThread`) y la `Utterance` que viaja por `tts_queue`.
+- `crotolamo/voice/loop.py` — `VoiceLoop` (orquestador: arma las colas y los 4
+  threads y los apaga limpio).
 - `crotolamo/voice/tts.py` — `TTS.stop()` + reproducción interrumpible por frase.
 
 ## Uso
@@ -49,9 +52,17 @@ Sin AEC real, el barge-in con altavoces se mitiga con 3 capas (configurables en
 `[voice]`): ventana de gracia (`barge_in_grace_ms`), umbral elevado en SPEAKING
 (`barge_in_threshold_margin`) y persistencia (`barge_in_min_chunks`).
 
+El AEC real ya está en el repo, a nivel de PipeWire (módulo WebRTC):
+`desktop/aec.sh on` instala `desktop/pipewire-aec.conf` y crea el source limpio
+`crotolamo_aec_source`; Crotolamo lo abre con `[voice].input_device` sin cambiar el
+micrófono por defecto. La salida sí cuenta: `crotolamo_aec_sink` debe ser el sink por
+defecto (es la referencia que se resta). El doctor lo exige (`[doctor].aec_source` /
+`aec_sink`). Ver `docs/MEJORAS_VOZ.md` §1.1.
+
 ## Pendiente (futuro)
 
-- AEC real (webrtc-audio-processing / speexdsp) para barge-in fiable con altavoces.
+- Validar el barge-in con altavoces sobre el AEC de PipeWire (`--barge-in` con
+  `desktop/aec.sh on`); hasta entonces, auriculares o `--no-barge-in`.
 - Cancelar el LLM en vuelo (hoy la inferencia vieja termina en background y solo se
   descarta su salida por turno; el audio sí para al instante).
 - Entrenar un modelo de wake word propio "crotolamo" (hoy se usa un puente de

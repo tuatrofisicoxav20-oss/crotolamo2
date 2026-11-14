@@ -31,6 +31,16 @@ allowed_roots = [
 # nada delicado a la mala.
 confirm_roots = ["~"]
 
+# Dónde caen las rutas RELATIVAS que el modelo pasa a las tools de archivo
+# ("crea la carpeta pruebas", read_file("notas.txt")). Sin definir (de fábrica)
+# se resuelven contra el directorio desde el que se lanzó Crotolamo: con el
+# .service y launch.sh es el checkout del repo, que está en la zona libre.
+# Con "~" caen siempre en tu home, se lance desde donde se lance; ojo: el home
+# es zona de confirmación, así que cada ruta relativa pedirá permiso (y en el
+# loop concurrente, donde no se confirma por voz, esas tools no correrán).
+# Solo rutas absolutas o que empiecen por ~.
+# relative_base = "~"
+
 # Personalidad del asistente: "desmadrosa" (buen pedo, echador de relajo,
 # expresiones mexicanas; el desmadre nunca estorba la tarea) o "clasica"
 # (directo y sarcástico, el tono original). extra = texto libre opcional que
@@ -138,9 +148,14 @@ max_tools = 8
 # "15m" = no recarga durante la sesión y libera RAM tras 15 min ocioso. Sube a "1h"
 # o "-1" (siempre residente) si te sobra RAM; baja si la lap va justa de memoria.
 keep_alive = "15m"
-# Ventana de contexto que Ollama reserva. Con el tool routing los prompts son
-# cortos; 2048 sobra y en CPU reduce memoria/trabajo del KV-cache. Súbelo si
-# activas [memory].compaction con historiales largos.
+# Ventana de contexto que Ollama reserva (tokens). Más chica = menos RAM y menos
+# trabajo del KV-cache en CPU, pero va justa: medido con el tokenizer de qwen2.5,
+# un turno con 8 tools enrutadas ya parte de ~1600-1750 tokens fijos (persona +
+# schemas), y con 2048 quedan ~300-450 para historial, pregunta y respuesta. Lo que
+# no cabe, Ollama lo recorta EN SILENCIO (descarta los mensajes más viejos): en modo
+# local pierde el hilo de la charla y no ve completo un archivo o página largos.
+# Súbelo (p.ej. 4096, a costa de RAM) si te pasa eso o si activas
+# [memory].compaction con historiales largos.
 num_ctx = 2048
 # Fast-path SIN LLM (misión velocidad): comandos inequívocos ("pausa la
 # música", "qué apps tengo abiertas", "abre opera") ejecutan la tool directo
@@ -246,8 +261,9 @@ sample_rate        = 16000
 # Micrófono que abre Crotolamo. Comentado = el default del sistema (comportamiento
 # histórico). Tras activar la cancelación de eco (`desktop/aec.sh on`), apúntalo al
 # source limpio: así SOLO Crotolamo usa el AEC y no cambias el default global (que
-# afectaría a Discord, el navegador, etc.). El AEC es lo que permite, más adelante,
-# volver a `use_oww = true` sin que el asistente se autodispare con su propia voz.
+# afectaría a Discord, el navegador, etc.). El AEC es lo que permite usar openWakeWord
+# (`[wake].use_oww = true`) con altavoces sin que el asistente se autodispare con su
+# propia voz.
 # input_device = "crotolamo_aec_source"
 # VAD (M2, de GLaDOS): 'silero' (neuronal) o 'energy' (fallback sin modelo).
 vad_backend          = "silero"
@@ -350,7 +366,9 @@ target    = "crotolamo"
 threshold = 0.72
 # QUÉ WAKE (y qué loop) corre. true = openWakeWord + loop CONCURRENTE (Ear/Stt/
 # Brain/Mouth, barge-in); false = wake DIFUSO con Whisper + loop SIMPLE
-# (secuencial). Si openwakeword no está instalado se cae solo al difuso. OJO:
+# (secuencial). Si openwakeword no está instalado se cae solo al difuso. Con true
+# se despierta con la frase del modelo de oww_model ("hey jarvis" con el puente de
+# abajo), NO con "crotolamo" (ese nombre solo lo busca el difuso). OJO:
 # varias claves de [voice] solo aplican al modo simple: ack, stream_speak,
 # smart_endpoint/endpoint_*, followup_s, wake_silence_ms/wake_max_seconds.
 use_oww = true

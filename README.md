@@ -31,7 +31,9 @@ Se elige con `[llm].backend` en la config: `"glm"` o `"ollama"`.
 **Por qué existe la opción:** en una laptop sin GPU dedicada, inferir en CPU es lo
 que hace lenta la máquina. `glm-4.7-flash` es gratuito y saca la inferencia del
 equipo. Todo el andamiaje de velocidad (`tool_routing`, `fastpath`, `direct_tools`)
-se construyó para sobrevivir al CPU; con GLM sigue ayudando, pero deja de ser vital.
+se construyó para sobrevivir al CPU y solo actúa con el motor local: con GLM de
+cerebro se apaga (GLM ve todas las tools y redacta cada respuesta). Si la nube cae y
+responde el respaldo de Ollama, vuelve solo el `tool_routing`.
 
 Para usar GLM necesitas una API key (gratis en <https://z.ai>). **Nunca se guarda en
 el TOML** (que va a git): va en el entorno.
@@ -48,9 +50,9 @@ chmod 600 ~/.config/crotolamo/env
 
 **Sin `export`**: systemd (`EnvironmentFile=`) no lo entiende y el servicio caería a
 Ollama en silencio. `launch.sh` exporta lo que lee, así que funciona también con el
-`.desktop` (doble clic), donde `~/.zshrc` **no** se carga: `Exec=kitty -e launch.sh`
-no es un shell interactivo. Si además quieres la key en tus terminales, añade a
-`~/.zshrc`:
+`.desktop` (doble clic), donde `~/.zshrc` **no** se carga:
+`Exec=kitty --hold -e …/launch.sh` no es un shell interactivo. Si además quieres la
+key en tus terminales, añade a `~/.zshrc`:
 
 ```bash
 [ -f ~/.config/crotolamo/env ] && set -a && source ~/.config/crotolamo/env && set +a
@@ -160,7 +162,13 @@ por git) con solo las claves que quieras cambiar.
 - [x] **Domótica + cámaras** — tools de Home Assistant (`light_control`, `home_state`) y Frigate (`camera_events`, `camera_snapshot`), REST con urllib puro; probadas con tests que parchean la red (sin HA/Frigate reales). **Falta validar contra el hardware real**: rellenar `[home.lights]` y `[cameras.names]` en la config y exportar `CROTOLAMO_HASS_TOKEN`.
 
 ### Notas de voz (honestas)
-- El **wake word** usa Whisper `tiny` (barato) y el **comando** usa `base`; ambos en CPU.
+- El **wake word** depende de `[wake].use_oww`. De fábrica (`true`, y la extra `[voice]`
+  instala openwakeword) corre **openWakeWord con el modelo puente `hey_jarvis`**: se
+  despierta diciendo «hey jarvis», no «crotolamo», y arranca el loop concurrente
+  (README_M3.md). Con `use_oww = false` en `config/crotolamo.local.toml` (o sin
+  openwakeword) el wake es **difuso**: Whisper `tiny` (barato) busca «crotolamo» y sus
+  `[wake].variants`, en el loop simple; es el validado con micrófono
+  (`docs/VALIDACION_MIC_CROTOLAMO.md`). El **comando** usa `base`; todo en CPU.
 - La **latencia depende del CPU**: en un i5 sin GPU, el smoke (TTS+STT de una frase) ronda
   los ~12 s en frío (incluye carga de modelos); en caliente baja. Con GPU sería fluido.
 - La reproducción usa `sounddevice` (no ffplay). Requiere `portaudio` en el sistema.

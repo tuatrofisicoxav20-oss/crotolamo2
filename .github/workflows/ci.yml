@@ -8,6 +8,10 @@ on:
 jobs:
   lint-type-test:
     runs-on: ubuntu-latest
+    # El job dura ~2 min (instalar + lint + tipos + tests). Sin tope, un test con
+    # hilos que se cuelgue retiene el runner las 6 h del límite de GitHub y el
+    # aviso llega horas tarde. 20 min dan unas diez veces de margen.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -43,7 +47,9 @@ jobs:
         run: ruff check .
 
       - name: Mypy (tipos)
-        run: mypy crotolamo interfaces
+        # scripts/ (el doctor) y desktop/ (HUD y panel) también se ejecutan en la
+        # lap: sin chequearlos, un error de tipos ahí llegaba sin aviso.
+        run: mypy crotolamo interfaces scripts desktop
 
       - name: Pytest
         run: pytest -q
