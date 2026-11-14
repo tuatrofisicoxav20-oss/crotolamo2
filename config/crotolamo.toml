@@ -283,6 +283,15 @@ whisper_model      = "base"
 # Modelo barato solo para detectar la palabra de activación (wake).
 wake_whisper_model = "tiny"
 piper_voice        = "es_MX-ald-medium.onnx"
+# Memoria de Piper (el arena de ONNX Runtime). Antes se quedaba, mientras viviera el
+# servicio, con el pico de la frase más larga que hubiera dicho (~+410 MB tras una de
+# 23 s). Las frases de hasta este número de phoneme ids (~115 caracteres, ~8 s de
+# audio) conservan el arena como siempre: misma velocidad. Las más largas devuelven su
+# pico al terminar, a cambio de sintetizarse algo más lento (~+14 %: 70-90 ms más en
+# una de 230 caracteres, que suena ~15 s). El audio es idéntico. 0 = devolverlo tras
+# CADA frase (~100-130 MB menos en reposo, pero +10-25 % de síntesis en todas); un
+# número enorme (100000) = no devolverlo nunca, como antes.
+piper_arena_keep_phonemes = 256
 # Hoy solo vale 16000: Whisper, Silero y openWakeWord trabajan a 16 kHz y el audio
 # capturado NO se remuestrea (PipeWire ya entrega 16 kHz de cualquier micrófono). Con
 # otro valor las órdenes salen vacías o mal transcritas.

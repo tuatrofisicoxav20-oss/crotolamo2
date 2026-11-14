@@ -9,6 +9,10 @@ DECISIONES, y por qué:
 - **Un server caído NUNCA impide arrancar.** Cada server se lanza bajo un
   presupuesto (`startup_timeout_s` cubre handshake + tools/list); si falla, se
   avisa por log y se salta. Crotolamo con menos tools es mejor que Crotolamo mudo.
+  Los handshakes de varios servers corren A LA VEZ (el arranque cuesta el más
+  lento, no la suma); lanzarlos y registrar sus tools sigue en el hilo del
+  llamador y en el orden de la config, así los nombres no dependen de quién
+  contesta antes.
 
 - **Soft-errors en personaje, no excepciones.** Un timeout o un fallo del server
   vuelven al LLM como texto ("El server MCP 'x' tardó..."), con un prefijo que
@@ -35,10 +39,13 @@ DECISIONES, y por qué:
 from __future__ import annotations
 
 import atexit
+import itertools
 import os
 import re
+import signal
 import threading
 import time
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -362,9 +369,17 @@ class _ServerState:
 _STATE: dict[str, _ServerState] = {}
 _STATE_LOCK = threading.RLock()
 # Clientes lanzados que aún no están en _STATE (handshake + tools/list, hasta
-# startup_timeout_s cada uno). Sin esto, un SIGTERM/Ctrl+C del arranque (npx
-# descargando...) no los veía terminate_all()/close_all(): huérfanos.
+# startup_timeout_s cada uno, y con varios servers la espera a su turno de
+# registro). Sin esto, un SIGTERM/Ctrl+C del arranque (npx descargando...) no
+# los veía terminate_all()/close_all(): huérfanos.
 _STARTING: set[StdioMCPClient] = set()
+# Clientes con su Popen en curso. Una señal atendida justo tras el fork corre
+# con el proceso ya creado y el cliente sin su pid: terminate_now() no lo
+# alcanza y lo busca _kill_unspawned, por la marca de entorno de su lanzamiento
+# ("<pid de Crotolamo>.<n>", una distinta cada vez).
+_SPAWNING: set[StdioMCPClient] = set()
+_MARCA_ENV = "CROTOLAMO_MCP_LANZAMIENTO"
+_LANZAMIENTOS = itertools.count(1)
 _ATEXIT_REGISTERED = False
 
 
@@ -536,28 +551,234 @@ def _remaining(deadline: float) -> float:
     return max(0.05, deadline - time.monotonic())
 
 
-def _connect(registry: Registry, server: MCPServerConfig) -> list[str]:
-    """Lanza un server, hace el handshake y registra sus tools. Nunca lanza
-    (salvo Ctrl+C/SystemExit, que se propagan tras cerrar el server)."""
+def _abandon(client: StdioMCPClient) -> None:
+    """Cierra un cliente que no llegó a registrarse y lo quita de _STARTING
+    (después de cerrarlo: hasta entonces terminate_all() debe seguir viéndolo)."""
+    try:
+        client.close()
+    finally:
+        with _STATE_LOCK:
+            _STARTING.discard(client)
+
+
+def _abandon_all(clients: list[StdioMCPClient]) -> None:
+    """_abandon de varios clientes A LA VEZ, esperando a todos. Cada close() de
+    un server que ignora el EOF tarda segundos (espera, SIGTERM, SIGKILL): uno
+    tras otro, un Ctrl+C con N handshakes en vuelo esperaba N cierres. La espera
+    está acotada porque close() lo está (~6 s el peor caso)."""
+
+    def cerrar(client: StdioMCPClient) -> None:
+        try:
+            _abandon(client)
+        except Exception as error:  # noqa: BLE001 — en su propio hilo: que quede en el log
+            log.warning("MCP '%s': no pude cerrarlo (%s)", client.name, error)
+
+    hilos: list[threading.Thread] = []
+    sin_hilo: list[StdioMCPClient] = []
+    for c in clients:
+        hilo = threading.Thread(target=cerrar, args=(c,), name=f"mcp-{c.name}-cierre", daemon=True)
+        try:
+            hilo.start()
+        except Exception as error:  # noqa: BLE001 — p.ej. "can't start new thread"
+            # Sin hilo, se cierra aquí, en serie como antes. Si no, el error
+            # tapaba el Ctrl+C (o el registro ya hecho) y el server seguía vivo.
+            log.debug("MCP '%s': cierre en serie (%s)", c.name, error)
+            sin_hilo.append(c)
+            continue
+        hilos.append(hilo)
+    for c in sin_hilo:
+        cerrar(c)
+    for hilo in hilos:
+        hilo.join()
+
+
+# Estados de /proc/<pid>/stat de un proceso que ya murió (zombi, o saliendo).
+_MUERTO = (b"Z", b"X")
+# Tope de la espera a que un hijo a medio exec publique su entorno: lo normal
+# son µs; bajo carga, ms. Solo la paga un hijo directo, líder de su grupo, vivo
+# y sin entorno, y solo en el apagado o un Ctrl+C con un Popen cortado.
+_EXEC_EN_CURSO_S = 0.2
+
+
+def _proc_stat(pid: int) -> list[bytes]:
+    """Los campos de /proc/<pid>/stat tras el ")" del nombre: estado, ppid,
+    grupo... (el nombre puede llevar espacios y paréntesis)."""
+    with open(f"/proc/{pid}/stat", "rb") as f:
+        return f.read().rsplit(b")", 1)[1].split()
+
+
+def _environ_publicado(pid: int) -> bytes:
+    """El environ de un hijo vivo, esperando (acotado) a que exista. Popen
+    vuelve con el hijo a medio execve: el kernel ya le cambió la memoria pero
+    publica su entorno más tarde, y hasta entonces /proc/<pid>/environ se lee
+    VACÍO (medido: 178 de 300 lecturas justo tras volver Popen entero). Leído
+    una sola vez, el server cortado en pleno Popen se daba por ajeno y quedaba
+    huérfano. Un proceso que sale vacío hasta el tope (una app lanzada con el
+    entorno vacío) no es nuestro y no se mata; uno que muere mientras, tampoco."""
+    fin = time.monotonic() + _EXEC_EN_CURSO_S
+    while True:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            entorno = f.read()
+        if entorno or time.monotonic() >= fin or _proc_stat(pid)[0] in _MUERTO:
+            return entorno
+        time.sleep(0.002)
+
+
+def _kill_unspawned(clients: list[StdioMCPClient]) -> None:
+    """SIGTERM al grupo de los servers de `clients` cuyo Popen cortó una señal
+    o un Ctrl+C justo tras el fork: el proceso existe, pero el cliente aún no
+    sabe su pid y ni terminate_now() ni close() lo alcanzan (huérfano). Se
+    buscan en /proc los hijos DIRECTOS de este proceso, líderes de su grupo
+    (start_new_session) y con la marca de entorno de uno de esos lanzamientos.
+    La marca es imprescindible: las apps que abre run_detached (Blender, el
+    terminal) también son hijos directos y líderes de su sesión, y parar
+    Crotolamo no debe matarlas. Con vfork (Linux, Python >= 3.11) Popen vuelve
+    del fork con el hijo ya DENTRO de su exec, pero no con el exec acabado: ver
+    _environ_publicado. Best-effort, nunca lanza."""
+    try:
+        marcas = {
+            f"{_MARCA_ENV}={c.env[_MARCA_ENV]}".encode() for c in clients if _MARCA_ENV in c.env
+        }
+        if not marcas:
+            return
+        yo = os.getpid()
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            try:
+                campos = _proc_stat(pid)
+                # Un zombi no es un exec en curso: ya murió (y su environ se
+                # lee vacío siempre; esperarle solo retrasaría el apagado).
+                if int(campos[1]) != yo or int(campos[2]) != pid or campos[0] in _MUERTO:
+                    continue
+                if marcas.isdisjoint(_environ_publicado(pid).split(b"\0")):
+                    continue
+                os.killpg(pid, signal.SIGTERM)
+            except (OSError, ValueError, IndexError):
+                continue  # ya no existe, o no es nuestro
+    except Exception as error:  # noqa: BLE001 — en pleno apagado: que no tumbe nada
+        log.debug("MCP: no pude barrer los servers a medio lanzar (%s)", error)
+
+
+def _launch(server: MCPServerConfig) -> tuple[StdioMCPClient, float] | None:
+    """Crea el cliente, lo apunta en _STARTING y lanza el proceso del server.
+
+    SIEMPRE en el hilo del llamador, también con los handshakes en paralelo:
+    la señal de apagado del listener se atiende en ese hilo, así que cuando
+    terminate_all() hace su foto todo proceso que exista ya está en _STARTING,
+    o en _SPAWNING si la señal cortó su Popen justo tras el fork (el cliente
+    aún no sabe el pid; lo busca _kill_unspawned). Un Popen en un hilo
+    ayudante podía acabar justo después de la foto y dejar un huérfano.
+    Lanzar cuesta milisegundos; lo que tarda (que el server conteste) va en
+    _handshake.
+
+    Devuelve (cliente, fin de su presupuesto de arranque), o None si no se pudo
+    lanzar (avisado y cerrado). Ctrl+C/SystemExit se propagan tras cerrarlo.
+    """
     client = StdioMCPClient(
-        server.name, server.command, server.env, server.cwd, on_dead=_on_transport_dead,
+        server.name, server.command,
+        {**server.env, _MARCA_ENV: f"{os.getpid()}.{next(_LANZAMIENTOS)}"},
+        server.cwd, on_dead=_on_transport_dead,
     )
     with _STATE_LOCK:
         _STARTING.add(client)
+        _SPAWNING.add(client)
+    # startup_timeout_s es un PRESUPUESTO para handshake + tools/list juntos.
+    deadline = time.monotonic() + server.startup_timeout_s
     try:
-        # startup_timeout_s es un PRESUPUESTO para handshake + tools/list juntos.
-        deadline = time.monotonic() + server.startup_timeout_s
-        try:
-            client.start()
-            client.initialize(timeout=_remaining(deadline))
-            raw_tools = client.list_tools(timeout=_remaining(deadline))
-        except Exception as error:  # noqa: BLE001 — un server caído no impide arrancar
+        client.start()
+    except Exception as error:  # noqa: BLE001 — un server caído no impide arrancar
+        log.warning("MCP '%s': no arrancó, lo salto (%s)", server.name, error)
+        _abandon(client)
+        return None
+    except BaseException:
+        # Ctrl+C (KeyboardInterrupt no es Exception) o SystemExit a mitad del
+        # arranque: nadie más conoce este cliente; sin cerrarlo quedaba huérfano.
+        # Sin proceso a la vista, el Ctrl+C pudo cortar su Popen tras el fork.
+        if not client.alive:
+            _kill_unspawned([client])
+        _abandon(client)
+        raise
+    finally:
+        with _STATE_LOCK:
+            _SPAWNING.discard(client)
+    return client, deadline
+
+
+def _handshake(
+    server: MCPServerConfig, client: StdioMCPClient, deadline: float,
+    abortando: threading.Event | None = None,
+) -> list[dict[str, Any]] | None:
+    """initialize + tools/list de un server ya lanzado, en lo que quede de su
+    presupuesto. No toca registry, router ni _STATE, así que puede correr en un
+    hilo ayudante a la vez que el de otros servers. Devuelve las tools crudas,
+    o None si falló o no ofrece ninguna (avisado, cerrado y fuera de
+    _STARTING). Ctrl+C/SystemExit se propagan tras cerrarlo.
+
+    `abortando` lo marca register_mcp_tools antes de cerrar lo que ya no va a
+    registrar (un Ctrl+C a mitad): ese fallo lo provocó él, no el server, y va
+    a DEBUG; si no, cada Ctrl+C dejaba un "no arrancó" por server en vuelo."""
+    try:
+        client.initialize(timeout=_remaining(deadline))
+        raw_tools = client.list_tools(timeout=_remaining(deadline))
+    except Exception as error:  # noqa: BLE001 — un server caído no impide arrancar
+        if abortando is not None and abortando.is_set():
+            log.debug("MCP '%s': handshake abortado (%s)", server.name, error)
+        else:
             log.warning("MCP '%s': no arrancó, lo salto (%s)", server.name, error)
-            client.close()
+        _abandon(client)
+        return None
+    except BaseException:
+        _abandon(client)
+        raise
+    if not raw_tools:
+        log.warning("MCP '%s': no ofrece ninguna tool; lo cierro", server.name)
+        _abandon(client)
+        return None
+    return raw_tools
+
+
+# Un server lanzado por register_mcp_tools con su handshake en un hilo ayudante.
+_Launched = tuple[StdioMCPClient, Future[list[dict[str, Any]] | None]]
+
+
+def _handshake_into(
+    future: Future[list[dict[str, Any]] | None], server: MCPServerConfig,
+    client: StdioMCPClient, deadline: float, abortando: threading.Event,
+) -> None:
+    """Cuerpo del hilo de un handshake en paralelo. Los fallos del server ya
+    los avisa _handshake; lo demás (también Ctrl+C/SystemExit) queda en
+    `future` y _connect lo re-lanza en el hilo del llamador, en su turno."""
+    try:
+        future.set_result(_handshake(server, client, deadline, abortando))
+    except BaseException as error:  # noqa: BLE001 — se re-lanza en el llamador
+        future.set_exception(error)
+
+
+def _connect(
+    registry: Registry, server: MCPServerConfig, launched: _Launched | None = None,
+) -> list[str]:
+    """Registra las tools de un server. Sin `launched` lo lanza y hace el
+    handshake aquí mismo; con él, recoge el handshake que register_mcp_tools
+    corrió en paralelo. El registro va SIEMPRE en el hilo del llamador y en el
+    orden de la config: los nombres (y el sufijo _2 de un choque) salen
+    idénticos al arranque en serie. Nunca lanza (salvo Ctrl+C/SystemExit, que
+    se propagan tras cerrar el server; con `launched` lo cierra el llamador)."""
+    if launched is None:
+        own = _launch(server)
+        if own is None:
             return []
-        if not raw_tools:
-            log.warning("MCP '%s': no ofrece ninguna tool; lo cierro", server.name)
-            client.close()
+        client, deadline = own
+    else:
+        client, handshake = launched
+    caller_closes = False
+    try:
+        if launched is None:
+            raw_tools = _handshake(server, client, deadline)
+        else:
+            raw_tools = handshake.result()
+        if raw_tools is None:
             return []
 
         tools = _build_tools(registry, server, raw_tools)
@@ -585,11 +806,19 @@ def _connect(registry: Registry, server: MCPServerConfig) -> list[str]:
     except BaseException:
         # Ctrl+C (KeyboardInterrupt no es Exception) o SystemExit a mitad del
         # arranque: nadie más conoce este cliente; sin cerrarlo quedaba huérfano.
-        client.close()
+        # Si lo lanzó register_mcp_tools, lo cierra él A LA VEZ que a los demás
+        # que tiene a medias (este solo y luego el resto eran dos rondas de
+        # close(), ~1 s cada una con un server que ignora el EOF); hasta
+        # entonces sigue en _STARTING, al alcance de terminate_all().
+        if launched is None:
+            client.close()
+        else:
+            caller_closes = True
         raise
     finally:
-        with _STATE_LOCK:
-            _STARTING.discard(client)
+        if not caller_closes:
+            with _STATE_LOCK:
+                _STARTING.discard(client)
     log.info(
         "MCP '%s': %d tools registradas (%s)",
         server.name, len(tools), ", ".join(t.name for t in tools),
@@ -617,22 +846,81 @@ def register_mcp_tools(registry: Registry, settings: Any) -> list[str]:
         return []
     _ensure_atexit()
 
-    registered: list[str] = []
-    for server in cfg.servers:
-        with _STATE_LOCK:
-            existing = _STATE.get(server.name)
-        if existing is not None:
-            if existing.client.alive:
-                for tool in existing.tools:
-                    if registry.get(tool.name) is None:
-                        registry.register(tool)
-                if registry is not existing.registry and registry not in existing.registries:
-                    existing.registries.append(registry)
-                registered.extend(t.name for t in existing.tools)
+    # Con más de un server por lanzar, sus handshakes corren A LA VEZ en hilos
+    # ayudantes: el arranque cuesta el más lento, no la suma (15 s por cada
+    # server colgado). Lanzar (_launch) y registrar (_connect) siguen en este
+    # hilo y en el orden de la config. Un server que sigue en _STATE con el
+    # proceso muerto se relanza abajo en serie, como siempre, tras retirar el
+    # viejo: dos procesos del mismo server a la vez podían pisarse (un lockfile).
+    with _STATE_LOCK:
+        to_launch = [s for s in cfg.servers if s.name not in _STATE]
+    # Se marca antes de cerrar lo lanzado que ya no se va a registrar (ver _handshake).
+    abortando = threading.Event()
+    hilos: list[threading.Thread] = []
+    # nombre -> server lanzado con su handshake en curso, hasta que se registra;
+    # None = ni se pudo lanzar (ya avisado): no se reintenta abajo.
+    pending: dict[str, _Launched | None] = {}
+    try:
+        if len(to_launch) > 1:
+            for server in to_launch:
+                own = _launch(server)
+                if own is None:
+                    pending[server.name] = None
+                    continue
+                client, deadline = own
+                handshake: Future[list[dict[str, Any]] | None] = Future()
+                hilo = threading.Thread(
+                    target=_handshake_into, args=(handshake, server, client, deadline, abortando),
+                    name=f"mcp-start-{server.name}", daemon=True,
+                )
+                # Apuntados ANTES de arrancar el hilo: un Ctrl+C dentro de
+                # start() lo deja corriendo, y el finally cierra el server y
+                # espera al hilo como a los demás.
+                pending[server.name] = (client, handshake)
+                hilos.append(hilo)
+                try:
+                    hilo.start()
+                except Exception as error:  # noqa: BLE001 — p.ej. "can't start new thread"
+                    # Sin hilo, este server hace su handshake aquí, en serie
+                    # como antes: ni se queda sin dueño ni tumba a los demás.
+                    hilos.remove(hilo)
+                    log.debug("MCP '%s': handshake en serie (%s)", server.name, error)
+                    handshake.set_result(_handshake(server, client, deadline, abortando))
+
+        registered: list[str] = []
+        for server in cfg.servers:
+            with _STATE_LOCK:
+                existing = _STATE.get(server.name)
+            if existing is not None:
+                if existing.client.alive:
+                    for tool in existing.tools:
+                        if registry.get(tool.name) is None:
+                            registry.register(tool)
+                    if registry is not existing.registry and registry not in existing.registries:
+                        existing.registries.append(registry)
+                    registered.extend(t.name for t in existing.tools)
+                    continue
+                _drop(existing, _why_dead(existing.client))
+            if server.name not in pending:
+                registered.extend(_connect(registry, server))
                 continue
-            _drop(existing, _why_dead(existing.client))
-        registered.extend(_connect(registry, server))
-    return registered
+            # Sigue en `pending` mientras se registra: si un Ctrl+C corta aquí,
+            # el finally lo cierra A LA VEZ que a los demás.
+            if (launched := pending[server.name]) is not None:
+                registered.extend(_connect(registry, server, launched))
+            del pending[server.name]
+        return registered
+    finally:
+        # Lanzado pero sin registrar: un Ctrl+C a mitad, o un server que otro
+        # hilo conectó entretanto. Se cierra ANTES de esperar a los hilos, así
+        # su handshake aborta al momento en vez de agotar su presupuesto.
+        abortando.set()
+        _abandon_all([p[0] for p in pending.values() if p is not None])
+        for hilo in hilos:
+            try:
+                hilo.join()
+            except RuntimeError:
+                pass  # el Ctrl+C llegó antes de que arrancase: nada que esperar
 
 
 def unregister_server(registry: Registry, name: str) -> bool:
@@ -661,11 +949,15 @@ def terminate_all() -> None:
     atexit: manda SIGTERM al grupo de cada server (también los que siguen en el
     handshake) sin esperar a nadie. Sin esto, un wrapper (npx, sh -c) o un
     server que ignora el EOF de stdin quedaba huérfano al parar el servicio.
+    Al que la señal pilla en pleno Popen lo busca _kill_unspawned.
     Best-effort, nunca lanza."""
     with _STATE_LOCK:
         clients = [state.client for state in _STATE.values()] + list(_STARTING)
+        spawning = list(_SPAWNING)
     for client in clients:
         try:
             client.terminate_now()
         except Exception:  # noqa: BLE001 - el proceso está saliendo
             pass
+    if spawning:
+        _kill_unspawned(spawning)

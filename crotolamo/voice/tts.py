@@ -24,6 +24,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from crotolamo.logging_setup import get_logger
+from crotolamo.voice import runtime
 from crotolamo.voice.clean import limpiar_para_voz
 
 log = get_logger("voice.tts")
@@ -115,10 +116,27 @@ def split_sentences(text: str) -> list[str]:
     return pieces
 
 
+def _piper_arena_keep_phonemes(voice_cfg) -> int:
+    """[voice].piper_arena_keep_phonemes: frases de hasta tantos phoneme ids
+    conservan el arena de ONNX Runtime; las más largas devuelven su pico al terminar.
+
+    Un valor inválido no impide hablar: se avisa y se usa el default de fábrica.
+    """
+    default = runtime.PIPER_KEEP_PHONEMES
+    value = voice_cfg.get("piper_arena_keep_phonemes", default)
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    log.warning("[voice].piper_arena_keep_phonemes=%r no es un entero >= 0; uso %d",
+                value, default)
+    return default
+
+
 class TTS:
-    def __init__(self, voice_model: Path) -> None:
+    def __init__(self, voice_model: Path, *,
+                 arena_keep_phonemes: int = runtime.PIPER_KEEP_PHONEMES) -> None:
         self.voice_model = Path(voice_model)
         self._voice = None  # PiperVoice perezoso, cargado una sola vez
+        self.arena_keep_phonemes = arena_keep_phonemes
         # El hilo WarmVoice del listener precalienta la voz mientras el hilo
         # principal ya habla ("Crotolamo escuchando"): sin lock, los dos veían
         # _voice en None y cargaban el modelo dos veces (CPU y RAM dobles).
@@ -129,7 +147,8 @@ class TTS:
     def from_settings(cls, settings) -> "TTS":
         voces = settings.paths.get("voces", Path.home() / "voices")
         piper_voice = settings.voice.get("piper_voice", "es_MX-ald-medium.onnx")
-        return cls(voces / piper_voice)
+        return cls(voces / piper_voice,
+                   arena_keep_phonemes=_piper_arena_keep_phonemes(settings.voice))
 
     def available(self) -> bool:
         """Hay voz si existe el .onnx (la reproducción ya no depende de ffplay)."""
@@ -144,9 +163,34 @@ class TTS:
                 if self._voice is None:
                     from piper import PiperVoice
 
-                    self._voice = PiperVoice.load(str(self.voice_model))
+                    # PiperVoice.load crea la sesión con SessionOptions por defecto: el
+                    # arena retenía de por vida el pico de la frase más larga dicha
+                    # (+411 MB tras una de 23 s). Envuelta, las frases de más de
+                    # arena_keep_phonemes ids lo devuelven al terminar; las típicas
+                    # hacen la MISMA llamada que antes (encoger en cada run costaba
+                    # +10-25 % de síntesis). Mismo audio. Se envuelve ANTES de
+                    # publicarla: el camino caliente de arriba la lee sin lock.
+                    self._voice = runtime.wrap_piper_session(
+                        PiperVoice.load(str(self.voice_model)), self.arena_keep_phonemes)
                 voice = self._voice
         return voice
+
+    def warm(self) -> bool:
+        """Precalienta la voz Piper: la misma carga que la primera frase, en el hilo
+        de quien llama (si otro hilo ya la está cargando, espera a esa carga).
+
+        Sin el .onnx no carga nada (sin voz no hay modelo que cargar). Nunca lanza:
+        si la carga falla no queda nada cacheado y la primera frase la reintenta y
+        falla como siempre. True si la voz quedó cargada.
+        """
+        if not self.available():
+            return False
+        try:
+            self._get_voice()
+        except Exception as error:  # noqa: BLE001 - lo decide y lo avisa el primer uso real
+            log.debug("no precalenté la voz Piper (%s); lo decidirá su primer uso", error)
+            return False
+        return True
 
     def synthesize_pcm(self, text: str):
         """Devuelve (audio_int16 ndarray, sample_rate) sintetizado por Piper.

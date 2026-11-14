@@ -64,12 +64,15 @@ _silero_lock = threading.Lock()
 _silero_load_error: str | None = None
 
 
-def _get_silero_vad():
+def _get_silero_vad(*, remember_error: bool = True):
     """OJO: instancia ÚNICA compartida con `loop._SileroVad`. Silero es una RNN con
     estado; esto es seguro solo porque los dos caminos se excluyen — el modo síncrono
     usa `_record_silero`, y el modo `listen` (hilos) usa el VAD del EarThread, cuyo
     hilo de STT transcribe con Whisper, no con Silero. Si algún día ambos corren a la
     vez, hay que dar una instancia por hilo o el estado se pisará.
+
+    remember_error=False (solo warm_vad): un fallo de carga NO se memoriza, para que
+    el primer uso real lo reintente y lo avise él (ver warm_vad).
     """
     global _silero_vad, _silero_load_error
     # Camino caliente sin lock: con el modelo ya cargado es leer un global.
@@ -86,9 +89,28 @@ def _get_silero_vad():
                 # importaba torch (+218 MB) solo como contenedor de tensores.
                 _silero_vad = runtime.load_silero()
             except Exception as error:
-                _silero_load_error = f"{type(error).__name__}: {error}"
+                if remember_error:
+                    _silero_load_error = f"{type(error).__name__}: {error}"
                 raise
     return _silero_vad
+
+
+def warm_vad() -> bool:
+    """Precalienta Silero: la misma carga que haría su primer uso real (el primer
+    frame del oído en el loop concurrente, o la primera grabación del modo simple),
+    pero en el hilo de quien llama y antes de que haga falta. Sin esto, la carga
+    caía DENTRO del hilo del oído tras el primer wake, con el micrófono sin leer.
+
+    Nunca lanza, y si no carga devuelve False SIN memorizar el fallo: la decisión
+    de caer a energía (y su único aviso en el log) la sigue tomando el primer uso
+    real, idéntica a la de no haber precalentado. True si el modelo quedó en caché.
+    """
+    try:
+        _get_silero_vad(remember_error=False)
+    except Exception as error:  # noqa: BLE001 - lo decide y lo avisa el primer uso real
+        log.debug("no precalenté el VAD Silero (%s); lo decidirá su primer uso", error)
+        return False
+    return True
 
 
 class VoiceUnavailable(RuntimeError):
@@ -170,6 +192,22 @@ class STT:
                         cpu_threads=_whisper_cpu_threads(),
                     )
         return _models[self.model_size]
+
+    def warm(self) -> bool:
+        """Precalienta este tamaño de Whisper: la misma carga que el primer
+        transcribe(), en el hilo de quien llama. Si otro hilo ya lo está cargando,
+        espera a esa carga (el lock por tamaño) en vez de repetirla.
+
+        Nunca lanza: si no carga no queda nada cacheado, así que el primer uso real
+        lo reintenta y da su error de siempre. True si el modelo quedó cargado.
+        """
+        try:
+            self._get_model()
+        except Exception as error:  # noqa: BLE001 - lo decide y lo avisa el primer uso real
+            log.debug("no precalenté Whisper '%s' (%s); lo decidirá su primer uso",
+                      self.model_size, error)
+            return False
+        return True
 
     # --- grabación ---
     def _write_wav(self, path: Path, audio_int16) -> None:

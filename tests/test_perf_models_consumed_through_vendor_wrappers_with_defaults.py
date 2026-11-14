@@ -12,6 +12,8 @@ defaults pensados para scripts cortos o para entrenar:
   para quedarse con 3.
 - Whisper: cada arranque consultaba el Hub (1 conexión por modelo) aunque el modelo
   ya estuviera en la caché, y tqdm dejaba un hilo monitor vivo para siempre.
+- Piper: el arena de ONNX Runtime retenía, de por vida del servicio, el pico de la
+  frase más larga dicha (+409 MB tras una de 23 s).
 - El doctor importaba torch, sklearn y scipy (~280 MB) para escribir "importable".
 
 Lo que fijan estos tests: mismas salidas que el camino del vendor (probabilidades,
@@ -178,6 +180,109 @@ def test_wrap_piper_session_envuelve_y_tolera_voces_sin_sesion():
     sin_sesion = types.SimpleNamespace(config="cfg")
     assert runtime.wrap_piper_session(sin_sesion) is sin_sesion
     assert not hasattr(sin_sesion, "session")
+
+
+_RECHAZO_ORT = ("[ONNXRuntimeError] : 2 : INVALID_ARGUMENT : Did not find an arena based "
+                "allocator registered for device-id combination in the memory arena shrink "
+                "list: cpu:0")
+
+
+class _SesionSinArena(_SesionFalsa):
+    """Sesión SIN arena de CPU (un ORT con mimalloc, o un Piper que lo apague): ORT
+    rechaza la lista de encogido antes de calcular, con este mismo error.
+    `arena_declarada` es lo que dice get_session_options()."""
+
+    def __init__(self, arena_declarada: bool = False) -> None:
+        super().__init__()
+        self.arena_declarada = arena_declarada
+
+    def run(self, output_names, input_feed, run_options=None):
+        self.llamadas.append(run_options)
+        if run_options is not None:
+            from onnxruntime.capi.onnxruntime_pybind11_state import InvalidArgument
+
+            raise InvalidArgument(_RECHAZO_ORT)
+        return ["salida"]
+
+    def get_session_options(self):
+        return types.SimpleNamespace(enable_cpu_mem_arena=self.arena_declarada)
+
+
+def test_arena_shrinking_session_si_ort_rechaza_encoger_repite_el_run_de_siempre(
+        monkeypatch, caplog):
+    """Sin arena, ORT rechaza el encogido: la frase larga debe sonar igual (el run
+    de siempre, sin run_options), dejar de intentarlo y avisar UNA vez."""
+    np = pytest.importorskip("numpy")
+    pytest.importorskip("onnxruntime")
+    monkeypatch.setattr(runtime, "_warned", set())
+    sesion = _SesionSinArena(arena_declarada=True)
+    proxy = runtime.ArenaShrinkingSession(sesion, keep_len=256)
+
+    with caplog.at_level(logging.WARNING, logger="crotolamo.voice.runtime"):
+        assert proxy.run(None, {"input": np.zeros((1, 256))}) == ["salida"]
+        assert sesion.llamadas == [None]
+        assert proxy.run(None, {"input": np.zeros((1, 300))}) == ["salida"]
+        assert _encoge(sesion.llamadas[1]) and sesion.llamadas[2:] == [None], sesion.llamadas
+        # Las siguientes largas van directas al run de siempre: ni un rechazo más.
+        assert proxy.run(None, {"input": np.zeros((1, 800))}) == ["salida"]
+        assert sesion.llamadas[3:] == [None]
+    avisos = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(avisos) == 1 and "arena" in avisos[0] and _RECHAZO_ORT in avisos[0], avisos
+    # Unas run_options del llamador siguen yendo tal cual, y su error sube tal cual.
+    mias = object()
+    from onnxruntime.capi.onnxruntime_pybind11_state import InvalidArgument
+
+    with pytest.raises(InvalidArgument):
+        proxy.run(None, {"input": np.zeros((1, 999))}, mias)
+    assert sesion.llamadas[-1] is mias and len(sesion.llamadas) == 5
+
+
+def test_arena_shrinking_session_si_tambien_falla_sin_encoger_sube_el_error_de_siempre(
+        monkeypatch, caplog):
+    """Si el run de siempre TAMBIÉN falla, sube SU error (el mismo que daría la voz de
+    fábrica), sin encadenar el rechazo, y el encogido no se apaga por eso."""
+    np = pytest.importorskip("numpy")
+    pytest.importorskip("onnxruntime")
+    monkeypatch.setattr(runtime, "_warned", set())
+
+    class _Rota(_SesionFalsa):
+        def run(self, output_names, input_feed, run_options=None):
+            self.llamadas.append(run_options)
+            raise RuntimeError("con encogido" if run_options is not None else "de siempre")
+
+    sesion = _Rota()
+    proxy = runtime.ArenaShrinkingSession(sesion, keep_len=256)
+    with caplog.at_level(logging.WARNING, logger="crotolamo.voice.runtime"):
+        with pytest.raises(RuntimeError, match="^de siempre$") as error:
+            proxy.run(None, {"input": np.zeros((1, 300))})
+    assert error.value.__context__ is None and error.value.__cause__ is None
+    assert _encoge(sesion.llamadas[0]) and sesion.llamadas[1:] == [None]
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    with pytest.raises(RuntimeError):
+        proxy.run(None, {"input": np.zeros((1, 300))})
+    assert _encoge(sesion.llamadas[2]), "un fallo ajeno al encogido no lo apaga"
+
+
+def test_wrap_piper_session_no_envuelve_una_sesion_sin_arena():
+    """Sin arena de CPU no hay pico que devolver (y ORT rechazaría el encogido): la
+    sesión se queda tal cual, la de fábrica."""
+    pytest.importorskip("onnxruntime")
+    sin_arena = types.SimpleNamespace(session=_SesionSinArena(arena_declarada=False))
+    cruda = sin_arena.session
+    assert runtime.wrap_piper_session(sin_arena) is sin_arena
+    assert sin_arena.session is cruda
+    con_arena = types.SimpleNamespace(session=_SesionSinArena(arena_declarada=True))
+    runtime.wrap_piper_session(con_arena)
+    assert isinstance(con_arena.session, runtime.ArenaShrinkingSession)
+
+    class _NoLoDice(_SesionFalsa):
+        def get_session_options(self):
+            raise RuntimeError("API distinta")
+
+    # Si la sesión no sabe decirlo, se envuelve: run() cae solo si ORT rechaza.
+    muda = types.SimpleNamespace(session=_NoLoDice())
+    runtime.wrap_piper_session(muda)
+    assert isinstance(muda.session, runtime.ArenaShrinkingSession)
 
 
 def test_load_whisper_prueba_la_cache_local_y_cae_a_la_llamada_de_siempre(monkeypatch):
@@ -944,6 +1049,339 @@ def test_available_es_false_sin_openwakeword(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "openwakeword", None)
     assert WakeWordDetector().available() is False
+
+
+# =============================================================================
+# Paso 4: el arena de Piper acotado sin frenar las frases típicas (TTS._get_voice)
+# =============================================================================
+
+
+class _VozPiperFalsa:
+    """PiperVoice falso: cuenta cargas y trae una sesión que anota sus run_options."""
+
+    cargas: list[str] = []
+
+    def __init__(self) -> None:
+        self.session = _SesionFalsa()
+        self.config = types.SimpleNamespace(sample_rate=22050)
+
+    @classmethod
+    def load(cls, path):
+        cls.cargas.append(path)
+        return cls()
+
+
+@pytest.fixture
+def piper_falso(monkeypatch):
+    fake = types.ModuleType("piper")
+    fake.PiperVoice = _VozPiperFalsa  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "piper", fake)
+    _VozPiperFalsa.cargas = []
+    return _VozPiperFalsa
+
+
+def _ids(n: int) -> dict:
+    """La entrada que Piper le da a su sesión para una frase de `n` phoneme ids."""
+    np = pytest.importorskip("numpy")
+    return {"input": np.zeros((1, n), dtype=np.int64),
+            "input_lengths": np.array([n], dtype=np.int64),
+            "scales": np.array([0.667, 1.0, 0.8], dtype=np.float32)}
+
+
+def test_get_voice_envuelve_la_sesion_de_piper_con_el_umbral(piper_falso):
+    pytest.importorskip("onnxruntime")
+    from crotolamo.voice.tts import TTS
+
+    tts = TTS(Path("voz.onnx"))
+    voz = tts._get_voice()
+    assert isinstance(voz.session, runtime.ArenaShrinkingSession)
+    assert voz.session._keep_len == runtime.PIPER_KEEP_PHONEMES == 256
+    cruda = voz.session._session
+    # Frase típica (<= 256 ids, ~115 caracteres): la MISMA llamada a ORT que hoy,
+    # sin run_options, así que el arena se queda y la velocidad no cambia.
+    assert voz.session.run(None, _ids(256)) == ["salida"]
+    assert cruda.llamadas == [None]
+    # Frase larga: devuelve su pico al sistema al terminar.
+    voz.session.run(None, _ids(257))
+    assert _encoge(cruda.llamadas[-1])
+    # Lo demás de la voz sigue igual, y la caché también: ni se recarga ni se
+    # vuelve a envolver.
+    assert voz.config.sample_rate == 22050
+    assert tts._get_voice() is voz and voz.session._session is cruda
+    assert piper_falso.cargas == ["voz.onnx"]
+
+
+def test_get_voice_deja_en_paz_una_voz_sin_sesion(monkeypatch):
+    from crotolamo.voice.tts import TTS
+
+    voz = types.SimpleNamespace(config="cfg")
+    fake = types.ModuleType("piper")
+    fake.PiperVoice = types.SimpleNamespace(load=lambda _ruta: voz)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "piper", fake)
+    assert TTS(Path("voz.onnx"))._get_voice() is voz
+    assert not hasattr(voz, "session")
+
+
+def test_get_voice_no_publica_la_voz_antes_de_envolverla(piper_falso, monkeypatch):
+    """El camino caliente de _get_voice lee self._voice SIN lock: si la voz se
+    publicara antes de envolverla, otro hilo podría sintetizar con la sesión sin
+    acotar (o mientras se le cambia la sesión)."""
+    from crotolamo.voice import tts as tts_mod
+
+    vista: list = []
+    envolver = runtime.wrap_piper_session
+
+    def _espia(voz, keep_phonemes=runtime.PIPER_KEEP_PHONEMES):
+        vista.append(tts._voice)
+        return envolver(voz, keep_phonemes)
+
+    monkeypatch.setattr(runtime, "wrap_piper_session", _espia)
+    tts = tts_mod.TTS(Path("voz.onnx"))
+    voz = tts._get_voice()
+    assert vista == [None]
+    assert tts._voice is voz
+
+
+def test_get_voice_con_una_sesion_sin_arena_dice_las_frases_largas(monkeypatch, caplog):
+    """Un Piper (u ORT) cuya sesión no tiene arena de CPU: sin acotar nada, la voz
+    queda como la de fábrica y las frases de más de 256 ids siguen sonando."""
+    pytest.importorskip("onnxruntime")
+    from crotolamo.voice.tts import TTS
+
+    voz = types.SimpleNamespace(session=_SesionSinArena(arena_declarada=False))
+    cruda = voz.session
+    fake = types.ModuleType("piper")
+    fake.PiperVoice = types.SimpleNamespace(load=lambda _ruta: voz)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "piper", fake)
+    with caplog.at_level(logging.WARNING):
+        assert TTS(Path("voz.onnx"))._get_voice() is voz
+        assert voz.session is cruda
+        assert voz.session.run(None, _ids(803)) == ["salida"]
+    assert cruda.llamadas == [None]
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def _settings_falsos(tmp_path, **voice):
+    return types.SimpleNamespace(paths={"voces": tmp_path},
+                                 voice={"piper_voice": "v.onnx", **voice})
+
+
+def test_piper_arena_keep_phonemes_de_la_config(piper_falso, tmp_path, caplog):
+    from crotolamo.voice.tts import TTS
+
+    def _umbral(**voice) -> int | None:
+        tts = TTS.from_settings(_settings_falsos(tmp_path, **voice))
+        assert tts.voice_model == tmp_path / "v.onnx"
+        return tts._get_voice().session._keep_len
+
+    assert _umbral() == 256, "sin la clave: el default de fábrica"
+    assert _umbral(piper_arena_keep_phonemes=400) == 400
+    assert _umbral(piper_arena_keep_phonemes=0) == 0, "0 = encoger tras cada frase"
+    # Lo que documenta la config: 0 encoge tras cada frase y un número enorme nunca.
+    pytest.importorskip("onnxruntime")
+    for keep, frase, encoge in ((0, 1, True), (100000, 5000, False)):
+        voz = TTS.from_settings(
+            _settings_falsos(tmp_path, piper_arena_keep_phonemes=keep))._get_voice()
+        voz.session.run(None, _ids(frase))
+        assert _encoge(voz.session._session.llamadas[-1]) is encoge, keep
+    # Un valor inválido no impide hablar: el default y UN aviso por valor.
+    for malo in ("mucho", -1, True, 2.5):
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="crotolamo.voice.tts"):
+            assert _umbral(piper_arena_keep_phonemes=malo) == 256
+        avisos = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(avisos) == 1 and "piper_arena_keep_phonemes" in avisos[0], avisos
+
+
+def test_la_config_de_fabrica_documenta_piper_arena_keep_phonemes():
+    import tomllib
+
+    from crotolamo.settings import DEFAULT_CONFIG
+
+    texto = DEFAULT_CONFIG.read_text(encoding="utf-8")
+    voice = tomllib.loads(texto)["voice"]
+    assert voice["piper_arena_keep_phonemes"] == runtime.PIPER_KEEP_PHONEMES == 256
+    lineas = texto.splitlines()
+    i = next(n for n, linea in enumerate(lineas)
+             if linea.startswith("piper_arena_keep_phonemes"))
+    # Junto a las demás claves de Piper, con su explicación encima.
+    assert any(linea.startswith("piper_voice") for linea in lineas[i - 15:i])
+    comentario = " ".join(linea.lstrip("# ") for linea in lineas[i - 12:i]
+                          if linea.startswith("#"))
+    assert "arena" in comentario and "0 =" in comentario, comentario
+
+
+def _voz_piper_real() -> str:
+    """El .onnx de Piper para los tests con el modelo real: CROTOLAMO_TEST_PIPER_VOICE
+    o el de la config versionada ([paths].voces + [voice].piper_voice)."""
+    if not (runtime.module_available("piper") and runtime.module_available("onnxruntime")):
+        pytest.skip("piper-tts/onnxruntime no están instalados")
+    ruta = os.environ.get("CROTOLAMO_TEST_PIPER_VOICE", "")
+    if not ruta:
+        try:
+            from crotolamo.settings import get_settings
+            from crotolamo.voice.tts import TTS
+
+            ruta = str(TTS.from_settings(get_settings()).voice_model)
+        except Exception as error:  # noqa: BLE001
+            pytest.skip(f"sin config para localizar la voz: {error}")
+    if not (os.path.isfile(ruta) and os.path.isfile(ruta + ".json")):
+        pytest.skip(f"no hay voz Piper en {ruta} (CROTOLAMO_TEST_PIPER_VOICE la indica)")
+    return ruta
+
+
+_CORTA = "Listo, patrón."
+_RESPUESTA = ("Son las tres de la tarde, patrón, y ya quedó anotado en tu lista de pendientes "
+              "para mañana temprano.")
+_LARGA = ("Mira patrón, revisé los tres proyectos que me pediste y encontré que en el primero "
+          "hay doce archivos modificados desde el lunes, en el segundo no hay cambios "
+          "pendientes, y en el tercero quedaron dos pruebas fallando que tienen que ver con "
+          "el módulo de audio")
+
+
+def test_piper_real_mismo_audio_y_el_arena_no_se_queda_el_pico_de_la_frase_larga():
+    """Con la voz real, en un proceso nuevo: el audio sale idéntico bit a bit al de
+    PiperVoice.load de siempre (sin ruido, para que sea determinista), solo los runs
+    de más de 256 ids pasan run_options, y tras una frase larga la RSS ya no se
+    queda con su pico (antes ~+330 MB para esta frase, de por vida del servicio)."""
+    ruta = _voz_piper_real()
+    out = _run_py(f"""
+        import gc, hashlib, json
+        import numpy as np
+        from piper import PiperVoice
+        from piper.config import SynthesisConfig
+        from crotolamo.voice import runtime
+        from crotolamo.voice.tts import TTS
+
+        def rss():
+            with open("/proc/self/status") as f:
+                for linea in f:
+                    if linea.startswith("VmRSS"):
+                        return int(linea.split()[1]) // 1024
+            return 0
+
+        voz = TTS({ruta!r})._get_voice()
+        proxy = voz.session
+        cruda = proxy._session
+        runs = []
+        run_real = cruda.run
+
+        def run(names, feed, *opciones):
+            runs.append([int(feed["input"].shape[-1]), bool(opciones)])
+            return run_real(names, feed, *opciones)
+
+        cruda.run = run
+        cfg = SynthesisConfig(noise_scale=0.0, noise_w_scale=0.0)
+
+        def md5(v, texto):
+            audio = np.concatenate([c.audio_int16_array
+                                    for c in v.synthesize(texto, syn_config=cfg)])
+            gc.collect()
+            return hashlib.md5(audio.tobytes()).hexdigest()
+
+        nuevo = [md5(voz, {_CORTA!r})]
+        r_corta = rss()
+        nuevo += [md5(voz, {_RESPUESTA!r}), md5(voz, {_LARGA!r})]
+        r_larga = rss()
+        md5(voz, {_CORTA!r})
+        r_corta_otra_vez = rss()
+        stock = PiperVoice.load({ruta!r})
+        viejo = [md5(stock, t) for t in ({_CORTA!r}, {_RESPUESTA!r}, {_LARGA!r})]
+        print(json.dumps({{
+            "proxy": type(proxy).__name__, "keep": proxy._keep_len,
+            "iguales": nuevo == viejo, "runs": runs,
+            "tras_larga_mb": r_larga - r_corta,
+            "trinquete_mb": r_corta_otra_vez - r_corta,
+        }}))
+    """)
+    assert out["proxy"] == "ArenaShrinkingSession" and out["keep"] == 256
+    assert out["iguales"] is True, "el audio cambió"
+    largos = [n for n, _ in out["runs"]]
+    assert min(largos) <= 256 < max(largos), out["runs"]
+    assert all(encoge == (n > 256) for n, encoge in out["runs"]), out["runs"]
+    # Sin el arreglo: trinquete ~+330 MB con esta frase. Con él, unos pocos MB.
+    assert out["tras_larga_mb"] < 100, out
+    assert out["trinquete_mb"] < 100, out
+
+
+def test_piper_real_sin_arena_las_frases_largas_suenan_como_las_de_fabrica():
+    """Con la voz real y un ORT SIN arena de CPU (lo que da un build con mimalloc o un
+    Piper que lo apague), ORT rechaza el encogido. Antes del arreglo toda frase de más
+    de 256 ids reventaba y TTS.speak la callaba. Ahora: si la sesión dice que no
+    tiene arena no se envuelve, y si lo oculta, el run se repite como el de fábrica,
+    deja de encoger y avisa una vez. En los dos casos, el mismo audio bit a bit."""
+    ruta = _voz_piper_real()
+    out = _run_py(f"""
+        import hashlib, json, logging
+        import numpy as np
+        import onnxruntime as ort
+        from piper import PiperVoice
+        from piper.config import SynthesisConfig
+        from crotolamo.voice import runtime
+        from crotolamo.voice.tts import TTS
+
+        _opciones = ort.SessionOptions
+
+        def _sin_arena():
+            so = _opciones()
+            so.enable_cpu_mem_arena = False
+            return so
+
+        ort.SessionOptions = _sin_arena  # PiperVoice.load crea su sesión con esto
+        avisos = []
+
+        class _Anota(logging.Handler):
+            def emit(self, record):
+                if record.levelno >= logging.WARNING:
+                    avisos.append(record.getMessage())
+
+        logging.getLogger("crotolamo.voice.runtime").addHandler(_Anota())
+        cfg = SynthesisConfig(noise_scale=0.0, noise_w_scale=0.0)
+
+        def md5(v, texto):
+            audio = np.concatenate([c.audio_int16_array
+                                    for c in v.synthesize(texto, syn_config=cfg)])
+            return hashlib.md5(audio.tobytes()).hexdigest()
+
+        def anotar(sesion):
+            runs = []
+            run_real = sesion.run
+
+            def run(names, feed, *opciones):
+                runs.append([int(feed["input"].shape[-1]), bool(opciones)])
+                return run_real(names, feed, *opciones)
+
+            sesion.run = run
+            return runs
+
+        stock = PiperVoice.load({ruta!r})
+        fabrica = [md5(stock, t) for t in ({_CORTA!r}, {_LARGA!r})]
+
+        declarada = TTS({ruta!r})._get_voice()
+        tipo_declarada = type(declarada.session).__name__
+        audio_declarada = [md5(declarada, t) for t in ({_CORTA!r}, {_LARGA!r})]
+
+        runtime._has_cpu_arena = lambda sesion: True  # el ORT no lo dice
+        oculta = TTS({ruta!r})._get_voice()
+        tipo_oculta = type(oculta.session).__name__
+        runs = anotar(oculta.session._session)
+        audio_oculta = [md5(oculta, t) for t in ({_CORTA!r}, {_LARGA!r}, {_LARGA!r})]
+        print(json.dumps({{
+            "tipo_declarada": tipo_declarada, "tipo_oculta": tipo_oculta,
+            "fabrica": fabrica, "declarada": audio_declarada, "oculta": audio_oculta,
+            "runs": runs, "avisos": avisos,
+        }}))
+    """)
+    assert out["tipo_declarada"] == "InferenceSession", out
+    assert out["declarada"] == out["fabrica"], "sin arena declarado: otro audio"
+    assert out["tipo_oculta"] == "ArenaShrinkingSession", out
+    assert out["oculta"] == out["fabrica"] + [out["fabrica"][1]], "con el respaldo: otro audio"
+    largos = [n for n, _ in out["runs"] if n > 256]
+    assert largos, out["runs"]
+    # Solo el PRIMER run largo intenta encoger (y ORT lo rechaza); el resto, de fábrica.
+    intentos = [r for r in out["runs"] if r[1]]
+    assert len(intentos) == 1 and intentos[0][0] > 256, out["runs"]
+    assert len(out["avisos"]) == 1 and "arena" in out["avisos"][0], out["avisos"]
 
 
 # =============================================================================

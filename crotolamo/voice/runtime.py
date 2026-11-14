@@ -125,6 +125,10 @@ class ArenaShrinkingSession:
     el arena como hoy, porque encoger en CADA run costó +10 a 25 % de tiempo por
     frase (páginas que se vuelven a pedir). keep_len=None: encoge siempre. Unas
     run_options del llamador nunca se pisan. Todo lo demás se delega.
+
+    Si ORT rechaza el encogido (una sesión sin arena de CPU: un ORT con mimalloc,
+    o un vendor que lo apague), ese run se repite tal cual lo hace el vendor y el
+    proxy deja de encoger: sin esto, toda frase larga reventaba y se callaba.
     """
 
     def __init__(self, session, keep_len: int | None = None,
@@ -133,6 +137,7 @@ class ArenaShrinkingSession:
         self._keep_len = keep_len
         self._input_name = input_name
         self._shrink: Any = None  # RunOptions perezosas: el primer run largo
+        self._shrink_rejected = False
 
     def _is_long(self, input_feed) -> bool:
         if self._keep_len is None:
@@ -143,13 +148,24 @@ class ArenaShrinkingSession:
             return False
 
     def run(self, output_names, input_feed, run_options=None):
-        if run_options is None and self._is_long(input_feed):
+        if run_options is not None:
+            return self._session.run(output_names, input_feed, run_options)
+        if self._shrink_rejected or not self._is_long(input_feed):
+            return self._session.run(output_names, input_feed)
+        try:
             if self._shrink is None:
                 self._shrink = shrink_run_options()
-            run_options = self._shrink
-        if run_options is None:
-            return self._session.run(output_names, input_feed)
-        return self._session.run(output_names, input_feed, run_options)
+            return self._session.run(output_names, input_feed, self._shrink)
+        except Exception as error:  # noqa: BLE001 - abajo: el run de siempre decide
+            rejected = error
+        # ORT valida la lista de encogido ANTES de calcular, así que repetir cuesta
+        # ~0. Fuera del except: si el run de siempre también falla, sube SU error,
+        # el mismo que daría el vendor, sin el rechazo encadenado.
+        outputs = self._session.run(output_names, input_feed)
+        self._shrink_rejected = True
+        _warn_once("arena-shrink", "ONNX Runtime no deja encoger el arena de esta sesión "
+                   "(%s): la uso sin encoger, igual que el vendor", rejected)
+        return outputs
 
     def __getattr__(self, name: str):
         if name == "_session":  # copy/pickle antes de __init__: sin recursión
@@ -453,15 +469,30 @@ def load_whisper(faster_whisper, size: str, cpu_threads: int = 0):
 # --- Piper -----------------------------------------------------------------------
 
 # ~115 caracteres / ~8 s de audio: las frases típicas conservan el arena (misma
-# velocidad que hoy) y las largas devuelven su pico al terminar.
+# velocidad que hoy) y las largas devuelven su pico al terminar. Es el default de
+# [voice].piper_arena_keep_phonemes (lo lee TTS.from_settings).
 PIPER_KEEP_PHONEMES = 256
 
 
+def _has_cpu_arena(session) -> bool:
+    """¿La sesión dice tener arena de CPU? Sin él no hay pico retenido que devolver
+    y ORT rechaza la opción de encogido. Si no sabe decirlo, se asume que sí: el
+    proxy cae solo al run de siempre si ORT la rechaza."""
+    try:
+        return bool(session.get_session_options().enable_cpu_mem_arena)
+    except Exception:  # noqa: BLE001 - otra API (o un falso): que decida run()
+        return True
+
+
 def wrap_piper_session(voice, keep_phonemes: int = PIPER_KEEP_PHONEMES):
-    """Envuelve voice.session en ArenaShrinkingSession (no-op si no hay sesión)."""
+    """Envuelve voice.session en ArenaShrinkingSession (no-op si no hay sesión, o si
+    la sesión no tiene arena de CPU: entonces queda la de fábrica)."""
     session = getattr(voice, "session", None)
     if (session is None or isinstance(session, ArenaShrinkingSession)
             or not callable(getattr(session, "run", None))):
+        return voice
+    if not _has_cpu_arena(session):
+        log.debug("la sesión de Piper no tiene arena de CPU: nada que acotar")
         return voice
     try:
         voice.session = ArenaShrinkingSession(session, keep_len=keep_phonemes)

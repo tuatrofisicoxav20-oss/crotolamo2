@@ -162,6 +162,23 @@ class WakeWordDetector:
                 self._model = self._load_model()
         return self._model
 
+    def warm(self) -> bool:
+        """Precalienta el modelo de openWakeWord: la misma carga que el primer
+        score(), en el hilo de quien llama, para que no caiga en el primer chunk del
+        oído (si otro hilo ya lo está cargando, espera a esa carga).
+
+        Nunca lanza: si no carga no queda nada cacheado, y el primer uso real lo
+        reintenta y da el mismo VoiceUnavailable de siempre (con él decide el
+        listener caer al wake difuso). True si el modelo quedó cargado.
+        """
+        try:
+            self._get_model()
+        except Exception as error:  # noqa: BLE001 - lo decide y lo avisa el primer uso real
+            log.debug("no precalenté el wake '%s' (%s); lo decidirá su primer uso",
+                      self.model_name, error)
+            return False
+        return True
+
     def _load_model(self):
         try:
             # Sin el módulo de ENTRENAMIENTO del paquete (sklearn + scipy: +87 MB y
