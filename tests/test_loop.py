@@ -138,8 +138,12 @@ def test_brain_drops_reply_if_turn_changed():
         assert agent.started.wait(timeout=2.0)  # el brain ya está "pensando"
         state.new_turn()                         # barge-in: actual = 2, invalida turno 1
         agent.release.set()                      # dejamos terminar la inferencia vieja
-        time.sleep(0.1)
-        assert tts_q.empty()                     # su respuesta NO se encoló
+        # El comando del turno vigente sale DESPUÉS del viejo (FIFO): cuando su END
+        # llega, el viejo ya se procesó (sin esto, un sleep pasaba sin el Brain).
+        cmd_q.put(("otra", 2))
+        assert _wait(lambda: not tts_q.empty() and tts_q.queue[-1] is END)
+        got = list(tts_q.queue)
+        assert [u.turn_id for u in got[:-1]] == [2, 2]  # la respuesta vieja NO se encoló
     finally:
         shutdown.set()
         brain.join(timeout=2.0)
@@ -216,9 +220,12 @@ def test_stt_drops_if_turn_changed():
     th.start()
     try:
         in_q.put((_NO_WAV, 1))
-        time.sleep(0.15)
-        assert out_q.empty()
-        assert stt.transcribed == 0  # ni siquiera se transcribió
+        # Detrás va un audio del turno vigente (FIFO): cuando sale, el abortado ya
+        # se procesó (sin esto, un sleep pasaba aunque el Stt no corriera).
+        in_q.put((_NO_WAV, 2))
+        assert _wait(lambda: not out_q.empty())
+        assert out_q.get() == ("lo que sea", 2) and out_q.empty()
+        assert stt.transcribed == 1  # el abortado ni siquiera se transcribió
     finally:
         shutdown.set()
         th.join(timeout=2.0)
@@ -226,15 +233,22 @@ def test_stt_drops_if_turn_changed():
 
 # --- M3.6: EarThread (con micrófono fake) ---
 class FakeMic:
-    """Entrega una secuencia fija de 'chunks' (etiquetas) y luego None."""
+    """Entrega una secuencia fija de 'chunks' (etiquetas) y luego None.
+
+    `agotado` se enciende cuando el oído vuelve a leer tras el ÚLTIMO chunk, es
+    decir, cuando ya procesó todo el guion: los tests que comprueban que algo NO
+    pasó esperan eso en vez de un sleep (que pasaba aunque el oído no corriera).
+    """
 
     def __init__(self, chunks):
         self._it = iter(chunks)
+        self.agotado = threading.Event()
 
     def read(self):
         try:
             return next(self._it)
         except StopIteration:
+            self.agotado.set()
             return None
 
 
@@ -312,12 +326,11 @@ def test_ear_no_barge_in_when_disabled():
     state.new_turn()
     state.set_mode(Mode.SPEAKING)
     tts = FakeTts()
-    ear, _stt_q, _tts_q, shutdown = _ear(
-        FakeMic(["voice", "voice", "voice"]), state, allow_barge_in=False, tts=tts
-    )
+    mic = FakeMic(["voice", "voice", "voice"])
+    ear, _stt_q, _tts_q, shutdown = _ear(mic, state, allow_barge_in=False, tts=tts)
     ear.start()
     try:
-        time.sleep(0.15)
+        assert mic.agotado.wait(2.0), "el oído no procesó el guion"
         assert state.get_mode() is Mode.SPEAKING  # half-duplex: ignora la voz
         assert tts.stopped == 0
     finally:
@@ -350,11 +363,11 @@ def _speaking_state():
 def test_barge_in_persistence_requires_multiple_chunks():
     # Un pico suelto NO dispara (min_chunks=3); una racha sostenida SÍ.
     s1 = _speaking_state()
-    ear1, _q, _t, sd1 = _ear(FakeMic(["voice"]), s1, allow_barge_in=True,
-                             grace_ms=0, min_chunks=3)
+    mic1 = FakeMic(["voice"])
+    ear1, _q, _t, sd1 = _ear(mic1, s1, allow_barge_in=True, grace_ms=0, min_chunks=3)
     ear1.start()
     try:
-        time.sleep(0.15)
+        assert mic1.agotado.wait(2.0), "el oído no procesó el guion"
         assert s1.get_mode() is Mode.SPEAKING  # un pico no interrumpe
     finally:
         sd1.set()
@@ -375,11 +388,12 @@ def test_barge_in_persistence_requires_multiple_chunks():
 def test_barge_in_grace_ignores_early_voice():
     # Con gracia amplia, la voz temprana (eco del arranque) se ignora.
     state = _speaking_state()
-    ear, _q, _t, shutdown = _ear(FakeMic(["voice"] * 6), state, allow_barge_in=True,
+    mic = FakeMic(["voice"] * 6)
+    ear, _q, _t, shutdown = _ear(mic, state, allow_barge_in=True,
                                  grace_ms=5000, min_chunks=1)
     ear.start()
     try:
-        time.sleep(0.2)
+        assert mic.agotado.wait(2.0), "el oído no procesó el guion"
         assert state.get_mode() is Mode.SPEAKING  # gracia bloquea el barge-in
     finally:
         shutdown.set()

@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import queue
 import threading
-import time
 
 from crotolamo.voice.threads import EarThread
 from crotolamo.voice.state import Mode, SharedState
@@ -23,9 +22,13 @@ class _ScriptedMic:
 
     def __init__(self, n: int) -> None:
         self._left = n
+        # Se enciende cuando el oído vuelve a leer tras el último chunk: ya
+        # procesó todo el guion (lee y procesa de a uno).
+        self.agotado = threading.Event()
 
     def read(self):
         if self._left <= 0:
+            self.agotado.set()
             return None
         self._left -= 1
         return [0.0]
@@ -52,8 +55,9 @@ def _run_ear(vad_probs: list[float], *, neg: float | None,
         except StopIteration:
             return 1.0  # tras el guion, "voz" para no cerrar por accidente
 
+    mic = _ScriptedMic(len(vad_probs))
     ear = EarThread(
-        _ScriptedMic(len(vad_probs)), lambda c: False, vad_fn, lambda f: "WAV", None,
+        mic, lambda c: False, vad_fn, lambda f: "WAV", None,
         stt_q, queue.Queue(), state, shutdown,
         vad_threshold=0.8, silence_ms=silence_ms, chunk_ms=chunk_ms,
         vad_neg_threshold=neg,
@@ -61,9 +65,12 @@ def _run_ear(vad_probs: list[float], *, neg: float | None,
     ear._start_command()
     t = threading.Thread(target=ear.run)
     t.start()
-    time.sleep(0.25)
+    # Esperar a que el oído procese TODO el guion (un sleep fijo dejaba pasar
+    # "no se cortó" aunque el oído no hubiera procesado nada).
+    agotado = mic.agotado.wait(2.0)
     shutdown.set()
     t.join(timeout=2)
+    assert agotado, "el oído no procesó el guion"
     # Si terminó el comando, encoló el WAV y pasó a THINKING.
     return (not stt_q.empty()), consumed["n"]
 
@@ -80,8 +87,9 @@ def test_sin_histeresis_la_micropausa_corta_el_comando():
 
 def test_con_histeresis_la_micropausa_no_corta():
     """Con neg_threshold=0.35, los chunks a 0.5 siguen contando como voz."""
-    terminado, _ = _run_ear(_MICRO_PAUSA, neg=0.35)
+    terminado, consumidos = _run_ear(_MICRO_PAUSA, neg=0.35)
     assert not terminado, "con histéresis, la micro-pausa NO debe cortar el comando"
+    assert consumidos == len(_MICRO_PAUSA)  # todo el guion se oyó EN la orden
 
 
 def test_con_histeresis_el_silencio_real_si_corta():

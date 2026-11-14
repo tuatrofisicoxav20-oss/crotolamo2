@@ -36,16 +36,36 @@ class FeedMic:
 
     def __init__(self):
         self.q: queue.Queue = queue.Queue()
+        self._lock = threading.Lock()
+        self._fed = 0         # chunks encolados por el test
+        self._served = 0      # chunks entregados al oído
+        self._idle_after = 0  # entregados cuando el oído volvió a leer y no había más
 
     def feed(self, chunk, times=1):
         for _ in range(times):
+            with self._lock:
+                self._fed += 1
             self.q.put(chunk)
 
     def read(self):
         try:
-            return self.q.get(timeout=0.02)
+            chunk = self.q.get(timeout=0.02)
         except queue.Empty:
+            with self._lock:
+                self._idle_after = self._served
             return None
+        with self._lock:
+            self._served += 1
+        return chunk
+
+    def wait_consumed(self, timeout=2.0) -> bool:
+        """True cuando el oído PROCESÓ todo lo encolado: volvió a leer tras el
+        último chunk (lee y procesa de a uno). Los tests que comprueban que algo
+        NO pasó esperan esto en vez de un sleep, que pasaba aunque no corriera."""
+        def consumido():
+            with self._lock:
+                return self._idle_after == self._fed
+        return _wait(consumido, timeout)
 
 
 def _wait(cond, timeout=2.0):
@@ -85,12 +105,12 @@ def test_cooldown_ignora_el_wake_durante_la_gracia_post_habla():
     try:
         # 1) Un chunk en SPEAKING para que _prev_mode registre el habla.
         mic.feed("sil")
-        time.sleep(0.1)
+        assert mic.wait_consumed(), "el oído no procesó el chunk en SPEAKING"
         # 2) Fin del turno: a IDLE. El siguiente chunk arranca el cooldown.
         state.set_mode(Mode.IDLE)
         # 3) Eco del TTS: chunks que disparan la wake word dentro de la gracia.
         mic.feed("wake", times=10)
-        time.sleep(0.3)
+        assert mic.wait_consumed(), "el oído no procesó los wakes"
         assert state.get_mode() is Mode.IDLE, "el wake en gracia NO debe despertar"
         assert state.turn_id == 0, "no debe abrirse ningún turno durante la gracia"
     finally:
