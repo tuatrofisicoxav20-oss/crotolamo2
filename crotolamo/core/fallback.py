@@ -23,18 +23,28 @@ así que `ToolAgent` no se entera. Dos decisiones que no son obvias:
 El punto de control del consumidor (`checkpoint`, ver `LiveStreamer`) sigue a la
 vista del primario a través del envoltorio, y se consulta antes de arrancar el
 local: un turno cancelado (barge-in) no paga el prompt-eval en CPU para nadie.
+
+Cuando el primario cae DENTRO de una llamada, la petición venía armada para él
+(con GLM: todas las tools). `shape_for_secondary` la adapta al respaldo antes de
+repetirla, y el cooldown se cuenta desde que el respaldo YA respondió: su carga
+en frío (~60-120 s) duraba más que el cooldown y la siguiente llamada del mismo
+turno volvía a probar la nube caída.
 """
 
 from __future__ import annotations
 
+import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 from crotolamo.core.glm import GLMAuthError
 from crotolamo.core.llm import ChatResponse, TransientLLMError
 from crotolamo.logging_setup import get_logger
 
 log = get_logger("core.fallback")
+
+Messages = list[dict[str, Any]]
+Tools = list[dict[str, Any]] | None
 
 
 class FallbackLLM:
@@ -60,6 +70,25 @@ class FallbackLLM:
         # la key no va a revivir sola). El caso "sin key al arrancar" ya lo maneja
         # engine.build_llm, que ni siquiera envuelve en FallbackLLM.
         self._auth_down: bool = False
+        # Adapta (messages, tools) al respaldo cuando el primario cae A MEDIA
+        # llamada: esa petición iba armada para la nube y el modelo local en CPU
+        # necesita su dieta chica de tools. Lo instala build_agent. None = se
+        # reenvía tal cual (lo de siempre).
+        self.shape_for_secondary: Callable[[Messages, Tools], tuple[Messages, Tools]] | None = None
+        # Qué motor respondió la última llamada de CADA hilo (ver answered_by_secondary).
+        self._local = threading.local()
+
+    @property
+    def answered_by_secondary(self) -> bool:
+        """True si la última llamada de ESTE hilo la respondió el respaldo local.
+
+        No es lo mismo que `degraded` mirado después: una llamada con el breaker
+        ya abierto no lo re-arma, así que si el cooldown vence mientras el local
+        responde, al volver `degraded` ya es False y la respuesta era del local.
+        Lo lee el agente para decidir el short-circuit con la política de quien
+        respondió. Por hilo, como la conexión del transporte.
+        """
+        return bool(getattr(self._local, "secondary", False))
 
     # `model` es parte del contrato `LLMEngine`: los clientes concretos lo traen
     # como atributo y aquí se delega en el que respondería ahora mismo. Hoy solo
@@ -106,6 +135,30 @@ class FallbackLLM:
             log.info("el motor principal volvió")
         self._retry_at = 0.0
 
+    def _for_secondary(self, messages: Messages, tools: Tools) -> tuple[Messages, Tools]:
+        """(messages, tools) para el respaldo tras un fallo del primario EN esta
+        llamada. Sin tools (el resumen de compaction, el Agent base) no hay nada
+        que adaptar; un shaper roto no puede dejar al patrón sin respuesta."""
+        if self.shape_for_secondary is None or not tools:
+            return messages, tools
+        try:
+            return self.shape_for_secondary(messages, tools)
+        except Exception:  # noqa: BLE001 - se usa la petición original
+            log.exception("no pude adaptar la petición al motor local; va tal cual")
+            return messages, tools
+
+    def _rearm(self) -> None:
+        """El cooldown cuenta desde que el respaldo YA respondió, no desde el fallo.
+
+        Si la primera respuesta local tarda más que cooldown_s (carga en frío del
+        modelo), el breaker se re-armaba antes de acabar el propio turno y la
+        siguiente llamada volvía a pagar la sonda de la nube caída. Las llamadas
+        con el breaker ya abierto no lo alargan: en charla continua la nube se
+        sigue probando cada cooldown_s. Una auth rechazada no usa el cooldown.
+        """
+        if self._retry_at:
+            self._retry_at = max(self._retry_at, time.monotonic() + self.cooldown_s)
+
     def preconnect(self) -> bool:
         """Abre por adelantado la conexión del motor que respondería ahora.
 
@@ -137,7 +190,15 @@ class FallbackLLM:
             # una caída, y el patrón debe verlo en vez de un Ollama lento.
             else:
                 self._recover()
+                self._local.secondary = False
                 return response
+            messages, tools = self._for_secondary(messages, tools)
+            self._local.secondary = True
+            try:
+                return self.secondary.chat(messages, tools=tools)
+            finally:
+                self._rearm()
+        self._local.secondary = True
         return self.secondary.chat(messages, tools=tools)
 
     def chat_stream(
@@ -147,6 +208,7 @@ class FallbackLLM:
         on_token=None,
     ) -> ChatResponse:
         checkpoint = getattr(on_token, "checkpoint", None)
+        cayo_aqui = False  # el primario se intentó EN esta llamada y falló
         if not self._primary_down():
             hablo = False
 
@@ -179,6 +241,7 @@ class FallbackLLM:
                     raise
             else:
                 self._recover()
+                self._local.secondary = False
                 return response
             # No salió nada, pero el consumidor puede tener retenido el
             # principio que soltó la nube (LiveStreamer con "sentence" lo
@@ -186,8 +249,16 @@ class FallbackLLM:
             restart = getattr(on_token, "restart", None)
             if callable(restart):
                 restart()
+            cayo_aqui = True
         if checkpoint is not None:
             # Cancelado mientras el primario fallaba: el local no arranca. El
             # fallo del primario ya contó para el breaker (fue real).
             checkpoint()
-        return self.secondary.chat_stream(messages, tools=tools, on_token=on_token)
+        self._local.secondary = True
+        if not cayo_aqui:
+            return self.secondary.chat_stream(messages, tools=tools, on_token=on_token)
+        messages, tools = self._for_secondary(messages, tools)
+        try:
+            return self.secondary.chat_stream(messages, tools=tools, on_token=on_token)
+        finally:
+            self._rearm()

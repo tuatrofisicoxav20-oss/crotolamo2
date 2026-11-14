@@ -115,7 +115,7 @@ def light_control(target: str, action: str) -> str:
     return f"Listo, patrón: {_HECHO[accion]} la luz '{target}'."
 
 
-@tool
+@tool(parallel_safe=True)
 def home_state(target: str) -> str:
     """Consulta el estado actual de una luz o entidad de la casa (encendida,
     apagada, brillo) vía Home Assistant, para contárselo al patrón.

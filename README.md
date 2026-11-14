@@ -33,7 +33,8 @@ que hace lenta la máquina. `glm-4.7-flash` es gratuito y saca la inferencia del
 equipo. Todo el andamiaje de velocidad (`tool_routing`, `fastpath`, `direct_tools`)
 se construyó para sobrevivir al CPU y solo actúa con el motor local: con GLM de
 cerebro se apaga (GLM ve todas las tools y redacta cada respuesta). Si la nube cae y
-responde el respaldo de Ollama, vuelve solo el `tool_routing`.
+responde el respaldo de Ollama, vuelve solo el `tool_routing` (con
+`[llm.glm].fallback_shortcuts = true`, también su `fastpath` y su retorno directo).
 
 Para usar GLM necesitas una API key (gratis en <https://z.ai>). **Nunca se guarda en
 el TOML** (que va a git): va en el entorno.
@@ -74,9 +75,25 @@ Con `backend = "glm"`, el cliente va envuelto en un respaldo local. Si la nube f
 **en caliente** (se cayó el wifi, caducó la key, un 429), los turnos siguientes los
 atiende Ollama con el modelo local. Más lento, pero Crotolamo no se queda mudo.
 
+El modelo local recibe sus tools enrutadas (las pocas que vienen al caso, no las ~40
+que ve GLM) desde la misma llamada en que cae la nube, no al turno siguiente: con
+todas, cada respuesta en CPU tardaba más de dos minutos y desbordaba su `num_ctx`.
+
 Tras un fallo, no se reintenta la nube en cada turno (se pagaría el timeout una y otra
-vez): se espera `[llm.glm].fallback_cooldown_s` segundos y se vuelve a probar. En
-cuanto la nube responde, se retoma sola.
+vez): se espera `[llm.glm].fallback_cooldown_s` segundos y se vuelve a probar. Esos
+segundos cuentan desde que el local **ya respondió**: su primera respuesta en frío
+(cargar el modelo, ~60-120 s) duraba más que el cooldown y el mismo turno volvía a
+probar la nube caída. En cuanto la nube responde, se retoma sola.
+
+Cada intento contra una nube inalcanzable cuesta como mucho
+`[llm.glm].connect_timeout` (5 s) por cada dirección que da el DNS, no el timeout de
+la respuesta entera (60 s). A eso se suma lo que tarde el sistema en resolver el
+nombre, que ese tope no cubre: con el nombre en caché no es nada, pero un resolver
+que espera a un servidor DNS caído añade su propia espera. Y una conexión reutilizada
+que el sistema ya sabe muerta (el servidor la cerró, o el keepalive TCP vio la ruta
+caída, 15-25 s después del corte) se descarta antes de escribir en ella. Un corte de
+hace menos que eso, sobre una conexión reutilizada, todavía puede costar el timeout
+de la respuesta.
 
 Una excepción deliberada: si la nube falla **a media frase** en modo voz (ya salieron
 tokens por el altavoz), ese turno falla en vez de reintentar — repetir el principio de

@@ -15,8 +15,12 @@ los dos clientes.
 from __future__ import annotations
 
 import http.client
+import ipaddress
 import json
+import math
 import os
+import select
+import socket
 import ssl
 import threading
 import time
@@ -44,6 +48,131 @@ def _reloj() -> float:
     if _BOOTTIME is not None:
         return time.clock_gettime(_BOOTTIME)
     return time.monotonic()
+
+
+# Tope para CONECTAR: el connect TCP (que socket.create_connection aplica a CADA
+# dirección que da el DNS) y el handshake TLS. Va aparte del de LEER, que cubre
+# la generación entera (60 s la nube, 180 s Ollama). Con un único número, una
+# nube en un agujero negro (wifi arriba, internet caído) costaba 60 s por
+# dirección en cada sonda antes de pasar al modelo local; un handshake sano
+# tarda milisegundos, así que 5 s sobran incluso tethering por el móvil.
+DEFAULT_CONNECT_TIMEOUT_S = 5.0
+
+# Keepalive TCP del keep-alive ocioso: sin él, Linux no prueba un socket
+# quieto en 2 h y una ruta muerta solo se descubría escribiendo y esperando el
+# timeout de lectura entero. Con estos valores el kernel lo da por muerto entre
+# 15 y 25 s después del corte (una sonda tras 10 s sin tráfico; 3 sin respuesta,
+# cada 5 s) y `_dropped` lo ve antes de escribir. De paso mantiene viva la
+# entrada del NAT del router. Precio: mientras el servidor no cierre el ocioso,
+# un segmento vacío (y su ACK) cada 10 s; por eso solo contra servidores de
+# fuera de esta máquina (ver HTTPTransport.__init__).
+_KEEPALIVE = (("TCP_KEEPIDLE", 10), ("TCP_KEEPINTVL", 5), ("TCP_KEEPCNT", 3))
+
+
+def _tope_de_conexion(connect_timeout: Any, timeout: float) -> float:
+    """El tope de conectar pedido, o el de fábrica (sin pasarse del de leer).
+
+    Un valor raro en la config no puede tumbar la red: con 0 el connect fallaría
+    al instante en cada petición y con un negativo reventaría con un ValueError
+    crudo. Se avisa en el log y se usa el de fábrica.
+    """
+    por_defecto = min(timeout, DEFAULT_CONNECT_TIMEOUT_S)
+    if connect_timeout is None:
+        return por_defecto
+    try:
+        segundos = float(connect_timeout)
+    except (TypeError, ValueError):
+        segundos = math.nan
+    if math.isfinite(segundos) and segundos > 0:
+        return segundos
+    log.warning("connect_timeout inválido (%r): uso %s s", connect_timeout, por_defecto)
+    return por_defecto
+
+
+def _es_loopback(host: str) -> bool:
+    """¿El servidor está en esta misma máquina (Ollama local)?"""
+    host = host.lower()
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _enable_keepalive(sock: socket.socket) -> None:
+    """Keepalive TCP en el socket (ver _KEEPALIVE). Best-effort: sin estas
+    opciones (otro sistema) el socket queda como siempre."""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        for nombre, valor in _KEEPALIVE:
+            opcion = getattr(socket, nombre, None)
+            if opcion is not None:
+                sock.setsockopt(socket.IPPROTO_TCP, opcion, valor)
+    except OSError:
+        pass
+
+
+def _disable_keepalive(sock: Any) -> None:
+    """Quita el keepalive TCP (best-effort; sin socket de verdad, nada)."""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 0)
+    except (AttributeError, OSError):
+        pass
+
+
+def _dropped(conn: Any) -> bool:
+    """¿El kernel ya dio por muerto el keep-alive ocioso de `conn`?
+
+    Un socket QUIETO no tiene nada que leer: si select() lo da por legible es
+    que trae un EOF (el servidor lo cerró) o un error (RST, o el keepalive TCP
+    vio la ruta caída). Mismo criterio que is_connection_dropped de urllib3.
+    Sin socket que mirar (aún sin conectar, o los dobles de los tests) cuenta
+    como vivo; con un descriptor que select() no admite, también (como antes).
+    """
+    sock: Any = getattr(conn, "sock", None)
+    fileno = getattr(sock, "fileno", None)
+    if fileno is None:
+        return False
+    if fileno() < 0:
+        return True  # ya cerrado
+    try:
+        legible, _, _ = select.select([sock], [], [], 0)
+    except ValueError:
+        return False  # descriptor >= FD_SETSIZE (1024): no se puede mirar
+    except OSError:
+        return True
+    return bool(legible)
+
+
+class _HTTPConnection(http.client.HTTPConnection):
+    """HTTPConnection con dos topes: el corto para CONECTAR, el de siempre para LEER.
+
+    http.client usa su único `timeout` para el connect TCP, el handshake TLS y
+    cada lectura. Aquí connect() corre con `connect_timeout` y, ya conectado,
+    el socket pasa al timeout de lectura de siempre.
+    """
+
+    def __init__(self, host: str, port: int | None, *, timeout: float,
+                 connect_timeout: float, keepalive: bool, **kwargs: Any) -> None:
+        super().__init__(host, port, timeout=timeout, **kwargs)
+        self.connect_timeout = connect_timeout
+        self.keepalive = keepalive
+
+    def connect(self) -> None:
+        lectura = self.timeout
+        self.timeout = self.connect_timeout
+        try:
+            super().connect()  # TCP por dirección y, en HTTPS, el handshake TLS
+        finally:
+            self.timeout = lectura
+        self.sock.settimeout(lectura)
+        if self.keepalive:
+            _enable_keepalive(self.sock)
+
+
+class _HTTPSConnection(_HTTPConnection, http.client.HTTPSConnection):
+    """Lo mismo sobre TLS: el handshake también queda bajo el tope de conectar."""
 
 
 class LLMEngine(Protocol):
@@ -100,7 +229,11 @@ class HTTPTransport:
     - Un fallo a media petición (timeout esperando la respuesta, por ejemplo)
       cierra la conexión en el acto: con el socket abierto el servidor seguía
       generando para nadie hasta la siguiente petición de ese hilo.
-    - Timeouts (de conexión y de lectura, vía el timeout del socket).
+    - Dos topes: `connect_timeout` para conectar (TCP, por cada dirección del
+      DNS, y TLS; 5 s de fábrica) y `timeout` para leer (la generación entera).
+    - Un keep-alive ocioso que el kernel ya dio por muerto se tira ANTES de
+      escribir (ver `_reuse_or_close`); contra un servidor que no está en esta
+      máquina, el keepalive TCP lo descubre 15-25 s después de un corte.
 
     SEGURO ENTRE HILOS vía conexión POR HILO (threading.local): en el modo de
     voz concurrente, WarmLLM y BrainThread pueden llamar chat() sobre el mismo
@@ -113,7 +246,9 @@ class HTTPTransport:
     Stdlib puro, igual que el resto del proyecto: cero dependencias.
     """
 
-    def __init__(self, base_url: str, timeout: float = 60) -> None:
+    def __init__(
+        self, base_url: str, timeout: float = 60, connect_timeout: float | None = None,
+    ) -> None:
         parts = urllib.parse.urlsplit(base_url)
         if parts.scheme not in ("http", "https") or not parts.hostname:
             raise ValueError(f"URL inválida para el transporte HTTP: {base_url!r}")
@@ -121,7 +256,13 @@ class HTTPTransport:
         self._host = parts.hostname
         self._port = parts.port  # None = puerto por defecto del esquema
         self.base_path = parts.path.rstrip("/")
-        self.timeout = timeout
+        self.timeout = timeout  # leer: la generación entera
+        # None = DEFAULT_CONNECT_TIMEOUT_S (sin pasarse de `timeout`).
+        self.connect_timeout = _tope_de_conexion(connect_timeout, timeout)
+        # Keepalive TCP solo contra un servidor de fuera: el loopback no se cae
+        # en silencio y Ollama no cierra nunca un keep-alive ocioso, así que ahí
+        # solo sería un sondeo cada 10 s, 24/7, sin nada que descubrir.
+        self._keepalive = not _es_loopback(self._host)
         # Estado por hilo: .conn (la conexión keep-alive), .last (la última
         # respuesta, para detectar streams a medias), .finishable (el
         # consumidor avisó que .last llegó a su fin lógico) y .finished_at
@@ -145,9 +286,9 @@ class HTTPTransport:
         self._local.last = value
 
     def _connect(self) -> http.client.HTTPConnection:
-        if self._https:
-            return http.client.HTTPSConnection(self._host, self._port, timeout=self.timeout)
-        return http.client.HTTPConnection(self._host, self._port, timeout=self.timeout)
+        cls = _HTTPSConnection if self._https else _HTTPConnection
+        return cls(self._host, self._port, timeout=self.timeout,
+                   connect_timeout=self.connect_timeout, keepalive=self._keepalive)
 
     # Cola de un stream ya terminado lógicamente: línea en blanco + chunk
     # terminal, unos pocos bytes que para la siguiente petición ya llegaron.
@@ -163,6 +304,12 @@ class HTTPTransport:
     # "funciona" y la respuesta no llega nunca, así que costaría el timeout de
     # lectura entero y abriría el breaker. Antes del finish() los streams
     # nunca reutilizaban; pasado este tope, conexión nueva como entonces.
+    # El keepalive TCP + `_dropped` NO lo vuelven innecesario: solo ven un corte
+    # de hace 15-25 s o más. Medido con el bench del diseño (reloj simulado), en
+    # el loop de voz con stream: un corte de hace 10-20 s cuesta 5 s con este
+    # tope y 60 s sin él; el precio es un handshake por turno con más de 15 s
+    # de hueco, lo que los streams pagaban siempre. Sin stream (respuesta leída
+    # entera) no aplica, como siempre: ahí costaría ese handshake en cada turno.
     _REUSE_MAX_IDLE_S = 15.0
 
     def finish(self, resp: Any) -> None:
@@ -172,9 +319,17 @@ class HTTPTransport:
         la cola la hace la siguiente petición de este hilo (ver `_drain`).
         Un aviso sobre otra respuesta, o desde otro hilo, no cuenta.
         """
-        if resp is not None and resp is self._last:
+        if resp is self._last and resp is not None:
             self._local.finishable = True
             self._local.finished_at = _reloj()
+            if self._keepalive and not resp.isclosed():
+                # Con la cola sin leer, este keep-alive solo se reutiliza dentro de
+                # _REUSE_MAX_IDLE_S (15 s) y el keepalive TCP no da veredicto antes
+                # de 10 + 5*3 = 25 s: ahí solo eran sondas por la radio (medido: 4
+                # en 41 s, y la conexión se tiraba igual) hasta que el servidor
+                # cerrara el ocioso. Vuelve al reutilizarla (`_reuse_or_close`).
+                _disable_keepalive(getattr(self._conn, "sock", None))
+                self._local.keepalive_off = True
 
     def _drain(self, resp: Any) -> bool:
         """Lee la cola de `resp`, acotada; True si el socket quedó limpio.
@@ -219,6 +374,41 @@ class HTTPTransport:
             self._conn = None
         self._last = None
         self._local.finishable = False
+        self._local.keepalive_off = False
+
+    def _reuse_or_close(self) -> None:
+        """La política de reutilización del keep-alive: UNA, para stream y no-stream.
+
+        La conexión de este hilo se reutiliza solo si:
+        1. Su última respuesta acabó. Leída entera (lo normal sin stream), o un
+           stream que avisó su fin lógico (finish) hace como mucho
+           _REUSE_MAX_IDLE_S y cuya cola se drenó dentro de su tope. Si quedó a
+           medias, el socket trae bytes pendientes y no sirve.
+        2. Y el kernel no la dio por muerta (`_dropped`): el servidor la cerró, o
+           el keepalive TCP vio la ruta caída. Se mira DESPUÉS de drenar, porque
+           la cola pendiente también hace legible el socket.
+        Si no, se cierra sin escribir nada y la petición abre otra conexión, bajo
+        el tope de conectar. Antes, un keep-alive muerto se descubría escribiendo:
+        una escritura fallida más el reintento, o el timeout de lectura entero.
+        """
+        last = self._last
+        finishable = getattr(self._local, "finishable", False) and (
+            _reloj() - self._local.finished_at <= self._REUSE_MAX_IDLE_S)
+        self._local.finishable = False
+        if last is not None and not last.isclosed():
+            if not (finishable and self._drain(last)):
+                self.close()
+                return
+        if self._conn is not None and _dropped(self._conn):
+            log.debug("keep-alive caído mientras estaba ocioso: conexión nueva")
+            self.close()
+        if getattr(self._local, "keepalive_off", False):
+            # Un stream terminado le quitó el keepalive (ver finish); si la
+            # conexión sigue, lo recupera: tras una respuesta leída entera el
+            # ocioso ya no tiene tope y es lo que descubre la ruta caída.
+            self._local.keepalive_off = False
+            if self._conn is not None and getattr(self._conn, "sock", None) is not None:
+                _enable_keepalive(self._conn.sock)
 
     def post_json(
         self,
@@ -241,17 +431,7 @@ class HTTPTransport:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8", errors="replace")
         hdrs = {"Content-Type": "application/json", **(headers or {})}
 
-        # Si la respuesta anterior quedó a medias, el socket tiene bytes
-        # pendientes y no es reutilizable: se tira y se abre conexión nueva.
-        # Salvo que el consumidor avisara (finish) que llegó al fin lógico: lo
-        # que falta es solo la cola del cuerpo, que se lee y el socket sigue.
-        last = self._last
-        finishable = getattr(self._local, "finishable", False) and (
-            _reloj() - self._local.finished_at <= self._REUSE_MAX_IDLE_S)
-        self._local.finishable = False
-        if last is not None and not last.isclosed():
-            if not (finishable and self._drain(last)):
-                self.close()
+        self._reuse_or_close()
 
         url = f"{self.base_path}{path}"
         for intento in (1, 2):

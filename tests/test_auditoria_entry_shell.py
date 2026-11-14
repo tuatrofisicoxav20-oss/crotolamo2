@@ -258,6 +258,7 @@ def test_build_agent_con_glm_no_corta_una_cadena_en_una_tool_con_flag_direct(mon
     monkeypatch.setattr(memoria_mod, "get_memoria",
                         lambda: type("M", (), {"enabled": False})())
     monkeypatch.setattr(hooks, "make_facts_prehook", lambda: (lambda text: text))
+    monkeypatch.setattr(hooks, "make_pinned_facts_prehook", lambda conv: (lambda text: text))
 
     enfocadas: list[list[str]] = []
     monkeypatch.setattr(windows, "_clients", lambda: [
@@ -403,6 +404,7 @@ def test_shell_como_script_respeta_sus_argumentos_y_configura_el_logging(
     monkeypatch.setattr(memoria_mod, "get_memoria",
                         lambda: type("M", (), {"enabled": False})())
     monkeypatch.setattr(hooks, "make_facts_prehook", lambda: (lambda text: text))
+    monkeypatch.setattr(hooks, "make_pinned_facts_prehook", lambda conv: (lambda text: text))
     # El script se ejecuta como módulo nuevo: el doble entra por donde lo importa.
     monkeypatch.setattr(engine, "build_llm", lambda s: llm)
     monkeypatch.setattr(sys, "argv", ["interfaces/shell.py", "--stream"])

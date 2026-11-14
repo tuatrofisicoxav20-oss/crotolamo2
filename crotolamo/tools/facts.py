@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from crotolamo.core.memoria import parece_secreto
 from crotolamo.persistence import facts
-from crotolamo.tools.base import tool
+from crotolamo.tools.base import LANE_LIBRETA, tool
 
 
 @tool
@@ -27,7 +27,7 @@ def remember_fact(texto: str, categoria: str = "general") -> str:
     return f"Anotado, patrón. Lo recordaré: «{texto.strip()}»."
 
 
-@tool
+@tool(parallel_safe=True, parallel_lane=LANE_LIBRETA)
 def recall_facts(categoria: str = "") -> str:
     """Recupera los hechos recordados, opcionalmente filtrando por categoría.
 
@@ -45,7 +45,7 @@ def recall_facts(categoria: str = "") -> str:
     return "Esto es lo que recuerdo, patrón:\n" + "\n".join(lines)
 
 
-@tool
+@tool(parallel_safe=True, parallel_lane=LANE_LIBRETA)
 def search_facts(query: str) -> str:
     """Busca entre los hechos recordados los más relevantes a una consulta.
 

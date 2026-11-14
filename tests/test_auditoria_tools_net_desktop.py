@@ -387,6 +387,11 @@ class _RespuestaFalsa:
     def read(self, _n: int = -1) -> bytes:
         return self._body
 
+    def read1(self, _n: int = -1) -> bytes:
+        # _http_json lee a trozos (read1) hasta que no queda nada.
+        body, self._body = self._body, b""
+        return body
+
 
 class _OpenerFalso:
     def __init__(self, body: bytes) -> None:

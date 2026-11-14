@@ -141,8 +141,28 @@ temperature = 0.2
 # hasta 10 min. 180s cubre un arranque en frío (~60-120s) + la respuesta; si se
 # excede, devuelve error en personaje y la voz vuelve a reposo (no se queda pegada).
 timeout     = 180
+# Tope para CONECTAR con Ollama, aparte del timeout de arriba (que cubre la
+# respuesta entera, carga en frío incluida). Sin la clave: 5 s (o el timeout, si
+# es menor). Antes era el mismo número: un [llm].host en otra máquina que no
+# contesta esperaba los 180 s enteros por cada dirección del DNS. Con Ollama en
+# esta máquina conectar es instantáneo (o falla al momento si no corre).
+# connect_timeout = 5
 # Máximo de iteraciones del loop agéntico (anti-loop infinito).
 max_iterations = 6
+# Política de repetición. Apagada de fábrica: la decides tú, porque cambia lo que
+# oyes. Hoy, si el modelo pide otra vez en el MISMO turno una llamada idéntica
+# (misma tool, mismos argumentos) que ya falló, se vuelve a correr (o a preguntar)
+# hasta gastar las max_iterations y acabar en "Me enredé en demasiados pasos". Con
+# true, esa repetición no se corre ni se te vuelve a preguntar: una tool que no
+# existe, una ruta que el guard bloquea o una confirmación que negaste se frenan a
+# la primera; un fallo de la tool o el aviso de fallo de un server MCP, tras UN
+# reintento. Al modelo le vuelve el mismo resultado y su siguiente petición va SIN
+# tools, así que te explica el fallo con sus palabras (y se habla en vivo). Al
+# agotar max_iterations, una última petición sin tools sustituye a la frase
+# enlatada (si falla, queda la enlatada). Medido con GLM y un modelo que insiste:
+# 6 llamadas al LLM (~110 KB) pasan a 3-4 (~39-58 KB), unos 3-4 s antes a ~1.2 s
+# por llamada; en voz concurrente, el "dímela por el shell" se dice 1 vez, no 6.
+# stop_on_repeated_failure = false
 # Tool routing: en vez de mandarle al modelo las ~32 tools en cada turno (lento en
 # CPU: ~130s evaluando el prompt), se le mandan solo las relevantes a la consulta
 # (~2-5s). Medido aquí: 6 tools = 2.4s vs 30 tools = 142s. Déjalo en true salvo
@@ -153,8 +173,11 @@ tool_routing = true
 max_tools = 8
 # keep_alive: cuánto mantiene Ollama el modelo residente en RAM tras responder.
 # Evita pagar la recarga del modelo (~60s en frío) en cada turno de una sesión.
-# OJO: el cache de prefijo NO amortiza entre turnos (cada turno re-evalúa el prompt);
-# lo que hace usable el rendimiento es el tool_routing de abajo (prompt chico), no
+# OJO: residente, Ollama reusa el cache KV del PRINCIPIO del prompt que coincide con
+# el request anterior. Dentro de un turno (la llamada tras una tool) se aprovecha;
+# entre turnos casi nunca, porque ese principio cambia: otras tools enrutadas, la
+# ventana que desliza un turno, el ajuste a num_ctx que descarta los más viejos.
+# Lo que hace usable el rendimiento es el tool_routing de arriba (prompt chico), no
 # este keep_alive. Medido aquí con routing: charla ~5s, acción con tool ~17-22s.
 # "15m" = no recarga durante la sesión y libera RAM tras 15 min ocioso. Sube a "1h"
 # o "-1" (siempre residente) si te sobra RAM; baja si la lap va justa de memoria.
@@ -162,18 +185,29 @@ keep_alive = "15m"
 # Ventana de contexto que Ollama reserva (tokens). Más chica = menos RAM y menos
 # trabajo del KV-cache en CPU, pero va justa: medido con el tokenizer de qwen2.5,
 # un turno con 8 tools enrutadas ya parte de ~1600-1750 tokens fijos (persona +
-# schemas), y con 2048 quedan ~300-450 para historial, pregunta y respuesta. Lo que
-# no cabe, Ollama lo recorta EN SILENCIO (descarta los mensajes más viejos): en modo
-# local pierde el hilo de la charla y no ve completo un archivo o página largos.
-# Súbelo (p.ej. 4096, a costa de RAM) si te pasa eso o si activas
-# [memory].compaction con historiales largos.
+# schemas), y con 2048 quedan ~300-450 para historial, pregunta y respuesta. Los
+# hechos anclados ([memory].pin_facts) también son fijos: ~18 tokens por hecho, ~540
+# con los 30 que caben. Con muchos hechos y 2048, el local pierde antes la charla
+# vieja y, si ni sin ella cabe el turno, recibe solo los hechos MÁS NUEVOS que
+# quepan (el log lo avisa; la persona nunca se recorta). Lo que
+# no cabe ya no lo recorta Ollama en silencio (cortaba el PRINCIPIO del prompt,
+# persona incluida): Crotolamo ajusta cada request a esta ventana antes de
+# mandarlo. Conserva la persona, las tools y el turno en curso, descarta los turnos
+# más viejos enteros y recorta los resultados de tool largos (a ~35% de la ventana,
+# 2365 caracteres con 2048), y lo avisa con un WARNING en el log. Solo el request:
+# el historial queda entero y la nube lo ve completo cuando vuelve. Con 2048 el
+# modelo local pierde pronto el hilo de la charla y no ve completo un archivo o
+# página largos: súbelo (p.ej. 4096, a costa de RAM) si te pasa eso o si activas
+# [memory].compaction con historiales largos. Sin la clave no se ajusta nada.
 num_ctx = 2048
 # Fast-path SIN LLM (misión velocidad): comandos inequívocos ("pausa la
 # música", "qué apps tengo abiertas", "abre opera") ejecutan la tool directo
 # (~0.1s en vez de ~17-22s de LLM). Solo tools seguras; cualquier frase con
 # matices cae al agente normal. false = todo pasa por el LLM.
 # OJO: con backend="glm" se IGNORA (queda en off): nada de comandos prehechos,
-# GLM razona y redacta cada turno. Este knob solo aplica al motor local.
+# GLM razona y redacta cada turno. Este knob solo aplica al motor local; con GLM,
+# también cuando responde el respaldo local (sin internet), pero solo si pones
+# [llm.glm].fallback_shortcuts = true.
 fastpath = true
 
 # --- Motor en la nube (backend = "glm") ---
@@ -186,6 +220,15 @@ model    = "glm-4.7-flash"
 # 60s sobra: la nube responde en ~1-2s. El timeout de 180s de Ollama existía por
 # el arranque en frío del modelo local, que aquí no aplica.
 timeout  = 60
+# Tope para CONECTAR con la nube (TCP, por cada dirección que da el DNS, y el
+# handshake TLS), aparte del timeout de arriba, que cubre la respuesta. Sin la
+# clave: 5 s. Antes era el mismo número: con el wifi arriba e internet caído, cada
+# intento de la nube esperaba 60 s por dirección (120 s con dos) antes de pasar al
+# respaldo local; ahora 5 s (10 s con dos). No incluye resolver el nombre (DNS),
+# que tiene su propio límite en el sistema. Súbelo (p.ej. 10) si conectas por un
+# enlace muy lento (tethering con mala señal) y caes al respaldo sin motivo;
+# bájalo (3) para notar antes que no hay internet.
+# connect_timeout = 5
 # Razonamiento interno del modelo ANTES de responder. GLM-4.7 lo trae ENCENDIDO por
 # defecto; aquí se apaga. MEDIDO contra la API real (2026-07-09):
 #     charla:  thinking=on 6.87s  |  thinking=off 1.23s   (5.6x)
@@ -198,18 +241,72 @@ thinking = false
 # o cuidar la cuota del tier gratuito. Ojo: si el tope corta, la frase queda a medias
 # (y un tool-call con argumentos largos, incompleto).
 # max_tokens = 512
+# Ventana de ENTRADA del modelo (tokens estimados, ~3.3 bytes de JSON por token),
+# solo como red de seguridad. Un request más grande (unas cuantas lecturas de
+# archivo seguidas) recibía un 400 permanente: sin respaldo local y fallando cada
+# turno hasta que 20 turnos más sacaban esos resultados del historial. Pasado el
+# tope se descartan los turnos más viejos enteros, solo de ese request (el
+# historial queda igual), con un WARNING en el log. Un turno normal (~15-55 KB) no
+# se acerca y sale idéntico. Sin la clave: 128000. 0 = sin red, como antes.
+# max_context_tokens = 128000
 # Respaldo local: si GLM falla en caliente (se cayó el wifi, la key caducó, un 429),
 # Crotolamo usa el modelo de Ollama de arriba durante estos segundos antes de volver
 # a intentar la nube. Sin esto, cada frase esperaría el timeout para nada. Es lo que
-# permite seguir usando el asistente SIN INTERNET, aunque más lento.
+# permite seguir usando el asistente SIN INTERNET, aunque más lento. Tras la caída,
+# los segundos cuentan desde que el local YA respondió (su carga en frío tarda
+# ~60-120s), así que el turno que descubre la caída no vuelve a probar la nube a
+# media respuesta. Un turno que empieza justo antes de que venza sí puede probarla.
 fallback_cooldown_s = 60
+# Atajos del motor local mientras responde el respaldo (sin internet). Con false (lo
+# de siempre) el local solo recupera el tool_routing; nada de fastpath ni de retorno
+# directo: lo que oyes lo redacta el modelo, en 2 llamadas por orden con tool. Con
+# true usa los suyos de [llm]: fastpath y las tools de retorno directo (dice la frase
+# de la tool tal cual, p.ej. "RAM: 5.0 GB usados..."). Medido en el bench de la
+# caída: 11 -> 6 llamadas al modelo local en 6 órdenes; "pausa la música" 8.4s -> 0s.
+# Con la nube arriba no cambia nada: GLM sigue sin atajos.
+# fallback_shortcuts = false
 
 [memory]
 # Ventana deslizante del historial conversacional (nº de turnos user+assistant).
 max_turns = 20
 # M5: al exceder max_turns, resumir los turnos viejos en vez de descartarlos.
 # Cuesta una llamada corta al LLM por compactación; default false para no gastar.
+# El resumen se hace DESPUÉS de responder, en segundo plano (antes iba antes de la
+# llamada del turno: un viaje de ida y vuelta más antes de la primera palabra).
+# Hasta que termina, el modelo sigue viendo el turno viejo tal cual; si falla, se
+# reintenta tras el turno siguiente (antes ese turno se perdía).
 compaction = false
+# Hechos que guardas con "acuérdate de que..." (SQLite): van en un mensaje de
+# sistema ANCLADO tras la persona, en cada request. Se releen cada turno: lo que
+# guardes u olvides se nota en el siguiente. false = como antes: se inyectaban UNA
+# vez, dentro del primer mensaje de la sesión, y se perdían cuando ese mensaje salía
+# de la ventana (turno max_turns+1; el daemon de voz nunca reinicia la sesión) o con
+# /reset. Con [memoria].enabled no aplica: ahí los hechos viven en la memoria
+# semántica.
+pin_facts = true
+# --- Lo que viaja en cada request (decisiones tuyas; sin la clave, lo de siempre) ---
+# Medido con el bench de la sesión en la nube (60 turnos, turnos 31-60, el default
+# manda ~2.16 MB y reusa el 40% del prefijo entre turnos).
+# trim_chunk: al llenarse la ventana, tira N turnos de golpe en vez de uno por
+# turno; el principio del historial queda quieto N-1 turnos y el cache de prefijo
+# del proveedor lo aprovecha: reuso 40% -> 89%, bytes nuevos por turno -83%. Coste:
+# la ventana oscila entre max_turns-N+1 y max_turns turnos (14..20 con 7). El ahorro
+# en latencia y cuota depende del cache implícito de Z.ai: confírmalo antes de
+# dejarlo puesto con CROTOLAMO_LOG=DEBUG, en la línea "GLM: prompt_tokens=...
+# cached_tokens=..." de cada llamada (en streaming, solo si Z.ai manda el usage).
+# trim_chunk = 7
+# stale_tool_turns: los resultados de tool de hace más de N turnos viajan como sus
+# primeros 800 caracteres y una nota para que el modelo vuelva a llamar la tool si
+# los necesita; /historial y el resumen guardan el original. Con 2: -32% de bytes
+# (una lectura de archivo de 20 KB viaja en 3 requests, no en 30) y reuso 60%.
+# Coste: para citar un archivo de hace 3+ turnos vuelve a leerlo (una llamada más).
+# Con trim_chunk = 7: -36% de bytes y reuso 92%.
+# stale_tool_turns = 2
+# idle_reset_min: tras N minutos sin hablar (cuenta la laptop suspendida), el turno
+# siguiente empieza con la ventana vacía; los hechos anclados y la memoria semántica
+# no se tocan. Un "hola" tras 8 h pasa de ~46 KB (con resultados de tool de ayer) a
+# ~18 KB. Coste: tras una pausa larga olvida la charla de antes.
+# idle_reset_min = 30
 
 # Memoria SEMÁNTICA de largo plazo (mem0 + Chroma + fastembed): Crotolamo recuerda
 # lo que le cuentas de ti y lo trae cuando viene al caso, sesión tras sesión.

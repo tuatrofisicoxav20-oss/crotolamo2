@@ -14,12 +14,14 @@ from __future__ import annotations
 
 import http.client
 import json
+import time
 import urllib.error
 import urllib.request
 from typing import Any
 from urllib.parse import urlencode
 
 from crotolamo.settings import get_settings
+from crotolamo.tools import _web
 
 DEFAULT_BASE_URL = "http://frigate.local:5000"
 # Timeout corto: Frigate vive en la LAN; si no responde en 6s, está caído.
@@ -65,12 +67,17 @@ def _http_json(url: str, timeout: float = _TIMEOUT) -> Any:
     """GET con urllib que devuelve el body parseado como JSON.
 
     Helper separado para que los tests lo parcheen sin tocar la red (mismo rol
-    que _web._http_get). Lanza HTTPError/URLError/OSError si la red falla y
+    que _web._http_get). Lanza HTTPError/URLError/OSError si la red falla
+    (TimeoutError si el cuerpo no acaba de llegar en `timeout` segundos) y
     json.JSONDecodeError si el body no es JSON.
     """
     request = urllib.request.Request(url)
     with _opener().open(request, timeout=timeout) as response:  # noqa: S310
-        raw = response.read(_MAX_BODY)
+        # A trozos y con plazo total para el cuerpo: un único read(_MAX_BODY)
+        # esperaba, recv a recv, a juntar el tope entero si Frigate goteaba.
+        raw, a_tiempo = _web.read_body(response, time.monotonic() + timeout, _MAX_BODY)
+    if not a_tiempo:  # medio JSON no sirve: es un timeout, como el del socket
+        raise TimeoutError("timed out")
     return json.loads(raw) if raw.strip() else []
 
 

@@ -537,7 +537,9 @@ def test_router_la_familia_de_recordar_ausente_no_ocupa_cupo():
     mem0 ocupaban hueco y de files solo llegaba create_note (5 tools de 8)."""
     reg = _registry_con_una_familia(presente=_FACTS, ausente=_MEMORIA)
     nombres = _enviadas(reg, "acuérdate de la nota del archivo")
-    assert nombres == _FACTS + ["create_note", "read_file", "write_file", "list_dir"]
+    # Las schemas van en el orden del registry (bytes estables, ver route_schemas).
+    esperadas = set(_FACTS + ["create_note", "read_file", "write_file", "list_dir"])
+    assert nombres == [n for n in reg.names() if n in esperadas]
 
 
 def test_router_remember_fact_llega_si_sobra_cupo():
@@ -556,8 +558,8 @@ def test_router_con_mem0_los_nombres_de_sqlite_tampoco_ocupan_cupo():
     SQLite (retirados del registry) eran los fantasmas."""
     reg = _registry_con_una_familia(presente=_MEMORIA, ausente=_FACTS)
     nombres = _enviadas(reg, "acuérdate de la nota del archivo")
-    assert nombres == _MEMORIA + [
-        "create_note", "read_file", "write_file", "list_dir", "make_dir"]
+    esperadas = set(_MEMORIA + ["create_note", "read_file", "write_file", "list_dir", "make_dir"])
+    assert nombres == [n for n in reg.names() if n in esperadas]
 
 
 def test_router_el_tope_se_sigue_respetando_con_el_filtro():

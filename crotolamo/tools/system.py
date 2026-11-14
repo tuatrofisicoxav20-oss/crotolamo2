@@ -23,7 +23,7 @@ def _human(num_bytes: float) -> str:
     return f"{num_bytes:.1f}P"
 
 
-@tool
+@tool(parallel_safe=True)
 def disk_usage() -> str:
     """Muestra el uso de disco de la partición del home."""
     usage = shutil.disk_usage(HOME)
@@ -34,7 +34,7 @@ def disk_usage() -> str:
     )
 
 
-@tool
+@tool(parallel_safe=True)
 def ram_usage() -> str:
     """Muestra el uso de memoria RAM."""
     meminfo = {}
@@ -53,7 +53,7 @@ def ram_usage() -> str:
     return f"RAM: {_human(used)} usados de {_human(total)} ({pct:.0f}%), patrón."
 
 
-@tool
+@tool(parallel_safe=True)
 def list_processes(limit: int = 8) -> str:
     """Lista los procesos que más memoria consumen (read-only).
 
@@ -72,7 +72,7 @@ def list_processes(limit: int = 8) -> str:
     return "Procesos que más comen, patrón:\n" + "\n".join([header, *rows])
 
 
-@tool
+@tool(parallel_safe=True)
 def system_status() -> str:
     """Resumen del estado del sistema: disco, RAM y carga."""
     parts = [disk_usage(), ram_usage()]

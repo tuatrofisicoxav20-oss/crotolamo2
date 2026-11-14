@@ -146,3 +146,16 @@ def is_hard_error(result: str) -> bool:
     if not result or not result.strip():
         return True
     return result.lstrip().startswith(HARD_ERROR_PREFIXES)
+
+
+# Prefijos de los "soft-errors" de los servers MCP (mcp/bridge._soft los arma con
+# este mismo texto). Son texto en personaje, NO fallos duros: el short-circuit y el
+# historial los tratan como cualquier resultado. Solo sirven para que el registro
+# del turno (core/turn.py) sepa que la llamada no salió bien.
+MCP_SOFT_ERROR_PREFIX = "El server MCP '"
+SOFT_ERROR_PREFIXES: tuple[str, ...] = (MCP_SOFT_ERROR_PREFIX,)
+
+
+def is_soft_error(result: str) -> bool:
+    """True si el resultado es un fallo avisado en personaje por un server MCP."""
+    return bool(result) and result.lstrip().startswith(SOFT_ERROR_PREFIXES)

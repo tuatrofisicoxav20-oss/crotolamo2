@@ -204,6 +204,72 @@ def test_agente_responde_aunque_la_memoria_reviente(tmp_path):
     assert agent.handle_turn("hola") == "Sigo vivo, patrón."
 
 
+# --- comandos anclados: ni búsqueda ni extracción (leen el TurnInfo) ------------
+
+def _agent_con_musica(m: Memoria, llm: _LLM, tmp_path: Path, fastpath: bool) -> ToolAgent:
+    from crotolamo.tools.base import Tool
+
+    reg = Registry()
+    reg.register(Tool("music_control", lambda action="": f"Pausada, patrón. ({action})",
+                      "música", {"type": "object", "properties": {"action": {"type": "string"}}}))
+    return ToolAgent(
+        llm, Conversation("SYS"), registry=reg, guard=Guard([tmp_path]),
+        pre_hooks=[make_memoria_prehook(m)], after_turn_hooks=[make_memoria_posthook(m)],
+        fastpath=fastpath, route_fn=lambda t: [],
+    )
+
+
+@pytest.mark.parametrize("fastpath", [True, False])
+def test_comando_anclado_no_busca_ni_extrae(tmp_path, fastpath):
+    """'pausa la música' lo determina entera la regla anclada del fast-path (y el
+    prompt de extracción manda ignorar esas órdenes): ni con el atajo apagado
+    (GLM de cerebro) se paga la búsqueda ni la extracción."""
+    m, backend = _memoria(["me gusta pausar la música en las juntas"])
+    llm = _LLM("Va, patrón.")
+    agent = _agent_con_musica(m, llm, tmp_path, fastpath)
+    reply = agent.handle_turn("pausa la música")
+    assert reply == ("Pausada, patrón. (pause)" if fastpath else "Va, patrón.")
+    assert m.flush()
+    assert backend.busquedas == 0 and backend.extraidos == []
+    assert agent.conversation.history[0].content == "pausa la música"  # sin bloque
+
+
+def test_charla_sigue_buscando_y_extrayendo_como_siempre(tmp_path):
+    m, backend = _memoria(["me gusta el café de olla sin azúcar"])
+    llm = _LLM("Órale, patrón.")
+    agent = _agent_con_musica(m, llm, tmp_path, fastpath=True)
+    assert agent.handle_turn("me gusta el café de olla") == "Órale, patrón."
+    assert m.flush()
+    assert backend.busquedas == 1
+    assert backend.extraidos == [("me gusta el café de olla", "Órale, patrón.")]
+    assert "café de olla sin azúcar" in llm.mensajes[0][-1]["content"]
+
+
+def test_hooks_llamados_sin_turno_buscan_y_extraen_como_siempre():
+    """Sin TurnInfo (llamada directa) no hay clasificación: byte a byte lo de antes,
+    también para un texto que sería un comando anclado."""
+    m, backend = _memoria(["pausa la música cuando llegue la visita"])
+    pre, post = make_memoria_prehook(m), make_memoria_posthook(m)
+    assert pre.wants_turn is True and post.wants_turn is True  # type: ignore[attr-defined]
+    assert pre.__qualname__ == "make_memoria_prehook.<locals>.hook"
+    out = pre("pausa la música")
+    assert backend.busquedas == 1 and out.startswith("[recuerdos sobre el patrón")
+    post("pausa la música", "Pausada, patrón.")
+    assert m.flush()
+    assert backend.extraidos == [("pausa la música", "Pausada, patrón.")]
+
+
+def test_hooks_con_un_turno_que_no_es_comando_buscan_y_extraen():
+    from crotolamo.core.turn import TurnInfo
+
+    m, backend = _memoria(["mi perro se llama Tletl"])
+    turno = TurnInfo(text="mi perro", command=None)
+    assert "Tletl" in make_memoria_prehook(m)("mi perro", turn=turno)  # type: ignore[call-arg]
+    make_memoria_posthook(m)("mi perro", "Ok.", turn=turno)  # type: ignore[call-arg]
+    assert m.flush()
+    assert backend.busquedas == 1 and backend.extraidos == [("mi perro", "Ok.")]
+
+
 # --- extracción en segundo plano --------------------------------------------------
 
 def test_extraccion_no_bloquea_el_turno(tmp_path):

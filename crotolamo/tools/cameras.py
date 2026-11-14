@@ -39,6 +39,9 @@ _SIN_FILTRO = {"", "todas", "todo", "all"}
 # (include_thumbnails=1): cientos de kB por consulta que aquí nadie mira, porque
 # solo se usan etiqueta, cámara, horas e id.
 _SIN_MINIATURAS = {"include_thumbnails": 0}
+# Lo que contestaría un Frigate que no aceptara el parámetro (Flask: 400,
+# FastAPI: 422). Ver _eventos.
+_RECHAZOS = ("http_400", "http_422")
 
 
 def _resolve_camera(camera: str) -> str:
@@ -51,6 +54,22 @@ def _resolve_camera(camera: str) -> str:
         if normalize_key(alias) == key:
             return str(real)
     return camera.strip()
+
+
+def _eventos(params: dict[str, Any]) -> tuple[bool, Any]:
+    """GET /api/events con `params` (que piden _SIN_MINIATURAS).
+
+    Las versiones conocidas de Frigate aceptan include_thumbnails (y las
+    demás ignoran lo que no conocen), pero aquí no hay un Frigate con el que
+    comprobarlo en todas. Si contesta 400/422, o algo que no es la lista de
+    eventos, se repite UNA vez la consulta sin el parámetro, la de siempre:
+    una petición más solo en ese caso, y la tool sigue funcionando.
+    """
+    ok, data = _frigate._frigate_get("/api/events", params)
+    if (ok and isinstance(data, list)) or (not ok and data not in _RECHAZOS):
+        return ok, data
+    sin_parametro = {k: v for k, v in params.items() if k not in _SIN_MINIATURAS}
+    return _frigate._frigate_get("/api/events", sin_parametro)
 
 
 def _explica_fallo(error: str) -> str:
@@ -83,7 +102,7 @@ def _describe(event: dict[str, Any], hoy: tuple[int, ...]) -> str:
     return f"- {etiqueta} en la cámara {camara} {cuando} ({duracion})"
 
 
-@tool
+@tool(parallel_safe=True)
 def camera_events(camera: str, hours: float = 6) -> str:
     """Consulta los eventos que detectaron las cámaras (personas, coches, etc.)
     en las últimas horas vía Frigate, para resumirle al patrón lo relevante.
@@ -113,7 +132,7 @@ def camera_events(camera: str, hours: float = 6) -> str:
     if filtra:
         params["camera"] = _resolve_camera(camera)
 
-    ok, data = _frigate._frigate_get("/api/events", params)
+    ok, data = _eventos(params)
     if not ok:
         return _explica_fallo(data)
     if not isinstance(data, list):
@@ -137,7 +156,7 @@ def camera_events(camera: str, hours: float = 6) -> str:
     return "\n".join(lines)
 
 
-@tool
+@tool(parallel_safe=True)
 def camera_snapshot(camera: str) -> str:
     """Devuelve la URL del snapshot (foto) del último evento de una cámara,
     para abrirla o pasársela al patrón.
@@ -150,8 +169,7 @@ def camera_snapshot(camera: str) -> str:
     if not real:
         return "Necesito saber de qué cámara, patrón."
 
-    ok, data = _frigate._frigate_get(
-        "/api/events", {"camera": real, "limit": 1, **_SIN_MINIATURAS})
+    ok, data = _eventos({"camera": real, "limit": 1, **_SIN_MINIATURAS})
     if not ok:
         return _explica_fallo(data)
     # Un dict de error con 200 NO es "sin eventos": distinguirlo evita el

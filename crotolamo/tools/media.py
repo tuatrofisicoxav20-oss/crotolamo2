@@ -73,7 +73,7 @@ def _playing(players: list[tuple[str, str, str]]) -> tuple[str, str, str] | None
     return next((p for p in players if p[1] == "playing"), None)
 
 
-@tool
+@tool(parallel_safe=True)
 def music_now() -> str:
     """Dice qué canción/contenido suena ahora mismo (Spotify, YouTube, etc.)."""
     if not shutil.which("playerctl"):

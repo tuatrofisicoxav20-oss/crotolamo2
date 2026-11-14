@@ -10,7 +10,9 @@ Todo con stdlib pura (urllib + html.parser).
 from __future__ import annotations
 
 import codecs
+import functools
 import http.client
+import io
 import ipaddress
 import re
 import socket
@@ -19,6 +21,7 @@ import string
 import time
 import urllib.error
 import urllib.request
+import zlib
 from html.parser import HTMLParser
 from urllib.parse import parse_qs, quote, urljoin, urlparse, urlsplit
 
@@ -26,7 +29,11 @@ _USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
 )
 _MAX_DOWNLOAD_BYTES = 1_500_000  # ~1.5 MB: suficiente para cualquier artículo
-_READ_CHUNK = 65_536  # tamaño de cada lectura del cuerpo (ver _read_body)
+_READ_CHUNK = 65_536  # tamaño de cada lectura del cuerpo (ver read_body)
+# Se pide el cuerpo comprimido: un artículo de 1.3 MB de HTML viaja en ~15-300
+# KB de gzip, y de él solo se van a quedar unos miles de caracteres. Solo gzip:
+# es lo único que se sabe inflar con stdlib y lo sirve cualquier servidor.
+_GZIP_ENCODINGS = ("gzip", "x-gzip")
 # Al percent-codificar una URL se deja intacta TODA la puntuación ASCII ("%"
 # incluido: lo que ya venía codificado no se codifica dos veces). Solo cambian
 # los espacios, los caracteres de control y lo que no es ASCII, que es justo lo
@@ -159,8 +166,65 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
 _MAX_REDIRECTS = 5
 
 
-def _pinned_connection(url: str, timeout: float) -> tuple[http.client.HTTPConnection, str]:
-    """Valida la URL (resolución pinneada) y devuelve (conexión, path)."""
+class _DeadlineIO(io.RawIOBase):
+    """Lo crudo de una respuesta HTTP, leído con un plazo TOTAL.
+
+    El timeout de un socket es por recv(): un servidor que gotea (un byte cada
+    poco, en las cabeceras o en el cuerpo) no lo dispara nunca, y un tarpit
+    tenía el hilo del Brain colgado lo que tardara http.client en juntar 64 KB
+    de una cabecera (casi una hora a un byte cada 50 ms). Aquí cada recv
+    recorta antes el timeout del socket a lo que queda del plazo: la respuesta
+    entera, status y cabeceras incluidos, acaba a tiempo. Al agotarse lanza
+    TimeoutError (un OSError, como el timeout del socket de siempre).
+    """
+
+    def __init__(self, raw: io.RawIOBase, sock: socket.socket, deadline: float) -> None:
+        super().__init__()
+        # El SocketIO de makefile: es el que mantiene vivo el socket cuando la
+        # conexión lo suelta (respuesta `Connection: close`), y el que lo
+        # libera al cerrarse.
+        self._raw = raw
+        self._sock = sock
+        self._deadline = deadline
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer) -> int | None:
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("timed out")
+        self._sock.settimeout(remaining)
+        return self._raw.readinto(buffer)
+
+    def fileno(self) -> int:
+        return self._raw.fileno()
+
+    def close(self) -> None:
+        if not self.closed:
+            self._raw.close()
+        super().close()
+
+
+class _DeadlineResponse(http.client.HTTPResponse):
+    """HTTPResponse que lee status, cabeceras y cuerpo con _DeadlineIO."""
+
+    def __init__(self, sock: socket.socket, debuglevel: int = 0, method: str | None = None,
+                 url: str | None = None, *, deadline: float) -> None:
+        super().__init__(sock, debuglevel, method, url)
+        # makefile ya creó el lector pero aún no leyó nada: se le quita lo
+        # crudo (detach no lo cierra) y se envuelve con el plazo.
+        self.fp = io.BufferedReader(_DeadlineIO(self.fp.detach(), sock, deadline))
+
+
+def _pinned_connection(
+    url: str, timeout: float, deadline: float | None = None,
+) -> tuple[http.client.HTTPConnection, str]:
+    """Valida la URL (resolución pinneada) y devuelve (conexión, path).
+
+    Con `deadline` (time.monotonic) la respuesta se lee entera bajo ese plazo
+    (ver _DeadlineIO); `timeout` acota conectar y el handshake TLS.
+    """
     # urlsplit y no urlparse: urlparse le corta el ";params" al último segmento
     # y aquí solo se re-unían path y query ("/doc;jsessionid=X" se pedía como
     # "/doc": otra página, o un 404).
@@ -185,6 +249,9 @@ def _pinned_connection(url: str, timeout: float) -> tuple[http.client.HTTPConnec
     if port is None:
         port = 443 if parts.scheme == "https" else 80
     conn = cls(host, ip, port, timeout)
+    if deadline is not None:
+        conn.response_class = functools.partial(  # type: ignore[assignment]
+            _DeadlineResponse, deadline=deadline)
     # La línea de petición tiene que ser ASCII sin espacios: "/wiki/México" o
     # "/wiki/Ciudad de México" (lo normal cuando la URL la escribe el LLM) hacían
     # fallar a http.client antes de conectar.
@@ -201,26 +268,56 @@ def _is_text_mime(mime: str) -> bool:
     return not mime or mime.startswith("text/") or mime == "application/xhtml+xml"
 
 
-def _read_body(response: http.client.HTTPResponse, timeout: float) -> bytes:
-    """Lee el cuerpo a trozos: hasta _MAX_DOWNLOAD_BYTES o `timeout` segundos EN
-    TOTAL, lo que llegue antes. Devuelve lo que alcanzó a leer.
+def read_body(
+    response: http.client.HTTPResponse, deadline: float, max_bytes: int,
+    *, gzipped: bool = False,
+) -> tuple[bytes, bool]:
+    """Lee el cuerpo a trozos: hasta `max_bytes`, el final o el plazo
+    `deadline` (time.monotonic), lo que llegue antes. Devuelve (bytes,
+    a_tiempo): a_tiempo es False si el plazo se acabó antes del final, y
+    entonces los bytes son lo que alcanzó a llegar.
 
     El timeout del socket es por recv(): un servidor que gotea bytes (o un
     stream que no acaba nunca, tipo text/event-stream) no lo dispara jamás, y un
     único read(1.5 MB) se quedaba esperando con el hilo del Brain colgado.
     read1 devuelve lo que haya en cuanto llega, así que el plazo se revisa
-    entre trozos; el recv() individual sigue acotado por el timeout del socket.
+    entre trozos. Con _DeadlineResponse (_http_get) además cada recv espera
+    solo lo que queda del plazo; con una respuesta de urllib (_hass, _frigate)
+    el último recv sigue acotado por el timeout de su socket.
+
+    Con `gzipped` el cuerpo se infla al vuelo y `max_bytes` cuenta lo
+    DESCOMPRIMIDO: unos cientos de KB de gzip que inflan a cientos de MB (una
+    bomba) se cortan en el tope sin pasar nunca de él en RAM. Un gzip corrupto
+    lanza urllib.error.URLError; uno cortado (por el plazo, o el servidor que
+    cuelga) devuelve lo que alcanzó a inflar, igual que un cuerpo sin comprimir.
     """
-    deadline = time.monotonic() + timeout
+    inflater = zlib.decompressobj(16 + zlib.MAX_WBITS) if gzipped else None
     chunks: list[bytes] = []
-    remaining = _MAX_DOWNLOAD_BYTES
-    while remaining > 0 and time.monotonic() < deadline:
-        chunk = response.read1(min(_READ_CHUNK, remaining))
-        if not chunk:
-            break
-        chunks.append(chunk)
-        remaining -= len(chunk)
-    return b"".join(chunks)
+    remaining = max_bytes
+    try:
+        while remaining > 0:
+            if time.monotonic() >= deadline:
+                return b"".join(chunks), False
+            if inflater is None:
+                # Justo lo que cabe: ni un byte de más por el cable.
+                chunk = response.read1(min(_READ_CHUNK, remaining))
+                done = not chunk
+            else:
+                # Comprimido no se sabe cuánto inflará cada trozo: max_length
+                # deja lo que no cabe en unconsumed_tail, sin inflarlo nunca.
+                packed = response.read1(_READ_CHUNK)
+                chunk = (inflater.decompress(packed, remaining) if packed
+                         else inflater.flush()[:remaining])
+                done = not packed or inflater.eof
+            chunks.append(chunk)
+            remaining -= len(chunk)
+            if done:
+                break
+    except TimeoutError:
+        return b"".join(chunks), False
+    except zlib.error as error:
+        raise urllib.error.URLError(f"cuerpo gzip roto ({error})") from error
+    return b"".join(chunks), True
 
 
 # <meta charset="x"> y <meta http-equiv="Content-Type" content="...; charset=x">.
@@ -273,13 +370,24 @@ def _http_get(url: str, timeout: float = 10.0) -> tuple[str, str]:
     interna.
 
     Si el Content-Type no es texto (PDF, zip, audio...) el cuerpo NO se
-    descarga: body_texto llega vacío. `timeout` acota cada operación de red y,
-    además, el total de la lectura del cuerpo (ver _read_body).
+    descarga: body_texto llega vacío. El cuerpo se pide en gzip y se infla
+    con el mismo tope de bytes (ver read_body).
+
+    `timeout` es el plazo de la llamada ENTERA: conectar, cabeceras, cada
+    redirect y el cuerpo. Antes cada salto estrenaba el suyo y solo el cuerpo
+    tenía tope total, así que cinco redirects lentos o unas cabeceras que
+    gotean lo multiplicaban. Si se agota antes de que llegue un byte del
+    cuerpo lanza TimeoutError (un OSError); si se agota leyéndolo, devuelve lo
+    que llegó (sirve para leer el principio).
     """
+    deadline = time.monotonic() + timeout
     current = url
     for _ in range(_MAX_REDIRECTS + 1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("timed out")
         try:
-            conn, path = _pinned_connection(current, timeout)
+            conn, path = _pinned_connection(current, remaining, deadline)
         except http.client.HTTPException as error:
             # El constructor de HTTPConnection rechaza un host con caracteres de
             # control (un NUL: getaddrinfo corta ahí y resuelve, http.client no)
@@ -288,7 +396,8 @@ def _http_get(url: str, timeout: float = 10.0) -> tuple[str, str]:
             raise urllib.error.URLError(
                 f"URL inválida para un GET ({error!r})") from error
         try:
-            conn.request("GET", path, headers={"User-Agent": _USER_AGENT})
+            conn.request("GET", path, headers={
+                "User-Agent": _USER_AGENT, "Accept-Encoding": _GZIP_ENCODINGS[0]})
             response = conn.getresponse()
 
             location = response.getheader("Location")
@@ -310,7 +419,13 @@ def _http_get(url: str, timeout: float = 10.0) -> tuple[str, str]:
                 # de PDF (o minuto y medio de una radio por internet) era
                 # trabajo tirado, con el hilo del Brain esperando.
                 return content_type, ""
-            raw = _read_body(response, timeout)
+            encoding = (response.getheader("Content-Encoding") or "").strip().lower()
+            raw, a_tiempo = read_body(response, deadline, _MAX_DOWNLOAD_BYTES,
+                                      gzipped=encoding in _GZIP_ENCODINGS)
+            if not a_tiempo and not raw:
+                # Ni un byte del cuerpo: no hay principio que leer, es un
+                # fallo de conexión (no una página vacía).
+                raise TimeoutError("timed out")
             charset = response.headers.get_content_charset()
         except http.client.HTTPException as error:
             # IncompleteRead (chunked cortado a medias), BadStatusLine (el

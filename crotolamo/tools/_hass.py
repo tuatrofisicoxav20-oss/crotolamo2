@@ -15,11 +15,13 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 from typing import Any
 
 from crotolamo.settings import get_settings
+from crotolamo.tools import _web
 
 # El token de acceso de larga duración de Home Assistant. NUNCA va en el toml
 # (que va a git): la env es el sitio correcto, igual que CROTOLAMO_GLM_API_KEY.
@@ -94,7 +96,8 @@ def _http_json(
     """Request HTTP con urllib que devuelve el body parseado como JSON.
 
     Helper separado para que los tests lo parcheen sin tocar la red (mismo rol
-    que _web._http_get). Lanza HTTPError/URLError/OSError si la red falla y
+    que _web._http_get). Lanza HTTPError/URLError/OSError si la red falla
+    (TimeoutError si el cuerpo no acaba de llegar en `timeout` segundos) y
     json.JSONDecodeError si el body no es JSON.
     """
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
@@ -103,7 +106,11 @@ def _http_json(
         all_headers["Content-Type"] = "application/json"
     request = urllib.request.Request(url, data=data, method=method, headers=all_headers)
     with _opener().open(request, timeout=timeout) as response:  # noqa: S310
-        raw = response.read(_MAX_BODY)
+        # A trozos y con plazo total para el cuerpo: un único read(_MAX_BODY)
+        # esperaba, recv a recv, a juntar el tope entero si HA goteaba.
+        raw, a_tiempo = _web.read_body(response, time.monotonic() + timeout, _MAX_BODY)
+    if not a_tiempo:  # medio JSON no sirve: es un timeout, como el del socket
+        raise TimeoutError("timed out")
     return json.loads(raw) if raw.strip() else {}
 
 

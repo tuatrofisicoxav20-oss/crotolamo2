@@ -162,6 +162,16 @@ def _split_doc(doc: str) -> tuple[str, dict[str, str]]:
     return " ".join(d for d in desc_lines if d).strip(), params
 
 
+# Carril de las lecturas de la libreta SQLite (hechos, atajos) y de
+# buscar_recuerdos (que cae a ella y comparte el pool de 2 de la Memoria). En
+# paralelo entre sí, sobre una libreta recién creada o borrada en caliente, dos
+# conexiones a la vez chocan en `PRAGMA journal_mode=WAL` (SQLITE_BUSY sin esperar
+# el busy timeout) y una contestaba "database is locked" donde en serie no; y la
+# 3ª búsqueda de recuerdos esperaba hilo con su presupuesto ya corriendo. Una tras
+# otra, como en serie; con lo demás del lote (web, sistema, archivos), a la vez.
+LANE_LIBRETA = "libreta"
+
+
 @dataclass
 class Tool:
     name: str
@@ -181,6 +191,19 @@ class Tool:
     # esquema es JSON arbitrario del server (anidado, additionalProperties...) y
     # filtrar por el primer nivel de `properties` mutilaría llamadas válidas.
     strict_args: bool = True
+    # parallel_safe=True: la tool SOLO LEE (no abre, escribe, mueve ni cambia nada
+    # fuera de ella). Si el modelo pide 2+ de estas en un mismo mensaje, el agente
+    # las corre a la vez (ver ToolAgent._parallel_plan). No es `safe`: safe=True
+    # solo dice "sin confirmación", y open_app o music_control lo son y cambian
+    # cosas. Default False: en serie, como siempre.
+    parallel_safe: bool = False
+    # Carril dentro de un lote en paralelo: las llamadas con el mismo carril van
+    # una tras otra, en su orden. Lo llevan las tools MCP de un mismo server (un
+    # solo pipe y un contador de strikes: a un server que atiende de una en una,
+    # la 2ª llamada le contaba el timeout desde que se mandó, no desde que le
+    # tocaba) y las lecturas de la libreta SQLite (LANE_LIBRETA). None = carril
+    # propio.
+    parallel_lane: str | None = None
 
     def schema(self) -> dict[str, Any]:
         """Formato que espera Ollama en el campo `tools`."""
@@ -385,6 +408,8 @@ def tool(
     name: str | None = None,
     safe: bool = True,
     direct: bool = False,
+    parallel_safe: bool = False,
+    parallel_lane: str | None = None,
 ):
     """Decorador. Registra la función como tool en el registry global.
 
@@ -393,6 +418,10 @@ def tool(
         safe: si False, el guard pedirá confirmación antes de ejecutarla.
         direct: si True, su output es presentacional (frase lista para el patrón)
             y el agente puede devolverlo sin una 2ª llamada al LLM (short-circuit).
+        parallel_safe: si True, solo lee: con otras así en el mismo mensaje del
+            modelo, corren a la vez (ver Tool.parallel_safe).
+        parallel_lane: carril dentro de ese lote; las del mismo carril van una
+            tras otra (ver Tool.parallel_lane).
     """
 
     def wrap(func: Callable[..., Any]) -> Callable[..., Any]:
@@ -405,6 +434,8 @@ def tool(
             parameters=parameters,
             safe=safe,
             direct=direct,
+            parallel_safe=parallel_safe,
+            parallel_lane=parallel_lane,
         )
         GLOBAL_REGISTRY.register(t)
         func._crotolamo_tool = t  # type: ignore[attr-defined]

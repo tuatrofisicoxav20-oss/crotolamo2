@@ -57,7 +57,7 @@ def _resolve_project(name: str) -> Path | None:
     return _projects().get(normalize_key(name))
 
 
-@tool
+@tool(parallel_safe=True)
 def list_projects() -> str:
     """Lista los proyectos que Crotolamo conoce."""
     projects = _projects()
@@ -67,7 +67,7 @@ def list_projects() -> str:
     return "Proyectos que conozco, patrón:\n" + "\n".join(lines)
 
 
-@tool
+@tool(parallel_safe=True)
 def analyze_project(name: str) -> str:
     """Resumen rápido de un proyecto: ruta y archivos Python/shell que contiene.
 
@@ -99,7 +99,7 @@ def analyze_project(name: str) -> str:
     return "\n".join(lines)
 
 
-@tool
+@tool(parallel_safe=True)
 def list_project_tree(name: str) -> str:
     """Árbol de carpetas y archivos de primer/segundo nivel de un proyecto.
 
@@ -151,7 +151,7 @@ def _tree_lines(project: Path) -> list[str]:
     return lines
 
 
-@tool
+@tool(parallel_safe=True)
 def read_project_file(project: str, relative_path: str) -> str:
     """Lee un archivo de un proyecto y devuelve su contenido para razonar sobre él.
 
@@ -185,7 +185,7 @@ def read_project_file(project: str, relative_path: str) -> str:
     return f"Contenido de {project}/{relative_path}:\n{text}"
 
 
-@tool
+@tool(parallel_safe=True)
 def find_in_project(project: str, pattern: str) -> str:
     """Busca un texto/patrón dentro de los archivos de un proyecto (read-only).
 

@@ -21,11 +21,13 @@ import os
 import time
 from typing import Any, NoReturn
 
+from crotolamo.core import budget
 from crotolamo.core.engine import HTTPTransport
 from crotolamo.core.llm import (
     ChatResponse,
     LLMError,
     TransientLLMError,
+    _log_request,
     _parse_tool_calls,
     _read_body,
 )
@@ -60,6 +62,20 @@ def _find_api_key() -> str | None:
     return None
 
 
+def _log_usage(usage: Any) -> None:
+    """DEBUG con lo que la nube dice que gastó. cached_tokens es la parte del
+    prompt que el proveedor sirvió de su cache de prefijo: con él se ve si
+    [memory].trim_chunk (u otro knob) de verdad abarata los turnos."""
+    if not isinstance(usage, dict) or not usage:
+        return
+    details = usage.get("prompt_tokens_details")
+    log.debug(
+        "GLM: prompt_tokens=%s completion_tokens=%s cached_tokens=%s",
+        usage.get("prompt_tokens"), usage.get("completion_tokens"),
+        details.get("cached_tokens") if isinstance(details, dict) else None,
+    )
+
+
 def _retry_after_s(resp) -> float | None:
     """Segundos del header Retry-After, o None si falta o no es numérico."""
     raw = resp.getheader("Retry-After")
@@ -74,6 +90,10 @@ def _retry_after_s(resp) -> float | None:
 class GLMClient:
     """Mismo contrato público que `LLMClient`: chat(), chat_stream(), from_settings()."""
 
+    # El warm-up del listener calienta solo un motor que tenga algo que cargar.
+    # La nube no carga nada: calentarla era una llamada real a la API por arranque.
+    needs_warmup = False
+
     def __init__(
         self,
         api_key: str | None = None,
@@ -83,6 +103,8 @@ class GLMClient:
         timeout: float = 60,
         max_tokens: int | None = None,
         thinking: bool = False,
+        connect_timeout: float | None = None,
+        max_context_tokens: int | None = budget.DEFAULT_CLOUD_CONTEXT_TOKENS,
     ) -> None:
         self.api_key = api_key or _find_api_key()
         self.base_url = base_url.rstrip("/")
@@ -100,9 +122,16 @@ class GLMClient:
         # limit del tier gratuito. Actívalo si quieres razonamiento en preguntas
         # difíciles y no te importa esperar.
         self.thinking = thinking
+        # Ventana del modelo en la nube (tokens estimados), solo como red de
+        # seguridad: un request que la pasa no se manda tal cual (ver _fit).
+        # None o 0 = sin red, como antes.
+        self.max_context_tokens = max_context_tokens
         # Conexión HTTPS persistente: un turno con tools hace 2+ llamadas
         # seguidas; reutilizar el socket ahorra el handshake TCP+TLS de cada una.
-        self._transport = HTTPTransport(self.base_url, timeout=self.timeout)
+        # connect_timeout (None = 5 s) acota conectar, no la respuesta: sin
+        # internet, cada sonda a la nube costaba los 60 s enteros por dirección.
+        self._transport = HTTPTransport(
+            self.base_url, timeout=self.timeout, connect_timeout=connect_timeout)
 
     @classmethod
     def from_settings(cls, settings) -> "GLMClient":
@@ -115,6 +144,9 @@ class GLMClient:
             timeout=glm.get("timeout", 60),
             max_tokens=glm.get("max_tokens"),
             thinking=glm.get("thinking", False),
+            connect_timeout=glm.get("connect_timeout"),
+            max_context_tokens=glm.get("max_context_tokens",
+                                       budget.DEFAULT_CLOUD_CONTEXT_TOKENS),
         )
 
     def _headers(self) -> dict[str, str]:
@@ -126,6 +158,32 @@ class GLMClient:
             )
         return {"Authorization": f"Bearer {self.api_key}"}
 
+    def _fit(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+    ) -> list[dict[str, Any]]:
+        """Red de seguridad: los MISMOS mensajes salvo que pasen la ventana.
+
+        Unas cuantas lecturas de archivo en pocos turnos llevaban el request por
+        encima de la ventana del proveedor, y su 400 es permanente (ni breaker
+        ni respaldo): cada turno fallaba hasta que 20 turnos más deslizaban los
+        resultados fuera, y el daemon no tiene /reset. Ahora se tiran bloques
+        viejos enteros, solo del request; un turno normal no cambia un byte.
+        """
+        if not self.max_context_tokens:
+            return messages
+        ajuste = budget.fit_window(messages, tools, self.max_context_tokens)
+        if ajuste.messages is not messages:
+            log.warning(
+                "el request para GLM pasaba de max_context_tokens=%d (~%d tokens "
+                "estimados): tiré %d bloque(s) viejo(s), recorté %d resultado(s) "
+                "de tool y %d hueco(s) anclado(s); quedan ~%d",
+                self.max_context_tokens, ajuste.est_before, ajuste.dropped_blocks,
+                ajuste.clipped_tools, ajuste.clipped_pinned, ajuste.est_after,
+            )
+        return ajuste.messages
+
     def _payload(
         self,
         messages: list[dict[str, Any]],
@@ -134,7 +192,7 @@ class GLMClient:
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": self.model,
-            "messages": to_openai_messages(messages),
+            "messages": to_openai_messages(self._fit(messages, tools)),
             "temperature": self.temperature,
             "stream": stream,
         }
@@ -208,7 +266,9 @@ class GLMClient:
         tools: list[dict[str, Any]] | None = None,
     ) -> ChatResponse:
         t0 = time.time() if _PROF else 0.0
-        resp = self._send(self._payload(messages, tools, stream=False))
+        payload = self._payload(messages, tools, stream=False)
+        _log_request(log, "GLM", payload)
+        resp = self._send(payload)
         try:
             raw = json.loads(resp.read().decode("utf-8"))
         except (TimeoutError, OSError) as error:
@@ -228,15 +288,18 @@ class GLMClient:
             # JSONDecodeError o UnicodeDecodeError (cuerpo no-UTF-8): ambas ValueError.
             raise LLMError("GLM me devolvió basura no-JSON, patrón.") from error
 
+        usage = raw.get("usage", {}) or {}
         if _PROF:
-            usage = raw.get("usage", {}) or {}
+            details = usage.get("prompt_tokens_details") or {}
             print(
                 f"[LLM-PROF/glm] {time.time() - t0:5.1f}s | "
                 f"prompt={usage.get('prompt_tokens', '?')} "
+                f"cached={details.get('cached_tokens', '?')} "
                 f"gen={usage.get('completion_tokens', '?')} | "
                 f"tools_enviadas={len(tools) if tools else 0}",
                 flush=True,
             )
+        _log_usage(usage)
 
         choices = raw.get("choices") or []
         message = (choices[0].get("message", {}) or {}) if choices else {}
@@ -260,9 +323,14 @@ class GLMClient:
         fallo o un consumidor que aborta, cuelga el socket para que la nube
         deje de generar para nadie.
         """
-        resp = self._send(self._payload(messages, tools, stream=True))
+        payload = self._payload(messages, tools, stream=True)
+        _log_request(log, "GLM", payload)
+        resp = self._send(payload)
+        # El stream solo trae usage si el proveedor lo manda por su cuenta: pedirlo
+        # (stream_options.include_usage) cambiaría el payload (decisión del dueño).
+        usage: dict[str, Any] = {}
         try:
-            content, message, complete = parse_sse(resp, on_token)
+            content, message, complete = parse_sse(resp, on_token, usage)
         except (TimeoutError, OSError) as error:
             self._transport.close()
             raise TransientLLMError(
@@ -297,6 +365,7 @@ class GLMClient:
                 len(content), len(message.get("tool_calls") or []),
             )
             self._transport.close()
+        _log_usage(usage)
 
         return ChatResponse(
             content=content.strip(),

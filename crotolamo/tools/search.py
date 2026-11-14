@@ -95,7 +95,7 @@ def search_web(query: str, engine: str = "google") -> str:
     return open_url(url)
 
 
-@tool
+@tool(parallel_safe=True)
 def fetch_web_results(query: str) -> str:
     """Busca en internet y devuelve los primeros resultados (título, URL y resumen)
     como texto, para poder leérselos o contárselos al patrón sin abrir el navegador.
@@ -133,7 +133,7 @@ def fetch_web_results(query: str) -> str:
     return "\n".join(lines)
 
 
-@tool
+@tool(parallel_safe=True)
 def read_page(url: str) -> str:
     """Descarga una página web y devuelve su contenido como texto plano,
     para poder resumírselo o leérselo al patrón.

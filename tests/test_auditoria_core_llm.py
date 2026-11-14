@@ -584,9 +584,11 @@ def test_el_turno_en_streaming_con_ollama_ejecuta_la_tool_que_pidio_el_modelo(mo
     assert ejecutadas == ["pause"]
     assert reply == "Pausada, patrón."
     assert "".join(dichos) == "Pausada, patrón."
-    # La segunda petición lleva la llamada y su resultado, como espera Ollama.
+    # La segunda petición lleva la llamada y su resultado, como espera Ollama
+    # (con el id estable que el agente le pone a una llamada que llega sin id).
     reenviado = json.loads(conn.cuerpos[1].decode("utf-8"))["messages"]
-    assert {"role": "assistant", "content": "", "tool_calls": [_PAUSA]} in reenviado
+    assert {"role": "assistant", "content": "",
+            "tool_calls": [{**_PAUSA, "id": "call_t1_0"}]} in reenviado
     assert reenviado[-1]["role"] == "tool"
     assert reenviado[-1]["content"] == "Música en pausa."
 

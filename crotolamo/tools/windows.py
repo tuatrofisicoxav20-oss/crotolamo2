@@ -141,7 +141,7 @@ def _label(client: dict[str, Any]) -> str:
     return f"{clase} — {title}" if title else clase
 
 
-@tool(direct=True)
+@tool(direct=True, parallel_safe=True)
 def list_windows() -> str:
     """Lista las apps/ventanas abiertas ahora mismo y en qué workspace están.
 
@@ -161,7 +161,7 @@ def list_windows() -> str:
     return f"Tienes {len(lines)} {plural}, patrón:\n" + "\n".join(lines)
 
 
-@tool(direct=True)
+@tool(direct=True, parallel_safe=True)
 def app_status(name: str) -> str:
     """Dice si una app está abierta, cuántas ventanas tiene y en qué workspace(s).
 

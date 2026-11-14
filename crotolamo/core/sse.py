@@ -42,6 +42,7 @@ def consume_sse(
 def parse_sse(
     resp: Any,
     on_token: Callable[[str], None] | None,
+    usage: dict[str, Any] | None = None,
 ) -> tuple[str, dict[str, Any], bool]:
     """Parsea el SSE de OpenAI (`data: {...}` por línea) hasta `[DONE]`.
 
@@ -66,6 +67,10 @@ def parse_sse(
     leída y lo que lance (TurnCancelled) sale tal cual: un tool-call o un
     razonamiento no traen texto, no llegan a on_token y el turno cancelado
     esperaba el stream entero.
+
+    `usage`: si se pasa un dict, se llena con el objeto `usage` del stream si
+    algún chunk lo trae (suele ir en el último, a veces con `choices` vacío).
+    Solo para el log del cliente; lo que se devuelve no cambia.
     """
     checkpoint = getattr(on_token, "checkpoint", None)
     parts: list[str] = []
@@ -98,6 +103,8 @@ def parse_sse(
             continue  # JSON válido que no es un evento (null, una lista): basura
         if obj.get("error"):
             raise SSEError(_error_text(obj["error"]))
+        if usage is not None and isinstance(obj.get("usage"), dict):
+            usage.update(obj["usage"])
 
         choices = obj.get("choices") or []
         if not choices:

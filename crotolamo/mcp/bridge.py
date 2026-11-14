@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import atexit
 import itertools
+import json
 import os
 import re
 import signal
@@ -50,6 +51,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from crotolamo.core import router
+from crotolamo.core.tool_parsing import MCP_SOFT_ERROR_PREFIX
 from crotolamo.logging_setup import get_logger
 from crotolamo.mcp.client import MCPError, MCPTimeout, MCPTransportError, StdioMCPClient
 from crotolamo.tools.base import Registry, Tool, normalize_key, truncate_for_context
@@ -67,6 +69,25 @@ _INVALID_NAME_CHARS = re.compile(r"[^A-Za-z0-9_]")
 # Recorte de la descripción del server: cada tool a la vista cuesta tokens en
 # CADA turno, y algunos servers escriben párrafos enteros.
 DESCRIPTION_CAP = 300
+# Tope de bytes del inputSchema de UNA tool (serializado como lo manda el
+# transporte). El esquema lo escribe el server y viaja en CADA request mientras
+# la tool esté a la vista: hay servers que ponen ejemplos, títulos y un párrafo
+# por propiedad (7 KB una tool de 12 campos). Pasado el tope se quitan las
+# anotaciones que no cambian qué argumentos valen y, si aún no cabe, se
+# recortan las descripciones anidadas. Lo que cabe llega byte a byte igual.
+MCP_SCHEMA_CAP = 4_000
+_SCHEMA_ANNOTATIONS = frozenset({"examples", "title", "default", "$comment"})
+NESTED_DESCRIPTION_CAP = 120
+# Dónde hay sub-esquemas en un JSON Schema. Solo se recorre lo que está aquí:
+# lo demás (enum, const, extensiones x-..., lo que no se conoce) son valores y
+# se queda intacto. Bajo estas claves los NOMBRES son de propiedades: una
+# propiedad llamada `title` es un argumento, no una anotación.
+_SCHEMA_MAPS = frozenset({
+    "properties", "patternProperties", "$defs", "definitions", "dependentSchemas"})
+_SCHEMA_CHILDREN = frozenset({
+    "items", "additionalItems", "prefixItems", "contains", "additionalProperties",
+    "unevaluatedProperties", "unevaluatedItems", "propertyNames",
+    "not", "if", "then", "else", "anyOf", "oneOf", "allOf"})
 # Timeouts consecutivos antes de desconectar un server.
 MAX_STRIKES = 2
 # Tope de keywords derivadas por server, para que un server verborreico no
@@ -274,12 +295,14 @@ def sanitize_tool_name(prefix: str, remote_name: str, taken: set[str]) -> str:
     return candidate
 
 
-def normalize_schema(schema: Any) -> dict[str, Any]:
+def normalize_schema(schema: Any, name: str = "") -> dict[str, Any]:
     """inputSchema del server -> esquema de objeto que aceptan Ollama/GLM.
 
     Garantiza `type: object` y un `properties` dict; quita `$schema` (a algunos
     motores les estorba). Lo demás (anidados, additionalProperties, enum...) se
     respeta tal cual: es la parte que el server necesita que llegue intacta.
+    Si pasa de MCP_SCHEMA_CAP se adelgaza (ver _fit_schema); `name` es la tool,
+    para el log.
     """
     out: dict[str, Any] = dict(schema) if isinstance(schema, dict) else {}
     out.pop("$schema", None)
@@ -288,7 +311,58 @@ def normalize_schema(schema: Any) -> dict[str, Any]:
     out["properties"] = dict(props) if isinstance(props, dict) else {}
     if "required" in out and not isinstance(out["required"], list):
         out.pop("required")
+    return _fit_schema(out, name)
+
+
+def _schema_bytes(schema: dict[str, Any]) -> int:
+    # Igual que serializa el transporte (engine.HTTPTransport): mismo tamaño.
+    return len(json.dumps(schema, ensure_ascii=False).encode("utf-8", errors="replace"))
+
+
+def _trim_schema(node: Any, *, clip: int | None, top: bool = True) -> Any:
+    """Copia de `node` sin anotaciones y, con `clip`, con las descripciones
+    anidadas recortadas. Nunca modifica `node` (es lo que mandó el server)."""
+    if not isinstance(node, dict):
+        return node
+    out: dict[str, Any] = {}
+    for key, value in node.items():
+        if key in _SCHEMA_ANNOTATIONS:
+            continue
+        if key in _SCHEMA_MAPS and isinstance(value, dict):
+            value = {prop: _trim_schema(sub, clip=clip, top=False)
+                     for prop, sub in value.items()}
+        elif key in _SCHEMA_CHILDREN:
+            if isinstance(value, list):
+                value = [_trim_schema(sub, clip=clip, top=False) for sub in value]
+            else:
+                value = _trim_schema(value, clip=clip, top=False)
+        elif (key == "description" and clip is not None and not top
+              and isinstance(value, str) and len(value) > clip):
+            value = value[:clip].rstrip() + "…"
+        out[key] = value
     return out
+
+
+def _fit_schema(schema: dict[str, Any], name: str) -> dict[str, Any]:
+    """`schema` tal cual si cabe en MCP_SCHEMA_CAP; si no, adelgazado.
+
+    1. Fuera examples/title/default/$comment: documentan, no validan.
+    2. Si aún no cabe, las descripciones ANIDADAS a NESTED_DESCRIPTION_CAP. La
+       de arriba del todo no: es la que explica la tool entera.
+    type, properties, required, enum, additionalProperties... no se tocan.
+    """
+    try:
+        before = _schema_bytes(schema)
+    except (TypeError, ValueError):  # no es JSON: que lo diga quien lo mande
+        return schema
+    if before <= MCP_SCHEMA_CAP:
+        return schema
+    fitted = _trim_schema(schema, clip=None)
+    if _schema_bytes(fitted) > MCP_SCHEMA_CAP:
+        fitted = _trim_schema(fitted, clip=NESTED_DESCRIPTION_CAP)
+    log.info("MCP: esquema de %s adelgazado de %d a %d bytes (tope %d)",
+             name or "una tool", before, _schema_bytes(fitted), MCP_SCHEMA_CAP)
+    return fitted
 
 
 def tool_is_safe(confirm: str, annotations: Any) -> bool:
@@ -304,6 +378,16 @@ def tool_is_safe(confirm: str, annotations: Any) -> bool:
         return False
     hints = annotations if isinstance(annotations, dict) else {}
     return hints.get("readOnlyHint") is True or hints.get("destructiveHint") is False
+
+
+def tool_is_read_only(annotations: Any) -> bool:
+    """Si la tool puede correr a la vez que otras lecturas (Tool.parallel_safe).
+
+    Solo `readOnlyHint: true`. `destructiveHint: false` basta para no preguntar
+    (tool_is_safe), pero no dice que no cambie nada: puede crear o añadir, y eso
+    no se adelanta ni se cruza con otra llamada del mismo mensaje.
+    """
+    return isinstance(annotations, dict) and annotations.get("readOnlyHint") is True
 
 
 def describe_tool(raw_tool: dict[str, Any], server_name: str) -> str:
@@ -398,8 +482,9 @@ def strikes_for(name: str) -> int:
 
 def _soft(server_name: str, text: str) -> str:
     # Prefijo fijo de TODOS los soft-errors MCP. No está (ni debe estar) en
-    # tool_parsing.HARD_ERROR_PREFIXES: es texto para el patrón.
-    return f"El server MCP '{server_name}' {text}"
+    # tool_parsing.HARD_ERROR_PREFIXES: es texto para el patrón. Sale de
+    # SOFT_ERROR_PREFIXES para que el registro del turno lo reconozca como fallo.
+    return f"{MCP_SOFT_ERROR_PREFIX}{server_name}' {text}"
 
 
 def _retire(state: _ServerState, registry: Registry, why: str | None = None) -> bool:
@@ -539,10 +624,13 @@ def _build_tools(
             name=name,
             func=_make_caller(server.name, remote_name),
             description=describe_tool(raw_tool, server.name),
-            parameters=normalize_schema(raw_tool.get("inputSchema")),
+            parameters=normalize_schema(raw_tool.get("inputSchema"), name),
             safe=tool_is_safe(server.confirm, raw_tool.get("annotations")),
             direct=False,
             strict_args=False,
+            parallel_safe=tool_is_read_only(raw_tool.get("annotations")),
+            # Las de un server, en fila dentro del lote: comparten pipe y strikes.
+            parallel_lane=f"mcp:{server.name}",
         ))
     return tools
 

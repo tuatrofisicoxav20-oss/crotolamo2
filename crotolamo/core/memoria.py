@@ -47,13 +47,17 @@ import queue  # noqa: E402
 import re  # noqa: E402
 import threading  # noqa: E402
 import time  # noqa: E402
-from concurrent.futures import Future, ThreadPoolExecutor  # noqa: E402
+from concurrent.futures import Future  # noqa: E402
 from concurrent.futures import TimeoutError as FutureTimeout  # noqa: E402
 from dataclasses import dataclass  # noqa: E402
 from pathlib import Path  # noqa: E402
-from typing import Any, Callable, Protocol  # noqa: E402
+from typing import TYPE_CHECKING, Any, Callable, Protocol  # noqa: E402
 
+from crotolamo.core.turn import DaemonPool, TurnInfo, wants_turn  # noqa: E402
 from crotolamo.logging_setup import get_logger  # noqa: E402
+
+if TYPE_CHECKING:
+    from crotolamo.core.memory import Conversation
 
 log = get_logger("core.memoria")
 
@@ -72,6 +76,16 @@ DEFAULT_USUARIO = "patron"
 # Lo más que el proceso espera AL SALIR a que termine la extracción pendiente (el
 # mismo tope que cerrar()): una nube colgada no puede dejar el shell sin terminar.
 _ESPERA_EXTRACCION_AL_SALIR_S = 5.0
+# Breaker de la búsqueda POR TURNO (la del pre-hook), como el de FallbackLLM con
+# el cerebro (mismos 60 s): tras BREAKER_FALLOS seguidas sin respuesta a tiempo,
+# los turnos de los próximos BREAKER_PAUSA_S responden sin recuerdos y sin
+# esperarla. Las búsquedas explícitas (tools, CLI) no pasan por él.
+BREAKER_FALLOS = 2
+BREAKER_PAUSA_S = 60.0
+# Lo mismo para la extracción en segundo plano (ver Memoria._drenar): tras
+# EXTRAER_FALLOS seguidas, el hilo espera EXTRAER_PAUSA_S antes de la siguiente.
+EXTRAER_FALLOS = 3
+EXTRAER_PAUSA_S = 120.0
 
 # La regla de contenido, UNA sola vez: la leen el modelo (descripciones de las
 # tools) y mem0 (instrucciones del prompt de extracción).
@@ -479,12 +493,27 @@ class Memoria:
         self._settings = settings
         self._backend_lock = threading.Lock()
         self._roto: str | None = None
-        self._pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="Memoria")
+        # Hilos daemon (DaemonPool): una búsqueda de mem0 colgada, que ni el
+        # presupuesto ni cancel() pueden parar, no impide que el proceso salga.
+        self._pool = DaemonPool(2, "Memoria")
         self._cola: queue.Queue[Any] = queue.Queue()
         self._worker: threading.Thread | None = None
         self._worker_lock = threading.Lock()
         self._vaciado_apuntado = False
         self._cerrada = False
+        # Salud de la búsqueda por turno (ver _buscar_turno): fallos seguidos,
+        # hasta cuándo no se intenta, la búsqueda en vuelo y si mem0 aún carga.
+        self._salud_lock = threading.Lock()
+        self._fallos_turno = 0
+        self._pausa_hasta = 0.0
+        self._breaker_abierto = False
+        self._busqueda_turno: Future[list[Recuerdo]] | None = None
+        self._calentando = False
+        # cerrar() y el vaciado al salir lo ponen: corta la pausa del hilo de
+        # extracción y no deja empezar otra (ver _drenar). _en_pausa: el hilo está
+        # en ella, sin ningún item en la mano (ver flush).
+        self._parar = threading.Event()
+        self._en_pausa = threading.Event()
 
     # --- estado ---
     @property
@@ -535,6 +564,8 @@ class Memoria:
         try:
             return future.result(timeout=limite)
         except FutureTimeout:
+            # Si aún no empezó (pool ocupado), ya no corre: nadie va a leerla.
+            future.cancel()
             log.warning("memoria: la búsqueda tardó más de %.1fs; respondo sin recuerdos", limite)
             raise BusquedaFallida(f"la búsqueda tardó más de {limite:.1f}s") from None
         except MemoriaNoDisponible as error:
@@ -556,12 +587,95 @@ class Memoria:
             # ni retrasa la respuesta hablada.
             return []
 
-    def contexto(self, query: str) -> str:
-        """Bloque de texto para el LLM con los recuerdos relevantes ('' si nada)."""
-        recuerdos = self.buscar(query)
+    def _buscar_turno(self, query: str) -> list[Recuerdo]:
+        """buscar() del pre-hook, que aprende de sus fallos como FallbackLLM.
+
+        El presupuesto de antes (Future.result con timeout en el pool de 2)
+        acotaba la ESPERA, no el trabajo: la búsqueda vencida seguía corriendo;
+        con dos colgadas el pool se llenaba y cada turno esperaba el presupuesto
+        entero sin que su búsqueda llegara a empezar (y todas corrían después).
+        Ahora:
+        - una a la vez: si la del turno anterior sigue en curso no se encola
+          otra; cuenta como fallo y el turno sigue sin recuerdos al instante;
+        - al vencer el presupuesto se cancela (si aún no empezó, ya no corre);
+        - BREAKER_FALLOS seguidas sin respuesta a tiempo pausan la búsqueda
+          BREAKER_PAUSA_S: esos turnos no esperan nada. Pasada la pausa se prueba
+          una (medio abierto): un fallo la reabre, un acierto la cierra.
+        Con la memoria sana es buscar() tal cual: mismos recuerdos y presupuesto.
+        El breaker nunca la marca rota: eso sigue siendo MemoriaNoDisponible.
+        """
+        if not self.enabled or not query.strip():
+            return []
+        future: Future[list[Recuerdo]] | None = None
+        with self._salud_lock:
+            if self._pausa_hasta > time.monotonic():
+                return []
+            previa = self._busqueda_turno
+            if previa is None or previa.done():
+                future = self._pool.submit(self._buscar_sync, query, self.cfg.top_k)
+                self._busqueda_turno = future
+        if future is None:
+            log.debug("memoria: la búsqueda del turno anterior sigue en curso; "
+                      "respondo sin recuerdos")
+            self._fallo_turno()
+            return []
+        limite = self.cfg.timeout_busqueda_s
+        try:
+            recuerdos = future.result(timeout=limite)
+        except FutureTimeout:
+            future.cancel()
+            log.warning("memoria: la búsqueda tardó más de %.1fs; respondo sin recuerdos", limite)
+            self._fallo_turno()
+            return []
+        except MemoriaNoDisponible as error:
+            self._marcar_rota(str(error))
+            return []
+        except Exception as error:  # noqa: BLE001 - la memoria nunca tumba el turno
+            log.warning("memoria: búsqueda falló (%s); respondo sin recuerdos", error)
+            self._fallo_turno()
+            return []
+        self._exito_turno()
+        return recuerdos
+
+    def _fallo_turno(self) -> None:
+        """Una búsqueda por turno sin respuesta a tiempo (o rota). Mientras mem0
+        carga (precalentar) no cuenta: es el arranque, no un almacén enfermo, y
+        dos turnos en esos segundos dejaban los recuerdos en pausa un minuto."""
+        with self._salud_lock:
+            if self._calentando:
+                return
+            self._fallos_turno += 1
+            if self._fallos_turno < BREAKER_FALLOS:
+                return
+            self._pausa_hasta = time.monotonic() + BREAKER_PAUSA_S
+            # Medio abierto: tras la pausa, UN fallo más basta para reabrirla.
+            self._fallos_turno = BREAKER_FALLOS - 1
+            self._breaker_abierto = True
+        log.warning("memoria: la búsqueda no responde a tiempo; los próximos %.0f s respondo "
+                    "sin recuerdos y sin esperarla", BREAKER_PAUSA_S)
+
+    def _exito_turno(self) -> None:
+        with self._salud_lock:
+            volvio = self._breaker_abierto
+            self._fallos_turno = 0
+            self._breaker_abierto = False
+        if volvio:
+            log.info("memoria: la búsqueda volvió a responder a tiempo")
+
+    def contexto(self, query: str, ya_visto: Callable[[str], bool] | None = None) -> str:
+        """Bloque de texto para el LLM con los recuerdos relevantes ('' si nada).
+
+        Es la búsqueda POR TURNO (la del pre-hook): pasa por _buscar_turno.
+        `ya_visto(linea)`: True si esa línea ("- texto") ya está a la vista del
+        modelo; se omite (ver make_memoria_prehook).
+        """
+        recuerdos = self._buscar_turno(query)
         if not recuerdos:
             return ""
-        return "\n".join(f"- {r.texto}" for r in recuerdos)
+        lineas = [f"- {r.texto}" for r in recuerdos]
+        if ya_visto is not None:
+            lineas = [linea for linea in lineas if not ya_visto(linea)]
+        return "\n".join(lineas)
 
     # --- escritura ---
     def recordar(self, texto: str) -> list[str]:
@@ -658,12 +772,27 @@ class Memoria:
                 atexit.register(self._vaciar_al_salir)
                 self._vaciado_apuntado = True
 
-    def _vaciar_al_salir(self) -> None:
+    def _vaciar_al_salir(self, timeout_s: float | None = None) -> bool:
         # Corre en atexit, cuando los hilos daemon aún viven (os._exit se lo salta:
-        # el apagado por señal del listener tiene que llamar a cerrar() él mismo).
-        self.flush(timeout_s=_ESPERA_EXTRACCION_AL_SALIR_S)
+        # el apagado por señal del listener vacía la cola él mismo). Al salir no
+        # hay "después de la pausa" (ver _drenar): se corta, y lo que llegó durante
+        # ella se intenta ya, dentro de este mismo presupuesto, como antes de que
+        # existiera. Sin esto flush() esperaba los 5 s enteros a un hilo dormido, y
+        # lo encolado se perdía sin intentarse.
+        self._parar.set()
+        return self.flush(timeout_s=_ESPERA_EXTRACCION_AL_SALIR_S if timeout_s is None
+                          else timeout_s)
 
     def _drenar(self) -> None:
+        # Extracciones seguidas que fallaron. Antes, tras un fallo se pasaba
+        # directo al siguiente turno: un proveedor que contesta 429 o rechaza la
+        # key recibía otra petición tras CADA turno, contra el mismo límite que el
+        # cerebro (un 429 largo en el cerebro lo tira al modelo local 60 s). Tras
+        # EXTRAER_FALLOS el hilo espera EXTRAER_PAUSA_S; lo que llega mientras se
+        # queda en la cola, en orden, y se extrae al acabar la pausa. Después basta
+        # UN fallo más para otra pausa (medio abierto); un acierto pone el contador
+        # a cero. MemoriaNoDisponible no cuenta: ya la marca rota, como siempre.
+        fallos = 0
         while True:
             item = self._cola.get()
             try:
@@ -680,16 +809,38 @@ class Memoria:
                     self._marcar_rota(str(error))
                 except Exception as error:  # noqa: BLE001 - un turno roto no mata el hilo
                     log.warning("memoria: la extracción falló (%s)", error)
+                    fallos += 1
                 else:
+                    fallos = 0
                     log.debug("memoria: extracción en %.1fs, %d hecho(s) nuevo(s)",
                               time.monotonic() - t0, len(nuevos))
             finally:
                 self._cola.task_done()
+            # Con _parar puesto (cerrar, la salida) ya no se pausa: el aviso de
+            # "pauso 120 s" salía tras cada fallo sin que hubiera pausa.
+            if fallos >= EXTRAER_FALLOS and not self._parar.is_set():
+                log.warning("memoria: %d extracciones seguidas fallaron; pauso la extracción "
+                            "%.0f s (lo encolado espera, no se pierde)", fallos, EXTRAER_PAUSA_S)
+                # Sin tener ningún item en la mano (flush() espera, como con una
+                # extracción colgada, a lo encolado DURANTE la pausa); cerrar() y el
+                # vaciado al salir ponen el Event y la cortan.
+                self._en_pausa.set()
+                try:
+                    self._parar.wait(EXTRAER_PAUSA_S)
+                finally:
+                    self._en_pausa.clear()
+                fallos = EXTRAER_FALLOS - 1
 
     def flush(self, timeout_s: float = 5.0) -> bool:
         """Espera a que el hilo procese lo encolado hasta ahora (tests, CLI, salida)."""
         if self._worker is None or not self._worker.is_alive():
             return self._cola.empty()
+        if self._en_pausa.is_set() and self._cola.empty():
+            # En pausa el hilo no tiene ningún item en la mano: con la cola vacía,
+            # todo lo encolado hasta ahora ya se intentó. Sin esto el Event de abajo
+            # quedaba detrás de la pausa y flush() solo podía agotar su tiempo (los
+            # 2 s del apagado del listener) con nada pendiente.
+            return True
         listo = threading.Event()
         self._cola.put(listo)
         return listo.wait(timeout_s)
@@ -704,6 +855,7 @@ class Memoria:
             return
 
         def _calentar() -> None:
+            fallo = False
             try:
                 self._buscar_sync("hola", 1)
                 log.info("memoria semántica lista (%s)", self.cfg.ruta)
@@ -711,18 +863,32 @@ class Memoria:
                 self._marcar_rota(str(error))
             except Exception as error:  # noqa: BLE001
                 log.warning("memoria: no pude precalentar (%s)", error)
+                fallo = True
+            finally:
+                with self._salud_lock:
+                    self._calentando = False
+            if fallo:
+                # Un almacén que ya falla al arrancar: con un fallo más del
+                # primer turno, la búsqueda por turno se pausa (ver _buscar_turno).
+                self._fallo_turno()
 
+        with self._salud_lock:
+            self._calentando = True
         threading.Thread(target=_calentar, name="MemoriaWarm", daemon=True).start()
 
     def cerrar(self, timeout_s: float = 5.0) -> None:
         self._cerrada = True
+        # Despierta al hilo de extracción si está en pausa (ver _drenar): sigue
+        # vaciando la cola hasta el None, acotado por el join de abajo.
+        self._parar.set()
         # cerrar() ya vacía la cola (None va detrás de lo encolado): el vaciado de
         # atexit sobra, y soltarlo no deja la Memoria referenciada hasta el final.
         atexit.unregister(self._vaciar_al_salir)
         if self._worker is not None and self._worker.is_alive():
             self._cola.put(None)
             self._worker.join(timeout=timeout_s)
-        self._pool.shutdown(wait=False)
+        # Lo que quedó en la cola del pool (búsquedas que ya nadie espera) no corre.
+        self._pool.shutdown(cancel_futures=True)
 
 
 def mem0_instalado() -> bool:
@@ -762,16 +928,53 @@ def set_memoria(memoria: Memoria | None) -> None:
         _MEMORIA = memoria
 
 
-def make_memoria_prehook(memoria: Memoria) -> Callable[[str], str]:
+def _ya_en(textos: list[str]) -> Callable[[str], bool]:
+    """¿Está `linea` como línea ENTERA en alguno de `textos`? La última del bloque
+    de recuerdos lleva pegado el "]" de cierre."""
+    envueltos = [f"\n{texto}\n" for texto in textos]
+
+    def visto(linea: str) -> bool:
+        return any(f"\n{linea}\n" in t or f"\n{linea}]\n" in t for t in envueltos)
+
+    return visto
+
+
+def make_memoria_prehook(
+    memoria: Memoria,
+    conversation: Conversation | None = None,
+    ventana_entera: Callable[[], bool] | None = None,
+) -> Callable[[str], str]:
     """Pre-hook por turno: antepone los recuerdos relevantes al mensaje del patrón.
 
     Va PRIMERO en la cadena de pre-hooks para buscar con el texto limpio. Si la
     memoria no está, tarda o falla, devuelve el texto tal cual (buscar() ya
     logueó el WARNING): la voz nunca espera.
+
+    Con `conversation`, un recuerdo que ya va en un mensaje del patrón que
+    seguirá en la ventana no se repite: el bloque se guarda en el historial con
+    el mensaje, y antes cada turno sumaba otra copia de los mismos recuerdos
+    (54 líneas repetidas en el request del turno 25 con top_k=3). Cuando esa
+    copia sale de la ventana, el recuerdo vuelve a entrar en cuanto se recupere.
+    `ventana_entera()` dice si el motor que respondería ve la ventana entera:
+    si no (el local de 2048 tira los turnos viejos del request), se repite
+    como siempre, porque la copia vieja podría no llegarle.
+
+    Con el TurnInfo del agente (`turn`), un comando anclado ("pausa la música",
+    "abre opera": la orden COMPLETA casa con una regla del fast-path) no busca:
+    su acción la fija la regla y los recuerdos no la cambian. Antes pagaba la
+    búsqueda (hasta el presupuesto entero, ANTES de que el fast-path corriera
+    la tool) y el bloque solo acababa en el historial. Sin `turn` (llamada
+    directa), como siempre.
     """
 
-    def hook(text: str) -> str:
-        ctx = memoria.contexto(text)
+    @wants_turn
+    def hook(text: str, turn: TurnInfo | None = None) -> str:
+        if turn is not None and turn.command is not None:
+            return text
+        if conversation is None or (ventana_entera is not None and not ventana_entera()):
+            ctx = memoria.contexto(text)
+        else:
+            ctx = memoria.contexto(text, _ya_en(conversation.surviving_user_texts()))
         if not ctx:
             return text
         return f"[recuerdos sobre el patrón que vienen al caso:\n{ctx}]\n\n{text}"
@@ -780,9 +983,18 @@ def make_memoria_prehook(memoria: Memoria) -> Callable[[str], str]:
 
 
 def make_memoria_posthook(memoria: Memoria) -> Callable[[str, str], None]:
-    """After-turn hook: encola el turno para extraer hechos. No bloquea."""
+    """After-turn hook: encola el turno para extraer hechos. No bloquea.
 
-    def hook(usuario: str, respuesta: str) -> None:
+    Un comando anclado (ver make_memoria_prehook) no se encola: cada extracción
+    es una llamada al LLM de la nube (con la key y el límite del cerebro) y el
+    prompt de extracción ya manda ignorar esas órdenes, así que no se pierde
+    ningún hecho. Sin `turn`, como siempre.
+    """
+
+    @wants_turn
+    def hook(usuario: str, respuesta: str, turn: TurnInfo | None = None) -> None:
+        if turn is not None and turn.command is not None:
+            return
         memoria.extraer_en_fondo(usuario, respuesta)
 
     return hook

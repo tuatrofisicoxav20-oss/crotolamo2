@@ -19,7 +19,7 @@ from crotolamo.core.memoria import (
     parece_secreto,
 )
 from crotolamo.persistence import facts as facts_sqlite
-from crotolamo.tools.base import Tool, _build_parameters, _split_doc, normalize_key
+from crotolamo.tools.base import LANE_LIBRETA, Tool, _build_parameters, _split_doc, normalize_key
 
 
 # Si la memoria semántica cae en caliente (mem0 roto, Chroma ilegible), estas
@@ -161,7 +161,8 @@ def olvidar_recuerdo(descripcion: str) -> str:
     return f"Olvidado, patrón: «{borrado.texto}»."
 
 
-def _make(func: Callable[..., str], safe: bool = True) -> Tool:
+def _make(func: Callable[..., str], safe: bool = True, parallel_safe: bool = False,
+          parallel_lane: str | None = None) -> Tool:
     doc = (func.__doc__ or "").replace("{regla}", REGLA_CONTENIDO)
     description, param_docs = _split_doc(doc)
     return Tool(
@@ -170,6 +171,8 @@ def _make(func: Callable[..., str], safe: bool = True) -> Tool:
         description=description,
         parameters=_build_parameters(func, param_docs),
         safe=safe,
+        parallel_safe=parallel_safe,
+        parallel_lane=parallel_lane,
     )
 
 
@@ -177,7 +180,9 @@ def memoria_tools() -> list[Tool]:
     """Las tres tools, listas para registrar (el registro lo hace tools/__init__)."""
     return [
         _make(recordar_de_mi),
-        _make(buscar_recuerdos),
+        # Solo lee: con otras lecturas del mismo mensaje corre a la vez; con las
+        # de la libreta (y con otra búsqueda de recuerdos), una tras otra.
+        _make(buscar_recuerdos, parallel_safe=True, parallel_lane=LANE_LIBRETA),
         # Olvidar es destructivo pero acotado (un recuerdo, y dice cuál): sin
         # confirmación para que "olvida lo de X" por voz sea de un solo paso.
         _make(olvidar_recuerdo),

@@ -368,12 +368,20 @@ def route_schemas(
     p.ej. si una tool se quita), y el tope se cuenta sobre ESAS: un nombre
     ausente no ocupa hueco. Lista vacía es intencional (charla): significa
     "sin tools este turno", NO "manda todas".
+
+    Van en el orden del registry, no en el de la selección: el orden de
+    select_tool_names solo decide qué entra bajo el tope. Así el mismo set da
+    los mismos bytes en cada llamada (con la rotación de los grupos MCP, o con
+    otra frase que puntúa distinto a los mismos grupos) y Ollama reusa el
+    cache KV del principio del prompt en vez de re-evaluarlo entero.
     """
-    names = select_tool_names(text, max_tools, available=registry.names())
+    registered = registry.names()
+    names = select_tool_names(text, max_tools, available=registered)
     if not names:
         return []  # charla: turno rápido, sin tentar al modelo a alucinar tools
+    order = {name: i for i, name in enumerate(registered)}
     schemas: list[dict[str, Any]] = []
-    for name in names:
+    for name in sorted(names, key=lambda n: order.get(n, len(order))):
         tool = registry.get(name)
         if tool is not None:
             schemas.append(tool.schema())

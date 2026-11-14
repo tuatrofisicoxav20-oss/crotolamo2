@@ -64,7 +64,7 @@ def _outside_corral(p: Path) -> str | None:
     return None
 
 
-@tool
+@tool(parallel_safe=True)
 def read_file(path: str) -> str:
     """Lee un archivo de texto y devuelve su contenido (recortado si es enorme).
 
@@ -114,7 +114,7 @@ def write_file(path: str, content: str) -> str:
     return f"Escribí {len(content)} chars en {p}, patrón."
 
 
-@tool
+@tool(parallel_safe=True)
 def list_dir(path: str) -> str:
     """Lista el contenido de una carpeta.
 
@@ -209,7 +209,7 @@ def delete_file(path: str) -> str:
     return f"Borrado, patrón: {p}"
 
 
-@tool
+@tool(parallel_safe=True)
 def search_files(query: str) -> str:
     """Busca archivos por nombre dentro de Documentos del patrón (read-only).
 

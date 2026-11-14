@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import http.client
 import json
+import logging
 import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, NoReturn
 
+from crotolamo.core import budget
 from crotolamo.core.engine import HTTPTransport
 from crotolamo.core.tool_parsing import arguments_complete, parse_arguments
 from crotolamo.logging_setup import get_logger
@@ -68,7 +70,33 @@ def _read_body(resp) -> str:
         return ""
 
 
+def _log_request(logger: logging.Logger, engine: str, payload: dict[str, Any]) -> None:
+    """DEBUG por request: bytes que viajan, tokens estimados, nº de tools y de
+    mensajes. Con esto (y lo que cuenta cada motor de vuelta) se deciden los
+    knobs de [memory] con datos reales. Solo serializa con DEBUG activo: con
+    el nivel de producción no cuesta nada."""
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    try:
+        messages = payload.get("messages") or []
+        tools = payload.get("tools")
+        # Medido como serializa el transporte (errors="replace"): el historial
+        # puede traer un sustituto suelto (medio emoji en el JSON de la nube) y
+        # el códec estricto reventaba aquí, antes de enviar, en cada turno.
+        logger.debug(
+            "request a %s: %d bytes, ~%d tokens estimados, %d tools, %d mensajes",
+            engine, budget._json_bytes(payload),
+            budget.est_tokens(messages, tools), len(tools or []), len(messages),
+        )
+    except Exception:  # noqa: BLE001 - una línea de log nunca tumba un request
+        logger.debug("no pude medir el request a %s", engine, exc_info=True)
+
+
 class LLMClient:
+    # El warm-up del listener lo calienta: el primer turno en frío carga el
+    # modelo en RAM (~60-120 s en CPU). Ver GLMClient.needs_warmup.
+    needs_warmup = True
+
     def __init__(
         self,
         host: str = "http://localhost:11434",
@@ -77,6 +105,7 @@ class LLMClient:
         timeout: float = 120,
         keep_alive: str = "15m",
         num_ctx: int | None = None,
+        connect_timeout: float | None = None,
     ) -> None:
         self.host = host.rstrip("/")
         self.model = model
@@ -86,6 +115,8 @@ class LLMClient:
         # más chica reduce memoria y trabajo del KV-cache; ojo: persona + 8
         # schemas enrutadas ya ocupan ~1600-1750 tokens; ver el comentario de
         # [llm].num_ctx en config/crotolamo.toml. None = default del modelo.
+        # Con num_ctx, cada request se ajusta a esa ventana ANTES de salir (ver
+        # _fit): lo que no cabía, Ollama lo recortaba en silencio.
         self.num_ctx = num_ctx
         # keep_alive: cuánto mantiene Ollama el modelo (y su cache de prefijo KV)
         # residente tras una respuesta. En CPU es CLAVE: el primer turno paga el
@@ -94,7 +125,10 @@ class LLMClient:
         # "15m" balancea rapidez en sesión vs. liberar RAM cuando no se usa.
         self.keep_alive = keep_alive
         # Conexión HTTP persistente: evita abrir TCP nuevo en cada petición.
-        self._transport = HTTPTransport(self.host, timeout=self.timeout)
+        # `timeout` cubre la respuesta (carga en frío incluida); conectar tiene
+        # su propio tope (None = 5 s): un host caído no espera 180 s.
+        self._transport = HTTPTransport(
+            self.host, timeout=self.timeout, connect_timeout=connect_timeout)
 
     @classmethod
     def from_settings(cls, settings) -> "LLMClient":
@@ -106,6 +140,7 @@ class LLMClient:
             timeout=llm.get("timeout", 120),
             keep_alive=llm.get("keep_alive", "15m"),
             num_ctx=llm.get("num_ctx"),
+            connect_timeout=llm.get("connect_timeout"),
         )
 
     def _options(self) -> dict[str, Any]:
@@ -113,6 +148,39 @@ class LLMClient:
         if self.num_ctx:
             options["num_ctx"] = self.num_ctx
         return options
+
+    def _fit(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+    ) -> list[dict[str, Any]]:
+        """Los mensajes ajustados a num_ctx; los MISMOS si ya caben (o sin num_ctx).
+
+        Ollama no rechaza un prompt que no cabe: lo recorta por su cuenta, y
+        cuando ni el último mensaje entra, corta el PRINCIPIO del prompt
+        (persona incluida) y el modelo contesta sin saber quién es. Aquí se
+        conserva la persona, las tools ofrecidas y el turno en curso; se tiran
+        bloques viejos enteros (un resultado de tool nunca queda sin la llamada
+        que lo pidió) y se recortan los resultados largos con la marca de
+        siempre. Solo el request: la Conversation no se toca, así que la nube,
+        cuando vuelve, ve la historia entera.
+        """
+        if not self.num_ctx:
+            return messages
+        ajuste = budget.fit_window(
+            messages, tools, self.num_ctx, tool_cap=budget.local_tool_cap(self.num_ctx))
+        if ajuste.messages is not messages:
+            # Con 2048 pasa en casi cada turno con historia: el aviso trae los
+            # números para decidir si subir [llm].num_ctx (más RAM).
+            log.warning(
+                "el request para Ollama no cabía en num_ctx=%d (~%d tokens estimados): "
+                "tiré %d bloque(s) viejo(s), recorté %d resultado(s) de tool y "
+                "%d hueco(s) anclado(s); quedan ~%d%s",
+                self.num_ctx, ajuste.est_before, ajuste.dropped_blocks,
+                ajuste.clipped_tools, ajuste.clipped_pinned, ajuste.est_after,
+                "" if ajuste.fits else " (ni así cabe en la estimación, que peca de grande)",
+            )
+        return ajuste.messages
 
     def _payload(
         self,
@@ -123,7 +191,7 @@ class LLMClient:
         payload: dict[str, Any] = {
             "model": self.model,
             "stream": stream,
-            "messages": messages,
+            "messages": self._fit(messages, tools),
             "keep_alive": self.keep_alive,
             "options": self._options(),
         }
@@ -180,7 +248,9 @@ class LLMClient:
         tools: list[dict[str, Any]] | None = None,
     ) -> ChatResponse:
         t0 = time.time() if _PROF else 0.0
-        resp = self._send(self._payload(messages, tools, stream=False))
+        payload = self._payload(messages, tools, stream=False)
+        _log_request(log, "Ollama", payload)
+        resp = self._send(payload)
         try:
             raw = json.loads(resp.read().decode("utf-8"))
         except (TimeoutError, OSError) as error:
@@ -213,6 +283,7 @@ class LLMClient:
                 f"gen={raw.get('eval_count', '?')} | tools_enviadas={n_tools}",
                 flush=True,
             )
+        self._check_prompt_eval(raw)
 
         message = raw.get("message", {}) or {}
         return ChatResponse(
@@ -238,9 +309,12 @@ class LLMClient:
         consumidor que aborta, cuelga el socket, que es lo que hace que Ollama
         deje de generar.
         """
-        resp = self._send(self._payload(messages, tools, stream=True))
+        payload = self._payload(messages, tools, stream=True)
+        _log_request(log, "Ollama", payload)
+        resp = self._send(payload)
+        stats: dict[str, Any] = {}
         try:
-            content, message, complete = self._parse_stream(resp, on_token)
+            content, message, complete = self._parse_stream(resp, on_token, stats)
         except (TimeoutError, OSError) as error:
             self._transport.close()
             raise TransientLLMError(
@@ -268,12 +342,32 @@ class LLMClient:
                 len(content), len(message.get("tool_calls") or []),
             )
             self._transport.close()
+        self._check_prompt_eval(stats)
 
         return ChatResponse(
             content=content.strip(),
             tool_calls=_parse_tool_calls(message),
             raw_message=message,
         )
+
+    def _check_prompt_eval(self, stats: dict[str, Any]) -> None:
+        """Lo que Ollama dice que evaluó. Un prompt_eval_count en el tope de
+        num_ctx (menos la reserva de la respuesta) es que el prompt llegó al
+        borde de la ventana: Ollama pudo recortarlo por su cuenta, o recortará
+        en cuanto la respuesta no quepa. La estimación de _fit (bytes / 3.3)
+        no ve los tokens reales; esto sí. Es un mínimo: con el cache de
+        prefijo, Ollama cuenta solo lo que re-evaluó."""
+        evaluated = stats.get("prompt_eval_count")
+        log.debug("Ollama: prompt_eval_count=%s eval_count=%s",
+                  evaluated, stats.get("eval_count"))
+        if (self.num_ctx and isinstance(evaluated, int)
+                and evaluated >= self.num_ctx - budget.REPLY_RESERVE):
+            log.warning(
+                "Ollama evaluó %d tokens de prompt con num_ctx=%d: llegó al borde de la "
+                "ventana (menos de %d para la respuesta) y pudo recortarlo. Sube "
+                "[llm].num_ctx si pasa a menudo",
+                evaluated, self.num_ctx, budget.REPLY_RESERVE,
+            )
 
     @staticmethod
     def _consume_stream(resp, on_token) -> tuple[str, dict[str, Any]]:
@@ -282,7 +376,8 @@ class LLMClient:
         return content, message
 
     @staticmethod
-    def _parse_stream(resp, on_token) -> tuple[str, dict[str, Any], bool]:
+    def _parse_stream(resp, on_token,
+                      stats: dict[str, Any] | None = None) -> tuple[str, dict[str, Any], bool]:
         """Parsea el JSONL de /api/chat?stream=true. Reusable y testeable.
 
         Devuelve (contenido, mensaje del turno ENTERO, ¿llegó done=true?). Con
@@ -304,6 +399,9 @@ class LLMClient:
         Como `parse_sse`, consulta el `checkpoint` del on_token (si lo trae)
         con CADA línea: un chunk de razonamiento (`thinking`) o de tool_calls
         llega con content vacío y no pasa por on_token.
+
+        `stats`: si se pasa un dict, se llena con los contadores del chunk final
+        (prompt_eval_count, eval_count). Solo para el log; lo devuelto no cambia.
         """
         checkpoint = getattr(on_token, "checkpoint", None)
         parts: list[str] = []
@@ -347,6 +445,9 @@ class LLMClient:
                     on_token(delta)
             if obj.get("done"):
                 complete = True
+                if stats is not None:
+                    stats.update({k: obj[k] for k in ("prompt_eval_count", "eval_count")
+                                  if k in obj})
                 break
         calls = final_calls or early_calls
         content = "".join(parts)

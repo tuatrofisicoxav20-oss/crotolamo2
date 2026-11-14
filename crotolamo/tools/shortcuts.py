@@ -9,7 +9,7 @@ un proyecto se guarda como búsqueda.
 from __future__ import annotations
 
 from crotolamo.persistence import db
-from crotolamo.tools.base import normalize_key, tool
+from crotolamo.tools.base import LANE_LIBRETA, normalize_key, tool
 from crotolamo.tools.desktop import open_app, open_folder, open_url, resolve_target
 from crotolamo.tools.search import search_web
 
@@ -57,7 +57,7 @@ def run_shortcut(alias: str) -> str:
     return f"El atajo '{alias}' está mal guardado, patrón."
 
 
-@tool
+@tool(parallel_safe=True, parallel_lane=LANE_LIBRETA)
 def list_shortcuts() -> str:
     """Lista los atajos que el patrón ha enseñado."""
     shortcuts = db.all_shortcuts()

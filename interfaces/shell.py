@@ -12,7 +12,7 @@ from typing import Any, Callable
 
 from crotolamo.core.agent import Agent
 from crotolamo.core.engine import build_llm
-from crotolamo.core.memory import Conversation
+from crotolamo.core.memory import CompactionWorker, Conversation
 from crotolamo.core.persona import system_prompt
 from crotolamo.logging_setup import get_logger
 from crotolamo.settings import get_settings
@@ -21,6 +21,19 @@ log = get_logger("shell")
 
 # Lo que oye el patrón cuando un turno revienta por un bug (la misma frase que la voz).
 _TURNO_ROTO = "Se me trabaron los cables, patrón. Vuelve a intentarlo."
+
+
+def _memory_knob(memory: dict[str, Any], key: str, default: int | None) -> Any:
+    """Un número opcional (>= 0) de [memory]. Un valor que no lo es (un typo en el
+    toml) se avisa y se ignora: un knob opcional no debe tumbar el arranque del
+    daemon, ni un negativo vaciar la conversación en cada turno."""
+    value = memory.get(key, default)
+    if value is None or (isinstance(value, (int, float)) and not isinstance(value, bool)
+                         and value >= 0):
+        return value
+    log.warning("[memory].%s = %r no es un número >= 0; lo ignoro (uso %r)",
+                key, value, default)
+    return default
 
 
 def build_agent(confirm_fn=None) -> tuple[Agent, Conversation]:
@@ -46,21 +59,28 @@ def build_agent(confirm_fn=None) -> tuple[Agent, Conversation]:
         return resp.content
 
     # M4.2: los hechos ya NO se inyectan en el system prompt aquí, sino vía pre-hook.
+    # Los knobs de [memory] que deciden qué viaja en cada request (ver la Conversation
+    # y config/crotolamo.toml); sin sus claves, el request es el de siempre.
+    idle_min = _memory_knob(settings.memory, "idle_reset_min", None)
     conversation = Conversation(
         system_prompt(),
         max_turns=settings.memory.get("max_turns", 20),
         compaction=compaction,
         summarizer=_summarize if compaction else None,
+        trim_chunk=_memory_knob(settings.memory, "trim_chunk", 1),
+        stale_tool_turns=_memory_knob(settings.memory, "stale_tool_turns", None),
+        idle_reset_s=idle_min * 60 if idle_min else None,
     )
 
     # La Fase 2 cablea el registry de tools; si está disponible, lo usamos.
     try:
-        from crotolamo.core.agent import ToolAgent  # type: ignore
+        from crotolamo.core.agent import DEFAULT_DIRECT_TOOLS, BrainPolicy, ToolAgent
         from crotolamo.core.hooks import (
             datetime_prehook,
             make_facts_prehook,
             make_memoria_posthook,
             make_memoria_prehook,
+            make_pinned_facts_prehook,
         )
         from crotolamo.core.memoria import get_memoria, mem0_instalado
         from crotolamo.core.router import route_schemas
@@ -83,22 +103,55 @@ def build_agent(confirm_fn=None) -> tuple[Agent, Conversation]:
         # cada consulta para que el turno local sea rápido (~2-5s vs ~130s).
         use_routing = settings.llm.get("tool_routing", True)
         max_tools = settings.llm.get("max_tools", 8)
+        local_route: Callable[[str], list[dict[str, Any]]] | None = (
+            (lambda t: route_schemas(registry, t, max_tools)) if use_routing else None
+        )
 
-        route_fn: Callable[[str], list[dict[str, Any]]] | None
+        # Con GLM, UNA política por motor (ver BrainPolicy): el agente la consulta
+        # en cada llamada, así que atajos y dieta de tools siguen al motor que de
+        # verdad responde, que el breaker de FallbackLLM decide llamada a llamada.
+        # Antes se miraba `llm.degraded` una vez por turno, ANTES de la llamada
+        # que descubre la caída: ese turno mandaba las 42 tools al modelo local.
+        # Con Ollama de cerebro, la de los kwargs de siempre (policy=None).
+        policy_fn: Callable[[], BrainPolicy] | None = None
+        answered_fn: Callable[[], BrainPolicy] | None = None
+        route_fn = local_route
+        # La dieta que recibe el local si la nube cae A MEDIA llamada (ver abajo).
+        failover_policy: BrainPolicy | None = None
         if glm_brain:
-            # GLM ve TODO el arsenal; si el breaker degradó a Ollama local
-            # (sin internet), se vuelve al routing chico para no pagar ~130s.
-            def _route_glm(text: str) -> list[dict[str, Any]]:
-                if llm.degraded and use_routing:
-                    return route_schemas(registry, text, max_tools)
-                return registry.schemas()
+            cloud_policy = BrainPolicy("cloud", fastpath=False, direct_tools=frozenset(),
+                                       honor_tool_direct=False)
+            # Degradado a Ollama (sin internet): el routing chico, siempre. Sus
+            # atajos (fastpath y retorno directo) solo si el patrón lo pide con
+            # [llm.glm].fallback_shortcuts; sin la clave, como siempre: sin atajos.
+            if settings.llm.get("glm", {}).get("fallback_shortcuts", False):
+                degraded_policy = BrainPolicy(
+                    "local", fastpath=settings.llm.get("fastpath", True),
+                    direct_tools=DEFAULT_DIRECT_TOOLS, route=local_route,
+                )
+            else:
+                degraded_policy = BrainPolicy("degraded", fastpath=False,
+                                              direct_tools=frozenset(),
+                                              honor_tool_direct=False, route=local_route)
 
-            route_fn = _route_glm
-        else:
-            route_fn = (
-                (lambda t: route_schemas(registry, t, max_tools))
-                if use_routing else None
-            )
+            def _policy_glm() -> BrainPolicy:
+                return degraded_policy if llm.degraded else cloud_policy
+
+            def _answered_glm() -> BrainPolicy:
+                # El motor que RESPONDIÓ, según FallbackLLM: no `degraded` mirado
+                # después, que ya es False si el cooldown venció en plena llamada local.
+                return degraded_policy if llm.answered_by_secondary else cloud_policy
+
+            def _route_now(text: str) -> list[dict[str, Any]]:
+                # Solo compatibilidad (agent.route_fn): las tools que vería AHORA
+                # el motor que respondería; el agente usa la política directamente.
+                return _policy_glm().schemas_for(registry, text)
+
+            policy_fn = _policy_glm
+            answered_fn = _answered_glm
+            route_fn = _route_now
+            if local_route is not None:
+                failover_policy = degraded_policy
 
         # Memoria semántica (mem0): con [memoria].enabled, los recuerdos
         # relevantes entran en CADA turno (pre-hook, con presupuesto de tiempo)
@@ -108,13 +161,28 @@ def build_agent(confirm_fn=None) -> tuple[Agent, Conversation]:
         memoria = get_memoria()
         if memoria.enabled and mem0_instalado():
             memoria.precalentar()
-            pre_hooks = [make_memoria_prehook(memoria), datetime_prehook]
+            if glm_brain:
+                # Un recuerdo que ya va en la ventana no se repite en cada turno
+                # (ver make_memoria_prehook). Mientras responde el local (breaker
+                # abierto), sí: el ajuste a su num_ctx tira los turnos viejos.
+                recall = make_memoria_prehook(memoria, conversation,
+                                              ventana_entera=lambda: not llm.degraded)
+            else:
+                recall = make_memoria_prehook(memoria)
+            pre_hooks = [recall, datetime_prehook]
             after_turn_hooks = [make_memoria_posthook(memoria)]
         else:
-            pre_hooks = [make_facts_prehook(), datetime_prehook]
+            # Los hechos SQLite, anclados tras el system prompt ([memory].pin_facts,
+            # de fábrica): en el primer mensaje, como antes, se perdían al salir
+            # ese mensaje de la ventana (turno max_turns+1) y con /reset.
+            if settings.memory.get("pin_facts", True):
+                facts_hook = make_pinned_facts_prehook(conversation)
+            else:
+                facts_hook = make_facts_prehook()
+            pre_hooks = [facts_hook, datetime_prehook]
             after_turn_hooks = []
 
-        agent: Agent = ToolAgent(
+        tool_agent = ToolAgent(
             llm,
             conversation,
             registry=registry,
@@ -125,9 +193,34 @@ def build_agent(confirm_fn=None) -> tuple[Agent, Conversation]:
             after_turn_hooks=after_turn_hooks,
             route_fn=route_fn,
             # Con GLM no hay comandos prehechos: todo lo razona y redacta él.
+            # (Con `policy`, estos dos quedan como atributos de compatibilidad.)
             fastpath=False if glm_brain else settings.llm.get("fastpath", True),
             direct_tools=set() if glm_brain else None,
+            policy=policy_fn,
+            answered_policy=answered_fn,
+            # Apagada de fábrica: la decide el patrón (ver config/crotolamo.toml).
+            stop_on_repeated_failure=settings.llm.get("stop_on_repeated_failure", False),
         )
+        if failover_policy is not None:
+            # La nube cayó A MEDIA llamada: esa petición iba armada para GLM (todas
+            # las tools). El local recibe la dieta chica del texto limpio del turno,
+            # la MISMA lista que el agente le dará en las llamadas siguientes (se
+            # enruta una vez por turno). Sin tool_routing no se instala: el local
+            # recibe todo, como siempre.
+            def _shape(messages, tools):
+                return messages, tool_agent.schemas_for_turn(failover_policy)
+
+            llm.shape_for_secondary = _shape
+        if compaction:
+            # El resumen de [memory].compaction, DESPUÉS de hablar: antes era una
+            # llamada al LLM dentro de add_user, antes de la del turno (un viaje
+            # de ida y vuelta entero antes de la primera palabra, en cada turno
+            # con la ventana llena). Lo que sale de la ventana sigue a la vista
+            # tal cual hasta que el resumen lo sustituye. Al final del armado: si
+            # algo de arriba falla, el Agent sin tools resume como siempre.
+            conversation.summarize_in_background = True
+            tool_agent.after_turn_hooks.append(CompactionWorker(conversation).after_turn)
+        agent: Agent = tool_agent
     except Exception:
         # Degradar a un agente SIN tools mantiene a Crotolamo hablando, pero no
         # puede ser silencioso: un ImportError en un módulo de tools dejaba al
@@ -138,6 +231,18 @@ def build_agent(confirm_fn=None) -> tuple[Agent, Conversation]:
         agent = Agent(llm, conversation)
 
     return agent, conversation
+
+
+def _cerrar_agente(agent) -> None:
+    """Al salir, el agente apaga sus hilos (los de las tools en paralelo, ver
+    ToolAgent.close). Un fallo aquí no puede tapar la salida: queda en el log."""
+    cerrar = getattr(agent, "close", None)
+    if cerrar is None:
+        return
+    try:
+        cerrar()
+    except Exception as error:  # noqa: BLE001 - salir siempre
+        log.warning("no pude cerrar el agente al salir: %s", error)
 
 
 def _text_confirm(reason: str) -> bool:
@@ -180,6 +285,7 @@ def run_shell(argv: list[str] | None = None) -> int:
             user = input("Patrón > ").strip()
         except (KeyboardInterrupt, EOFError):
             print("\nCrotolamo apagado, patrón.")
+            _cerrar_agente(agent)
             return 0
 
         if not user:
@@ -188,6 +294,7 @@ def run_shell(argv: list[str] | None = None) -> int:
         low = user.lower()
         if low in {"salir", "exit", "quit"}:
             print("Crotolamo apagado, patrón.")
+            _cerrar_agente(agent)
             return 0
         if low == "/reset":
             conversation.reset()

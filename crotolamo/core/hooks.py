@@ -107,30 +107,64 @@ def strip_leaked_tool_json(reply: str) -> str:
     return reply
 
 
+def _facts_block() -> str | None:
+    """El bloque de hechos del patrón tal como lo lee el modelo. "" sin hechos;
+    None si no se pudo leer la base (se reintenta en el próximo turno)."""
+    try:
+        from crotolamo.persistence import facts
+
+        ctx = facts.facts_context()
+    except Exception as error:  # noqa: BLE001 - sin hechos, pero el turno sigue
+        log.warning("no pude leer los hechos del patrón (reintento en el próximo turno): %s",
+                    error)
+        return None
+    return f"[contexto que ya sabes sobre el patrón:\n{ctx}]" if ctx else ""
+
+
 def make_facts_prehook():
     """Pre-hook que inyecta los hechos recordados del patrón UNA sola vez (primer
     turno), sustituyendo la inyección manual en el system prompt (M4.2).
+
+    Es la de [memory].pin_facts = false: el bloque viaja dentro del primer
+    mensaje guardado y se pierde cuando ese mensaje sale de la ventana o con
+    /reset. De fábrica va anclado (make_pinned_facts_prehook).
     """
     state = {"done": False}
 
     def hook(text: str) -> str:
         if state["done"]:
             return text
-        try:
-            from crotolamo.persistence import facts
-
-            ctx = facts.facts_context()
-        except Exception as error:  # noqa: BLE001 - sin hechos, pero el turno sigue
+        block = _facts_block()
+        if block is None:
             # NO se marca como hecho: la marca iba antes de leer y un fallo
             # puntual en el primer turno (sqlite bloqueada) dejaba al proceso
             # sin hechos hasta reiniciar, sin una línea en el log. Se reintenta
             # en el turno siguiente.
-            log.warning("no pude leer los hechos del patrón (reintento en el próximo turno): %s",
-                        error)
             return text
         state["done"] = True
-        if ctx:
-            return f"[contexto que ya sabes sobre el patrón:\n{ctx}]\n\n{text}"
+        if block:
+            return f"{block}\n\n{text}"
+        return text
+
+    return hook
+
+
+def make_pinned_facts_prehook(conversation):
+    """Pre-hook que mantiene los hechos del patrón en un hueco ANCLADO de la
+    Conversation ([memory].pin_facts, de fábrica) y devuelve el texto intacto.
+
+    Mismo bloque que make_facts_prehook, pero tras el system prompt en vez de
+    dentro del primer mensaje: lo ve el modelo en TODOS los turnos, también
+    pasados max_turns turnos y tras /reset. Se relee en cada turno (una consulta
+    SQLite de una tabla chica): un hecho que se guarda o se olvida se nota en el
+    turno siguiente, y mientras no cambien, los bytes del hueco tampoco. Si la
+    base falla, se queda el bloque que ya estaba.
+    """
+
+    def hook(text: str) -> str:
+        block = _facts_block()
+        if block is not None:
+            conversation.set_pinned("facts", block or None)
         return text
 
     return hook

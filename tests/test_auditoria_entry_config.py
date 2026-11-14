@@ -151,11 +151,17 @@ def test_con_glm_los_atajos_de_velocidad_se_apagan(monkeypatch, tmp_path):
     assert agent.fastpath is False
     assert agent.direct_tools == set()
     assert len(agent.route_fn("pausa la música")) == len(todas)
+    # Lo que de verdad decide (la política por llamada; los atributos de arriba
+    # quedan de compatibilidad): ni fastpath ni short-circuit, flag Tool.direct incluido.
+    nube = agent._policy_fn()
+    assert (nube.fastpath, nube.direct_tools, nube.honor_tool_direct) == (False, frozenset(), False)
 
     llm._retry_at = time.monotonic() + 60  # breaker abierto: responde Ollama
     assert llm.degraded
     assert 0 < len(agent.route_fn("pausa la música")) < len(todas)
     assert agent.fastpath is False  # el fastpath no vuelve al degradar
+    local = agent._policy_fn()
+    assert (local.fastpath, local.direct_tools, local.honor_tool_direct) == (False, frozenset(), False)
 
     texto = (_RAIZ / "README.md").read_text(encoding="utf-8")
     parrafo = next(p for p in texto.split("\n\n") if "`direct_tools`" in p)
