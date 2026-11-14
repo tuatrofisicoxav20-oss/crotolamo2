@@ -12,6 +12,7 @@ deliberadamente de red local. Frigate no pide token.
 
 from __future__ import annotations
 
+import http.client
 import json
 import urllib.error
 import urllib.request
@@ -42,7 +43,22 @@ def _build_opener() -> urllib.request.OpenerDirector:
     return urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
-_OPENER = _build_opener()
+_OPENER: urllib.request.OpenerDirector | None = None
+
+
+def _opener() -> urllib.request.OpenerDirector:
+    """El opener del módulo, construido en el PRIMER uso y no al importar.
+
+    En Python 3.12+ HTTPSHandler crea su SSLContext (y carga el bundle de CAs
+    del sistema, ~20 ms) en el constructor: como constante de módulo se pagaba
+    en cada arranque del shell/listener/doctor aunque nunca se consultara una
+    cámara y la base_url sea http://. Vive en el global `_OPENER` para que
+    sustituirlo desde fuera (tests) siga mandando.
+    """
+    global _OPENER
+    if _OPENER is None:
+        _OPENER = _build_opener()
+    return _OPENER
 
 
 def _http_json(url: str, timeout: float = _TIMEOUT) -> Any:
@@ -53,7 +69,7 @@ def _http_json(url: str, timeout: float = _TIMEOUT) -> Any:
     json.JSONDecodeError si el body no es JSON.
     """
     request = urllib.request.Request(url)
-    with _OPENER.open(request, timeout=timeout) as response:  # noqa: S310
+    with _opener().open(request, timeout=timeout) as response:  # noqa: S310
         raw = response.read(_MAX_BODY)
     return json.loads(raw) if raw.strip() else []
 
@@ -72,7 +88,15 @@ def _frigate_get(path: str, params: dict[str, Any] | None = None) -> tuple[bool,
         return True, _http_json(url)
     except urllib.error.HTTPError as error:
         return False, f"http_{error.code}"
-    except (TimeoutError, urllib.error.URLError, OSError) as error:
-        return False, f"conexion: {error}"
-    except json.JSONDecodeError:
+    # UnicodeDecodeError: JSON que no es UTF-8 (json.loads lo decodifica antes
+    # de parsear y ese fallo es ValueError, NO JSONDecodeError).
+    except (json.JSONDecodeError, UnicodeDecodeError):
         return False, "respuesta_rara"
+    # HTTPException (IncompleteRead de un chunked cortado, BadStatusLine de un
+    # puerto que no habla HTTP...) no hereda de OSError, y ValueError es lo que
+    # lanza Request() con una base_url sin esquema, antes de tocar la red: sin
+    # ellos el "NO lanza" de arriba era mentira y la tool salía por el
+    # "reventó" genérico del registry.
+    except (TimeoutError, urllib.error.URLError, OSError,
+            http.client.HTTPException, ValueError) as error:
+        return False, f"conexion: {error}"

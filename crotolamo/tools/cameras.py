@@ -35,6 +35,11 @@ _MAX_HOURS = 168  # una semana; más que eso ya no es "qué pasó", es arqueolog
 
 _SIN_FILTRO = {"", "todas", "todo", "all"}
 
+# /api/events mete por defecto la miniatura de cada evento en base64
+# (include_thumbnails=1): cientos de kB por consulta que aquí nadie mira, porque
+# solo se usan etiqueta, cámara, horas e id.
+_SIN_MINIATURAS = {"include_thumbnails": 0}
+
 
 def _resolve_camera(camera: str) -> str:
     """Alias amigable -> nombre real de Frigate; sin alias, el nombre va tal cual."""
@@ -53,18 +58,29 @@ def _explica_fallo(error: str) -> str:
             "¿Andan vivas las cámaras?")
 
 
-def _describe(event: dict[str, Any]) -> str:
+def _describe(event: dict[str, Any], hoy: tuple[int, ...]) -> str:
+    """Una línea por evento. `hoy` es (año, mes, día) local de la consulta."""
     label = str(event.get("label", "algo"))
     etiqueta = _LABELS_ES.get(label, label)
     camara = event.get("camera", "?")
     start = event.get("start_time")
     end = event.get("end_time")
-    hora = time.strftime("%H:%M", time.localtime(start)) if start else "??:??"
+    if start:
+        local = time.localtime(start)
+        cuando = time.strftime("a las %H:%M", local)
+        # La ventana llega a una semana (_MAX_HOURS) y con solo la hora el
+        # evento de hoy y el de hace tres días se leían igual. El que no es de
+        # hoy lleva la fecha, en el mismo formato ISO del sello [ahora: ...]
+        # que ve el LLM, para que pueda compararlas.
+        if local[:3] != hoy:
+            cuando = time.strftime("el %Y-%m-%d ", local) + cuando
+    else:
+        cuando = "a las ??:??"
     if start and end:
         duracion = f"{round(end - start)}s"
     else:
         duracion = "sigue en curso"
-    return f"- {etiqueta} en la cámara {camara} a las {hora} ({duracion})"
+    return f"- {etiqueta} en la cámara {camara} {cuando} ({duracion})"
 
 
 @tool
@@ -87,7 +103,11 @@ def camera_events(camera: str, hours: float = 6) -> str:
 
     params: dict[str, Any] = {
         "after": int(time.time() - hours * 3600),
-        "limit": _MAX_EVENTS,
+        # Uno de más que no se lista: Frigate corta en `limit` sin avisar, y es
+        # la única forma de saber si los _MAX_EVENTS son todos o solo los
+        # últimos.
+        "limit": _MAX_EVENTS + 1,
+        **_SIN_MINIATURAS,
     }
     filtra = normalize_key(camera) not in _SIN_FILTRO
     if filtra:
@@ -104,9 +124,16 @@ def camera_events(camera: str, hours: float = 6) -> str:
         return (f"Ni un alma, patrón: cero eventos en {donde} "
                 f"en las últimas {hours:g} horas.")
 
-    lines = [f"Eventos de {donde} en las últimas {hours:g} horas "
-             f"({len(data)} en total):"]
-    lines.extend(_describe(event) for event in data)
+    # Frigate devuelve los más recientes primero: si llegó el de más, la lista
+    # está cortada y decir "50 en total" era contarle al patrón 50 de 300.
+    if len(data) > _MAX_EVENTS:
+        data = data[:_MAX_EVENTS]
+        cuantos = f"los {_MAX_EVENTS} más recientes; hay más"
+    else:
+        cuantos = f"{len(data)} en total"
+    lines = [f"Eventos de {donde} en las últimas {hours:g} horas ({cuantos}):"]
+    hoy = time.localtime()[:3]
+    lines.extend(_describe(event, hoy) for event in data)
     return "\n".join(lines)
 
 
@@ -123,7 +150,8 @@ def camera_snapshot(camera: str) -> str:
     if not real:
         return "Necesito saber de qué cámara, patrón."
 
-    ok, data = _frigate._frigate_get("/api/events", {"camera": real, "limit": 1})
+    ok, data = _frigate._frigate_get(
+        "/api/events", {"camera": real, "limit": 1, **_SIN_MINIATURAS})
     if not ok:
         return _explica_fallo(data)
     # Un dict de error con 200 NO es "sin eventos": distinguirlo evita el

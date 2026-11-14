@@ -13,32 +13,68 @@ import shutil
 import subprocess
 from typing import Any
 
+from crotolamo.logging_setup import get_logger
 from crotolamo.tools.base import normalize_key as _norm
 from crotolamo.tools.base import run_cmd, tool
 
+log = get_logger("windows")
+
 _NO_HYPRCTL = "No tengo hyprctl, patrón. Esto solo funciona dentro de Hyprland."
 _MAX_TITLE = 60
+# Tope del detalle de un fallo de hyprctl que se le dice al patrón (una línea).
+_MAX_DETALLE = 200
 
 
 def _run(args: list[str]) -> subprocess.CompletedProcess:
     return run_cmd(["hyprctl", *args], timeout=5)
 
 
-def _clients() -> list[dict[str, Any]] | None:
-    """Lista de ventanas de `hyprctl clients -j`, o None si hyprctl falta/falla."""
+def _detalle(*salidas: str | None) -> str:
+    """Primera línea con texto de lo que imprimió hyprctl, recortada."""
+    for salida in salidas:
+        for line in (salida or "").splitlines():
+            if line.strip():
+                return _truncate(line.strip(), _MAX_DETALLE)
+    return ""
+
+
+def _clients() -> list[dict[str, Any]] | str | None:
+    """Lista de ventanas de `hyprctl clients -j`.
+
+    None si hyprctl no está instalado. Si está pero falló, la frase para el
+    patrón con el motivo. Antes los dos casos daban None y todo se contaba como
+    "No tengo hyprctl": con el listener arrancado por systemd sin
+    HYPRLAND_INSTANCE_SIGNATURE en el entorno, hyprctl existe y sale con 1, y
+    se le decía al patrón que le faltaba algo que tiene, sin dejar en el log lo
+    que hyprctl había contestado.
+    """
     if not shutil.which("hyprctl"):
         return None
     try:
         result = _run(["clients", "-j"])
-    except (OSError, subprocess.TimeoutExpired):
-        return None
+    except (OSError, subprocess.TimeoutExpired) as error:
+        log.warning("hyprctl clients -j no contestó: %s", error)
+        return "No pude hablar con Hyprland, patrón: hyprctl no me contestó."
     if result.returncode != 0:
-        return None
+        # hyprctl escribe sus quejas en stdout ("HYPRLAND_INSTANCE_SIGNATURE not
+        # set!"); stderr primero por si alguna versión lo usa.
+        detalle = _detalle(result.stderr, result.stdout)
+        log.warning("hyprctl clients -j salió con %s: %s", result.returncode,
+                    detalle or "sin salida")
+        return "hyprctl se quejó, patrón: " + (
+            detalle or f"salió con código {result.returncode} sin dar detalles")
+    texto = (result.stdout or "").strip()
     try:
-        data = json.loads(result.stdout or "[]")
+        data = json.loads(texto or "[]")
     except json.JSONDecodeError:
-        return None
-    return data if isinstance(data, list) else None
+        data = None
+    if not isinstance(data, list):
+        # Salida 0 pero no es la lista de ventanas: hay versiones de hyprctl que
+        # avisan de un error y aun así salen con 0.
+        detalle = _detalle(texto)
+        log.warning("hyprctl clients -j no devolvió la lista de ventanas: %s", detalle)
+        return f"hyprctl me contestó algo que no entiendo, patrón: {detalle}"
+    return data
 
 
 def _dispatch(args: list[str]) -> subprocess.CompletedProcess:
@@ -71,15 +107,32 @@ def _truncate(text: str, limit: int = _MAX_TITLE) -> str:
 
 
 def _match(clients: list[dict[str, Any]], name: str) -> list[dict[str, Any]]:
-    """Ventanas cuyo class o title contiene `name` (sin acentos ni mayúsculas)."""
+    """Ventanas cuyo class o title contiene `name` (sin acentos ni mayúsculas).
+
+    De mejor a peor coincidencia: primero la app que se llama así (class
+    exacto), luego la app cuyo class lo contiene y al final las que solo lo
+    llevan en el título; dentro de cada grupo, el orden de hyprctl. focus_window
+    y close_window actúan sobre la PRIMERA: sin este orden, "cierra opera"
+    cerraba un kitty con `nvim notas_opera.md` si hyprctl lo listaba antes que
+    el navegador.
+    """
     query = _norm(name.strip())
     if not query:
         return []
-    return [
-        c
-        for c in clients
-        if query in _norm(str(c.get("class", ""))) or query in _norm(str(c.get("title", "")))
-    ]
+    ranked: list[tuple[int, dict[str, Any]]] = []
+    for c in clients:
+        clase = _norm(str(c.get("class", "")))
+        if clase == query:
+            rank = 0
+        elif query in clase:
+            rank = 1
+        elif query in _norm(str(c.get("title", ""))):
+            rank = 2
+        else:
+            continue
+        ranked.append((rank, c))
+    # sorted() es estable: empates en el orden en que los dio hyprctl.
+    return [c for _, c in sorted(ranked, key=lambda par: par[0])]
 
 
 def _label(client: dict[str, Any]) -> str:
@@ -95,8 +148,8 @@ def list_windows() -> str:
     Úsala cuando el patrón pregunte qué apps o ventanas tiene abiertas.
     """
     clients = _clients()
-    if clients is None:
-        return _NO_HYPRCTL
+    if not isinstance(clients, list):
+        return clients or _NO_HYPRCTL
     if not clients:
         return "No hay ni una ventana abierta, patrón. Escritorio zen total."
     def _sort_key(c: dict[str, Any]) -> tuple[int, str]:
@@ -118,8 +171,8 @@ def app_status(name: str) -> str:
         name: nombre (o pedazo del nombre) de la app o ventana a buscar.
     """
     clients = _clients()
-    if clients is None:
-        return _NO_HYPRCTL
+    if not isinstance(clients, list):
+        return clients or _NO_HYPRCTL
     matches = _match(clients, name)
     if matches:
         workspaces = sorted({str(_workspace_id(c)) for c in matches})
@@ -149,8 +202,8 @@ def focus_window(name: str) -> str:
         name: nombre (o pedazo del nombre) de la app o ventana a enfocar.
     """
     clients = _clients()
-    if clients is None:
-        return _NO_HYPRCTL
+    if not isinstance(clients, list):
+        return clients or _NO_HYPRCTL
     matches = _match(clients, name)
     if not matches:
         return f"No encontré ninguna ventana que suene a '{name}', patrón."
@@ -185,8 +238,8 @@ def close_window(name: str) -> str:
         name: nombre (o pedazo del nombre) de la app o ventana a cerrar.
     """
     clients = _clients()
-    if clients is None:
-        return _NO_HYPRCTL
+    if not isinstance(clients, list):
+        return clients or _NO_HYPRCTL
     matches = _match(clients, name)
     if not matches:
         return f"No encontré ninguna ventana que suene a '{name}', patrón. Nada que cerrar."

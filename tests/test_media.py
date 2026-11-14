@@ -8,10 +8,18 @@ from crotolamo.tools import media
 
 
 def _fake_playerctl(monkeypatch, metadata="Artista — Cancion\n", status="Playing\n"):
-    """playerctl de mentiras: `metadata` y `status` son sus stdout (con el "\\n"
-    final real que imprime el binario)."""
+    """playerctl de mentiras con UN reproductor: `metadata` y `status` son lo que
+    imprime de él (con el "\\n" final real que imprime el binario)."""
     def fake_run(args):
-        stdout = metadata if args[0] == "metadata" else status
+        if "metadata" in args:
+            # music_now pide nombre, estado y pista en una sola línea
+            # (`-a metadata --format "{{playerName}}\t{{status}}\t..."`).
+            formato = args[args.index("--format") + 1]
+            stdout = (formato.replace("{{playerName}}", "spotify")
+                      .replace("{{status}}", status.strip())
+                      .replace("{{artist}} — {{title}}", metadata))
+        else:
+            stdout = status
         return subprocess.CompletedProcess(
             args=["playerctl", *args], returncode=0, stdout=stdout, stderr=""
         )

@@ -321,13 +321,15 @@ def test_dns_que_no_resuelve_se_niega(monkeypatch):
 
 
 def test_read_page_no_toca_la_red_si_es_interna(monkeypatch):
-    """El bloqueo ocurre ANTES de la petición HTTP."""
+    """El bloqueo ocurre ANTES de la petición HTTP: ni un connect TCP. (Se
+    vigila el socket y no _http_get: quién de los dos, read_page o _http_get,
+    hace la validación es detalle interno; lo que no puede pasar es conectar.)"""
     monkeypatch.setattr(_web.socket, "getaddrinfo", _resolver_fijo("127.0.0.1"))
 
     def no_debe_llamarse(*a, **kw):
-        raise AssertionError("read_page intentó descargar una URL interna")
+        raise AssertionError("read_page intentó conectarse a una URL interna")
 
-    monkeypatch.setattr(_web, "_http_get", no_debe_llamarse)
+    monkeypatch.setattr(_web.socket, "create_connection", no_debe_llamarse)
     out = search.read_page(url="http://localhost:11434/api/tags")
     assert "red interna" in out
 
@@ -392,7 +394,6 @@ def test_redirect_a_red_interna_se_bloquea(redirect_server, monkeypatch):
     """Un 302 hacia una IP interna debe abortar con BlockedRedirectError."""
     _RedirectHandler.redirect_to = "http://169.254.169.254/latest/meta-data/"
     _permite_loopback(monkeypatch)
-    monkeypatch.setattr(_web, "is_public_url", lambda url: "169.254" not in url)
     with pytest.raises(_web.BlockedRedirectError):
         _web._http_get(f"{redirect_server}/a", timeout=5.0)
 
@@ -405,7 +406,6 @@ def test_redirect_a_url_publica_se_sigue(redirect_server, monkeypatch):
     """
     _RedirectHandler.redirect_to = f"{redirect_server}/b"
     _permite_loopback(monkeypatch)
-    monkeypatch.setattr(_web, "is_public_url", lambda url: True)
     content_type, body = _web._http_get(f"{redirect_server}/a", timeout=5.0)
     assert "text/html" in content_type
     assert "llegaste al destino" in body
@@ -413,13 +413,15 @@ def test_redirect_a_url_publica_se_sigue(redirect_server, monkeypatch):
 
 def test_read_page_bloquea_redirect_interno(redirect_server, monkeypatch):
     """De punta a punta: read_page responde el mensaje de red interna."""
-    _RedirectHandler.redirect_to = "http://127.0.0.1:11434/api/tags"
+    # Otro loopback (127.0.0.2), no el del servidor de mentiras: _permite_loopback
+    # solo deja pasar 127.0.0.1, así que este salto lo juzga el guardia REAL.
+    _RedirectHandler.redirect_to = "http://127.0.0.2:11434/api/tags"
     # La URL ORIGINAL pasa el guardia (fingimos que resuelve a una IP pública);
     # el redirect a loopback es lo que debe morir.
     url_original = f"{redirect_server}/a"
     _permite_loopback(monkeypatch)
-    # Solo la URL original pasa el guardia; el destino del redirect (mismo
-    # loopback, otro puerto) debe morir en el gate por URL de _http_get.
+    # Solo la URL original pasa el pre-check de read_page; el destino del
+    # redirect debe morir en la validación por salto de _http_get.
     monkeypatch.setattr(_web, "is_public_url", lambda url: url == url_original)
     out = search.read_page(url_original)
     assert "red interna" in out
@@ -431,20 +433,31 @@ def test_read_page_bloquea_redirect_interno(redirect_server, monkeypatch):
 # TODAS sus IPs, y conectar a esa misma IP (pinning); nunca re-resolver.
 
 def test_dns_rebinding_se_bloquea(monkeypatch):
-    """getaddrinfo cambia de pública a privada entre llamadas: como el pin sale
-    de la MISMA resolución que se valida, la privada nunca recibe conexión."""
+    """getaddrinfo cambiaría de pública a privada entre llamadas: como el pin
+    sale de la MISMA (y única) resolución que se valida, no hay segunda
+    consulta que envenenar y la privada nunca recibe conexión."""
     publica = [(2, 1, 6, "", ("93.184.216.34", 0))]
     privada = [(2, 1, 6, "", ("127.0.0.1", 0))]
     respuestas = iter([publica, privada, privada])
-    monkeypatch.setattr(_web.socket, "getaddrinfo",
-                        lambda *a, **kw: next(respuestas))
+    consultas: list[tuple] = []
 
-    def no_conectar(*a, **kw):
-        raise AssertionError("se intentó conectar pese al rebinding")
+    def dns_que_rebindea(*a, **kw):
+        consultas.append(a)
+        return next(respuestas)
 
-    monkeypatch.setattr(_web.socket, "create_connection", no_conectar)
-    with pytest.raises(_web.BlockedRedirectError):
+    monkeypatch.setattr(_web.socket, "getaddrinfo", dns_que_rebindea)
+    conexiones: list[tuple] = []
+
+    def captura(addr, timeout=None, **kw):
+        conexiones.append(addr)
+        raise OSError("cortamos aquí: solo interesa la IP destino")
+
+    monkeypatch.setattr(_web.socket, "create_connection", captura)
+    with pytest.raises(OSError):
         _web._http_get("http://rebind.evil/", timeout=2.0)
+    # El único connect va a la IP que pasó la validación; 127.0.0.1, jamás.
+    assert conexiones == [("93.184.216.34", 80)]
+    assert len(consultas) == 1
 
 
 def test_http_get_conecta_a_la_ip_validada(monkeypatch):

@@ -56,7 +56,22 @@ def _build_opener() -> urllib.request.OpenerDirector:
     return urllib.request.build_opener(_NoRedirectHandler, urllib.request.ProxyHandler({}))
 
 
-_OPENER = _build_opener()
+_OPENER: urllib.request.OpenerDirector | None = None
+
+
+def _opener() -> urllib.request.OpenerDirector:
+    """El opener del módulo, construido en el PRIMER uso y no al importar.
+
+    En Python 3.12+ HTTPSHandler crea su SSLContext (y carga el bundle de CAs
+    del sistema, ~20 ms) en el constructor: como constante de módulo se pagaba
+    en cada arranque del shell/listener/doctor aunque nunca se tocara una luz
+    y la base_url sea http://. Vive en el global `_OPENER` para que sustituirlo
+    desde fuera (tests) siga mandando.
+    """
+    global _OPENER
+    if _OPENER is None:
+        _OPENER = _build_opener()
+    return _OPENER
 
 
 def _find_token() -> str | None:
@@ -87,7 +102,7 @@ def _http_json(
     if data is not None:
         all_headers["Content-Type"] = "application/json"
     request = urllib.request.Request(url, data=data, method=method, headers=all_headers)
-    with _OPENER.open(request, timeout=timeout) as response:  # noqa: S310
+    with _opener().open(request, timeout=timeout) as response:  # noqa: S310
         raw = response.read(_MAX_BODY)
     return json.loads(raw) if raw.strip() else {}
 

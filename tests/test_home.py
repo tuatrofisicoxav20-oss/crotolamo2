@@ -74,7 +74,15 @@ def test_light_off_y_toggle_usan_el_servicio_correcto(home_cfg, monkeypatch):
 def test_light_entidad_que_ha_no_reconoce(home_cfg, monkeypatch):
     """HA responde 200 con [] si el entity_id no existe (typo en la config):
     NO hay que cantar victoria con 'prendí la luz'."""
-    _patch_http(monkeypatch, [])
+    # [] a secas no basta (es también lo que HA devuelve si la luz ya estaba
+    # prendida): lo que delata al entity_id inexistente es el 404 al preguntar
+    # por la entidad.
+    def fake(method, url, headers, payload=None, timeout=5.0):
+        if method == "GET":
+            raise urllib.error.HTTPError(url, 404, "Not Found", None, None)
+        return []
+
+    monkeypatch.setattr(_hass, "_http_json", fake)
     out = home.light_control("xbox", "on")
     assert "prendí" not in out
     assert "entity_id" in out
@@ -304,7 +312,8 @@ def test_hass_opener_sin_proxy(monkeypatch):
     # Sanidad del test: un opener "normal" bajo este entorno SÍ llevaría el proxy.
     ingenuo = urllib.request.build_opener(_hass._NoRedirectHandler)
     assert _proxy_handlers_con_proxies(ingenuo)
-    for opener in (_hass._OPENER, _hass._build_opener()):
+    # _opener(): el del módulo se construye en el primer uso, no al importar.
+    for opener in (_hass._opener(), _hass._build_opener()):
         assert _proxy_handlers_con_proxies(opener) == []
 
 

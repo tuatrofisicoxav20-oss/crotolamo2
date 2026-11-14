@@ -209,7 +209,8 @@ def test_frigate_opener_sin_proxy(monkeypatch):
 
     # Sanidad del test: un opener "normal" bajo este entorno SÍ llevaría el proxy.
     assert con_proxies(urllib.request.build_opener())
-    for opener in (_frigate._OPENER, _frigate._build_opener()):
+    # _opener(): el del módulo se construye en el primer uso, no al importar.
+    for opener in (_frigate._opener(), _frigate._build_opener()):
         assert con_proxies(opener) == []
 
 

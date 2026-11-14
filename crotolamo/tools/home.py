@@ -91,12 +91,26 @@ def light_control(target: str, action: str) -> str:
     )
     if not ok:
         return _explica_fallo(data)
-    # HA responde 200 con la lista de estados que CAMBIARON. Con un entity_id
-    # inexistente (typo en la config) responde 200 con []: NO hay que cantar
-    # victoria por un "prendí" que no ocurrió.
+    # HA responde 200 con la lista de estados que CAMBIARON mientras corría la
+    # llamada. Con un entity_id inexistente (typo en la config) responde 200
+    # con []: NO hay que cantar victoria por un "prendí" que no ocurrió. Pero
+    # [] llega también al prender una luz que ya estaba prendida y con las
+    # integraciones que publican el estado después (MQTT/Zigbee2MQTT, ESPHome),
+    # así que [] a secas no distingue nada: se pregunta por la entidad.
     if data == []:
-        return (f"Home Assistant no reconoció la luz '{target}', patrón. "
-                f"Revisa el entity_id '{entity_id}' en [home.lights] de la config.")
+        ok, estado = _hass._hass_call("GET", f"/api/states/{quote(entity_id, safe='')}")
+        if not ok and estado == "no_encontrado":
+            return (f"Home Assistant no reconoció la luz '{target}', patrón. "
+                    f"Revisa el entity_id '{entity_id}' en [home.lights] de la config.")
+        # HA se salta en silencio las entidades `unavailable` (foco sin
+        # corriente, dispositivo caído): ahí [] sí es "no pasó nada".
+        no_disponible = (ok and isinstance(estado, dict)
+                         and str(estado.get("state", "")).lower() == "unavailable")
+        if no_disponible:
+            return (f"La luz '{target}' no me hizo caso, patrón: Home Assistant la "
+                    "tiene como no disponible. ¿Tiene corriente el cacharro?")
+        # Cualquier otro fallo de esta comprobación no desmiente el 200 con el
+        # que HA aceptó la orden.
     accion = normalize_key(action)
     return f"Listo, patrón: {_HECHO[accion]} la luz '{target}'."
 

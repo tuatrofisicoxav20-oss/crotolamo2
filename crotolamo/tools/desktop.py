@@ -11,6 +11,7 @@ import random
 import re
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 
 from crotolamo.logging_setup import get_logger
@@ -21,6 +22,8 @@ log = get_logger("desktop")
 HOME = Path.home()
 
 # Carpetas estándar XDG, derivadas del home actual (no hardcodeado a un usuario).
+# Son los defaults y el catálogo de nombres: la ruta de cada una la puede pisar
+# [paths] de la config (ver _folders).
 FOLDERS: dict[str, Path] = {
     "documentos": HOME / "Documentos",
     "descargas": HOME / "Descargas",
@@ -76,6 +79,11 @@ def funny_line() -> str:
     return random.choice(_FUNNY_OPEN)
 
 
+# El esquema de una URL no distingue mayúsculas (RFC 3986 §3.1): "HTTPS://x.com"
+# ya es una URL, no un dominio al que anteponerle otro https://.
+_HTTP_SCHEME = re.compile(r"https?://", re.IGNORECASE)
+
+
 def resolve_target(target: str) -> tuple[str, dict]:
     """Clasifica un destino genérico en (tipo, payload): url/app/folder/search.
 
@@ -83,27 +91,77 @@ def resolve_target(target: str) -> tuple[str, dict]:
     cualquier otro consumidor: aquí viven APP_COMMANDS/COMMON_SITES/FOLDERS,
     así que la clasificación se decide aquí y no leyendo los dicts desde fuera.
     """
+    # strip ANTES de clasificar (como hacía C1): con un espacio delante la URL
+    # no pasaba el startswith y se guardaba como búsqueda de sí misma.
+    target = target.strip()
     key = normalize_key(target)
     if key in COMMON_SITES:
         return "url", {"value": COMMON_SITES[key]}
     # "terminal" no vive en APP_COMMANDS (lo resuelve _detect_terminal en
-    # open_app), pero sigue siendo una app válida como destino de atajo.
-    if key in APP_COMMANDS or key == "terminal":
+    # open_app), pero sigue siendo una app válida como destino de atajo. Igual
+    # las de [apps]: open_app y el fastpath las abren, así que un atajo a una
+    # de ellas es una app y no una búsqueda en Google de su nombre.
+    if key in APP_COMMANDS or key == "terminal" or key in _config_apps():
         return "app", {"value": key}
     if key in FOLDERS:
         return "folder", {"value": key}
-    if target.startswith(("http://", "https://")):
-        return "url", {"value": target.strip()}
-    return "search", {"engine": "google", "query": target.strip()}
+    if _HTTP_SCHEME.match(target):
+        return "url", {"value": target}
+    return "search", {"engine": "google", "query": target}
+
+
+# `systemd-run --scope` registra un scope propio en el systemd del usuario y
+# hace exec del comando dentro de él: mismo entorno y mismo PID, otro cgroup.
+_SCOPE_CMD = ["systemd-run", "--user", "--scope", "--collect", "--quiet", "--"]
+_CGROUP = Path("/proc/self/cgroup")
+# Lo que decidió _scope_prefix(); None = aún sin decidir (una vez por proceso).
+_scope_cache: list[str] | None = None
+
+
+def _scope_prefix() -> list[str]:
+    """Prefijo que saca del cgroup del servicio a lo que lanza run_detached.
+
+    start_new_session cambia la sesión, NO el cgroup: corriendo como
+    crotolamo.service, Blender, VS Code o el terminal abiertos por voz quedan
+    dentro de la unidad y systemd (KillMode=control-group, el default) los mata
+    al parar o reiniciar el servicio, con lo que tengan sin guardar. Fuera de
+    una unidad .service no hay nada que arreglar y devuelve [].
+
+    Solo se usa si una sonda (`... -- true`) demuestra que aquí funciona: un
+    systemd-run que no alcanza al systemd del usuario sale con error ANTES de
+    lanzar nada y Popen no se entera (el mismo problema que `flatpak run`).
+    """
+    global _scope_cache
+    if _scope_cache is None:
+        prefix: list[str] = []
+        try:
+            lines = _CGROUP.read_text(encoding="utf-8", errors="replace").splitlines()
+            if any(line.endswith(".service") for line in lines) and shutil.which(_SCOPE_CMD[0]):
+                if run_cmd([*_SCOPE_CMD, "true"], timeout=3).returncode == 0:
+                    prefix = _SCOPE_CMD
+        except (OSError, subprocess.SubprocessError) as error:
+            log.debug("sin scope de systemd, lanzo como siempre: %s", error)
+        _scope_cache = prefix
+    return _scope_cache
 
 
 def run_detached(args: list[str]) -> None:
-    subprocess.Popen(
-        args,
+    prefix = _scope_prefix()
+    # Con el binario ausente no se envuelve: Popen debe fallar con el OSError
+    # de siempre (open_app lo usa para decir "No pude abrir"). Envuelto,
+    # systemd-run arrancaría bien y el fallo del exec se perdería en DEVNULL.
+    if prefix and not shutil.which(args[0]):
+        prefix = []
+    proc = subprocess.Popen(
+        [*prefix, *args],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
+    # Nadie más espera a este hijo: sin wait() queda <defunct> al terminar
+    # (xdg-open sale enseguida) hasta que OTRO subprocess dispara la limpieza
+    # interna de subprocess, y Popen.__del__ avisa con ResourceWarning.
+    threading.Thread(target=proc.wait, name="crotolamo-reap", daemon=True).start()
 
 
 # M3: el patrón usa Hyprland (Wayland), no GNOME. Detectamos el terminal instalado
@@ -119,24 +177,31 @@ def _detect_terminal() -> list[str] | None:
 
 
 def terminal_exec(command: str) -> list[str] | None:
-    """Argv para correr `bash -lc command` en el terminal detectado.
+    """Argv para correr `bash -lc command` en el terminal del patrón.
 
     La sintaxis para ejecutar un comando varía entre terminales (--, -e, start --);
-    aquí se normaliza. Devuelve None si no hay terminal instalado.
+    aquí se normaliza. Devuelve None si no hay terminal cableado ni instalado.
     """
-    term = _detect_terminal()
-    if term is None:
+    # Misma precedencia que open_app: [apps].terminal > terminal detectado. Sin
+    # esto, "Cablea uno en [apps]" (lo que contestan open_app y launch_project)
+    # arreglaba "abre terminal" pero launch_project seguía sin terminal.
+    term = _config_apps().get("terminal") or _detect_terminal()
+    if not term:
         return None
-    name = term[0]
+    # La sintaxis sale del nombre del binario: lo cableado puede traer ruta y
+    # argumentos propios (["/usr/bin/foot", "--app-id=x"]), que se conservan.
+    name = Path(term[0]).name
     inner = ["bash", "-lc", command]
-    if name == "gnome-terminal":
-        return [name, "--", *inner]
+    if name in ("gnome-terminal", "ptyxis"):
+        return [*term, "--", *inner]
     if name == "wezterm":
-        return [name, "start", "--", *inner]
-    if name in ("alacritty", "konsole", "xterm"):
-        return [name, "-e", *inner]
-    # kitty, foot: ejecutan los args directamente.
-    return [name, *inner]
+        return [*term, "start", "--", *inner]
+    if name in ("kitty", "foot"):
+        # kitty, foot: ejecutan los args directamente.
+        return [*term, *inner]
+    # alacritty, konsole, xterm... y cualquier otro cableado en [apps]: -e es
+    # la convención de xterm, la que más terminales respetan.
+    return [*term, "-e", *inner]
 
 
 def _config_apps() -> dict[str, list[str]]:
@@ -161,6 +226,32 @@ def _config_apps() -> dict[str, list[str]]:
     return apps
 
 
+def _folders() -> dict[str, Path]:
+    """FOLDERS con las rutas de [paths] de la config superpuestas.
+
+    El toml documenta [paths].documentos y [paths].descargas, pero FOLDERS se
+    arma solo con el home: quien apuntaba documentos a ~/Documents veía a
+    search_files buscar ahí y a open_folder decir que la carpeta no existía.
+    Solo se pisan nombres que YA están en FOLDERS: [paths] también trae rutas
+    que no son carpetas para abrir (db, voces) y el catálogo no debe cambiar.
+    """
+    try:
+        from crotolamo.settings import get_settings
+
+        paths = get_settings().paths
+    except Exception as error:  # noqa: BLE001 — sin config, valen los defaults
+        log.debug("no pude leer [paths] de la config: %s", error)
+        return FOLDERS
+    folders = dict(FOLDERS)
+    for name, path in paths.items():
+        key = normalize_key(name)
+        # Una ruta relativa (o "" = ".") se resolvería contra el CWD del
+        # proceso: "abre descargas" abriría la carpeta desde donde se lanzó.
+        if key in folders and path.is_absolute():
+            folders[key] = path
+    return folders
+
+
 def _opera_gx_flatpak_available() -> bool:
     """True solo si hay `flatpak` Y Opera GX está instalada como flatpak.
 
@@ -179,6 +270,34 @@ def _opera_gx_flatpak_available() -> bool:
     return result.returncode == 0
 
 
+def _flatpak_app_missing(args: list[str]) -> bool:
+    """True si `args` es `flatpak run <id>` y flatpak no tiene instalado ese id.
+
+    El mismo problema que resuelve _opera_gx_flatpak_available para las URLs:
+    con una app ausente `flatpak run` arranca y sale con 1 a espaldas de Popen,
+    y open_app contestaba "Abrí" sin abrir nada (el [apps] de fábrica trae
+    opera y spotify como flatpaks).
+
+    Solo se da por ausente lo que es seguro: un id pelón, justo tras `run`,
+    que flatpak NO lista en ninguna instalación. Con opciones delante, un ref
+    con rama (`id//rama`) o sin poder preguntar (timeout, permisos, un flatpak
+    que no entiende --columns) se lanza como siempre: dar por ausente una app
+    que sí está sería peor que el fallo que esto arregla.
+    """
+    if len(args) < 3 or Path(args[0]).name != "flatpak" or args[1] != "run":
+        return False
+    app_id = args[2]
+    if app_id.startswith("-") or "/" in app_id:
+        return False
+    try:
+        # --all: que no se quede fuera ni lo que `list` esconde por defecto.
+        result = run_cmd([args[0], "list", "--all", "--columns=application"], timeout=3)
+    except (OSError, subprocess.SubprocessError) as error:
+        log.debug("no pude consultar flatpak list: %s", error)
+        return False
+    return result.returncode == 0 and app_id not in result.stdout.split()
+
+
 def _open_local_browser(url: str) -> str:
     if _opera_gx_flatpak_available():
         try:
@@ -186,7 +305,12 @@ def _open_local_browser(url: str) -> str:
             return f"{funny_line()}\nAbrí esta pestaña, patrón: {url}"
         except (OSError, subprocess.SubprocessError) as error:
             log.debug("flatpak/opera falló, caigo a xdg-open: %s", error)
-    run_detached(["xdg-open", url])
+    # Sin xdg-utils (o sin poder crear el proceso) Popen lanza OSError: sin
+    # atraparlo, la tool "reventaba" con el mensaje genérico del registry.
+    try:
+        run_detached(["xdg-open", url])
+    except (OSError, subprocess.SubprocessError) as error:
+        return f"No pude abrir {url}, patrón: {error}"
     return f"{funny_line()}\nAbrí esta URL con el navegador por defecto, patrón: {url}"
 
 
@@ -201,13 +325,18 @@ def open_url(url: str) -> str:
     if not url:
         return "No recibí una URL, patrón."
 
-    if not re.match(r"^https?://", url):
-        if "." in url and " " not in url:
-            url = "https://" + url
-        else:
-            from urllib.parse import quote_plus
+    scheme = _HTTP_SCHEME.match(url)
+    if scheme:
+        # Solo el esquema pasa a minúsculas (su forma canónica): así lo que
+        # recibe el lanzador no depende de que sepa leer "HTTPS://". La ruta y
+        # la query sí distinguen mayúsculas y no se tocan.
+        url = scheme.group().lower() + url[scheme.end():]
+    elif "." in url and " " not in url:
+        url = "https://" + url
+    else:
+        from urllib.parse import quote_plus
 
-            url = f"https://www.google.com/search?q={quote_plus(url)}"
+        url = f"https://www.google.com/search?q={quote_plus(url)}"
 
     return _open_local_browser(url)
 
@@ -237,6 +366,11 @@ def open_app(name: str) -> str:
         return f"No tengo registrada la app '{name}', patrón. Conozco: {disponibles}."
 
     for args in candidates:
+        # Un `flatpak run` de una app sin instalar no hace fallar a Popen: se
+        # pregunta antes, para no contestar "Abrí" por algo que no se abrió.
+        if _flatpak_app_missing(args):
+            log.debug("flatpak no tiene instalada %s: no la lanzo", args[2])
+            continue
         try:
             run_detached(args)
             return f"{funny_line()}\nAbrí {name}, patrón."
@@ -258,14 +392,18 @@ def open_folder(name: str) -> str:
         disponibles = ", ".join(sorted(FOLDERS))
         return f"No tengo registrada la carpeta '{name}', patrón. Conozco: {disponibles}."
 
-    folder = FOLDERS[key]
+    folder = _folders()[key]
     if key == "escritorio" and not folder.exists():
         folder = HOME / "Desktop"
 
     if not folder.exists():
         return f"No encontré la carpeta {folder}, patrón."
 
-    run_detached(["xdg-open", str(folder)])
+    # Mismo trato que en _open_local_browser: sin xdg-open, en personaje.
+    try:
+        run_detached(["xdg-open", str(folder)])
+    except (OSError, subprocess.SubprocessError) as error:
+        return f"No pude abrir {folder}, patrón: {error}"
     return f"{funny_line()}\nAbrí {folder}, patrón."
 
 
