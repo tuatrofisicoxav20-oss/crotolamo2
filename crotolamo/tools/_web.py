@@ -22,6 +22,7 @@ import time
 import urllib.error
 import urllib.request
 import zlib
+from collections.abc import Sequence
 from html.parser import HTMLParser
 from urllib.parse import parse_qs, quote, urljoin, urlparse, urlsplit
 
@@ -59,14 +60,20 @@ def _ip_is_public(ip_str: str) -> bool:
         or getattr(ip, "is_site_local", False))
 
 
-def _resolve_public_ip(host: str) -> str | None:
-    """UNA resolución DNS: si TODAS las IPs del host son públicas, devuelve la
-    primera (la IP a la que se conectará: pinning); si alguna es interna, None.
+def _resolve_public_ips(host: str) -> list[str] | None:
+    """UNA resolución DNS: si TODAS las IPs del host son públicas, las devuelve
+    en el orden del resolver (las únicas IPs a las que se conectará: pinning);
+    si alguna es interna, None.
 
     Resolver y conectar en pasos separados abría un TOCTOU: un DNS malicioso
     con TTL 0 responde una IP pública en la validación y 127.0.0.1 al conectar
-    (rebinding). Devolver la IP validada y conectar EXACTAMENTE a ella cierra
-    esa ventana. Ante la duda, None: negar es lo seguro.
+    (rebinding). Devolver las IPs validadas y conectar EXACTAMENTE a ellas
+    cierra esa ventana. Ante la duda, None: negar es lo seguro.
+
+    Todas y no solo la primera: en un host de doble pila o con varias A la
+    primera puede no contestar (IPv6 roto en la red del portátil, un nodo
+    caído) y la siguiente, ya validada, sí. Con solo la primera read_page
+    fallaba donde urllib, curl o un navegador pasan a la siguiente.
 
     Si el DNS NO resuelve lanza URLError en vez de devolver None: sin wifi o
     con el dominio mal escrito no hay "red interna" que bloquear, hay un fallo
@@ -77,12 +84,14 @@ def _resolve_public_ip(host: str) -> str | None:
         infos = socket.getaddrinfo(host, None)
     except (socket.gaierror, UnicodeError, ValueError) as error:
         raise urllib.error.URLError(f"no pude resolver {host!r}: {error}") from error
-    ips = [str(info[4][0]) for info in infos]
+    # Sin repetidas: getaddrinfo da cada IP una vez por tipo de socket (stream,
+    # datagrama, raw) y reintentar la misma IP muerta solo gasta plazo.
+    ips = list(dict.fromkeys(str(info[4][0]) for info in infos))
     if not ips:
         raise urllib.error.URLError(f"no pude resolver {host!r}: sin direcciones")
     if not all(_ip_is_public(ip) for ip in ips):
         return None
-    return ips[0]
+    return ips
 
 
 def is_public_url(url: str) -> bool:
@@ -102,7 +111,7 @@ def is_public_url(url: str) -> bool:
     if not host:
         return False
     try:
-        return _resolve_public_ip(host) is not None
+        return _resolve_public_ips(host) is not None
     except urllib.error.URLError:  # no resuelve: ante la duda, negar
         return False
 
@@ -111,22 +120,52 @@ class BlockedRedirectError(urllib.error.URLError):
     """La URL (original o de un redirect) apunta a la red interna: SSRF bloqueado."""
 
 
+def _connect_pinned(ips: Sequence[str], port: int, timeout: float | None,
+                    deadline: float | None) -> socket.socket:
+    """TCP a la primera de `ips` que conteste, en orden: lo que hace
+    socket.create_connection con las respuestas del DNS, pero solo a IPs ya
+    validadas y sin volver a resolver (pinning). Si ninguna conecta, relanza
+    el error de la última.
+
+    Con `deadline` (time.monotonic) cada intento tiene lo que QUEDA del plazo
+    (no un número calculado antes del DNS) repartido entre las IPs que faltan:
+    una IP en agujero negro (el SYN se pierde) ya no se come el plazo entero
+    de la siguiente, y una que rechaza (RST) no cuesta nada. Sin `deadline`,
+    `timeout` por intento, como create_connection.
+    """
+    last_error: OSError = TimeoutError("timed out")
+    for index, ip in enumerate(ips):
+        budget = timeout
+        if deadline is not None:
+            budget = (deadline - time.monotonic()) / (len(ips) - index)
+            if budget <= 0:
+                raise TimeoutError("timed out")
+        try:
+            return socket.create_connection((ip, port), timeout=budget)
+        except OSError as error:
+            last_error = error
+    raise last_error
+
+
 class _PinnedHTTPConnection(http.client.HTTPConnection):
     """HTTPConnection que conecta a una IP ya validada (pinning anti-rebinding).
 
     El header Host sale de `host` (el hostname original), pero el TCP va a
-    `pinned_ip`: así el servidor virtual correcto responde y el resolver ya no
-    pinta nada entre la validación y la conexión.
+    `pinned_ip` (o, si no contesta, a las `fallback_ips` de la misma
+    resolución validada): así el servidor virtual correcto responde y el
+    resolver ya no pinta nada entre la validación y la conexión. Con
+    `deadline` conectar va bajo ese plazo (ver _connect_pinned).
     """
 
     def __init__(self, host: str, pinned_ip: str, port: int | None,
-                 timeout: float) -> None:
+                 timeout: float, *, fallback_ips: Sequence[str] = (),
+                 deadline: float | None = None) -> None:
         super().__init__(host, port, timeout=timeout)
-        self._pinned_ip = pinned_ip
+        self._pinned_ips = (pinned_ip, *fallback_ips)
+        self._deadline = deadline
 
     def connect(self) -> None:
-        self.sock = socket.create_connection(
-            (self._pinned_ip, self.port), timeout=self.timeout)
+        self.sock = _connect_pinned(self._pinned_ips, self.port, self.timeout, self._deadline)
 
 
 _SSL_CONTEXT: ssl.SSLContext | None = None
@@ -151,15 +190,25 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
     certificado usan el hostname original (server_hostname), no la IP."""
 
     def __init__(self, host: str, pinned_ip: str, port: int | None,
-                 timeout: float) -> None:
+                 timeout: float, *, fallback_ips: Sequence[str] = (),
+                 deadline: float | None = None) -> None:
         context = _ssl_context()
         super().__init__(host, port, timeout=timeout, context=context)
-        self._pinned_ip = pinned_ip
+        self._pinned_ips = (pinned_ip, *fallback_ips)
+        self._deadline = deadline
         self._ssl_context = context
 
     def connect(self) -> None:
-        raw = socket.create_connection(
-            (self._pinned_ip, self.port), timeout=self.timeout)
+        raw = _connect_pinned(self._pinned_ips, self.port, self.timeout, self._deadline)
+        if self._deadline is not None:
+            # wrap_socket hereda el timeout del socket y CPython lo aplica al
+            # handshake ENTERO: con el que dejó el connect (lo que quedaba
+            # ANTES de conectar) el handshake estrenaba un plazo casi completo.
+            remaining = self._deadline - time.monotonic()
+            if remaining <= 0:
+                raw.close()
+                raise TimeoutError("timed out")
+            raw.settimeout(remaining)
         self.sock = self._ssl_context.wrap_socket(raw, server_hostname=self.host)
 
 
@@ -222,8 +271,10 @@ def _pinned_connection(
 ) -> tuple[http.client.HTTPConnection, str]:
     """Valida la URL (resolución pinneada) y devuelve (conexión, path).
 
-    Con `deadline` (time.monotonic) la respuesta se lee entera bajo ese plazo
-    (ver _DeadlineIO); `timeout` acota conectar y el handshake TLS.
+    Con `deadline` (time.monotonic) todo va bajo ese plazo: lo que se llevó el
+    DNS, conectar (ver _connect_pinned), el handshake TLS y la respuesta entera
+    (ver _DeadlineIO). Sin él, `timeout` acota cada intento de conexión y el
+    handshake TLS.
     """
     # urlsplit y no urlparse: urlparse le corta el ";params" al último segmento
     # y aquí solo se re-unían path y query ("/doc;jsessionid=X" se pedía como
@@ -232,15 +283,18 @@ def _pinned_connection(
     host = parts.hostname
     if parts.scheme not in ("http", "https") or not host:
         raise urllib.error.URLError(f"URL rara para un GET: {url!r}")
-    # UNA resolución hace de gate y de pin: la conexión va a la MISMA IP que
-    # acaba de validarse. Antes había además un is_public_url(url) delante que
+    # UNA resolución hace de gate y de pin: la conexión va a las MISMAS IPs que
+    # acaban de validarse. Antes había además un is_public_url(url) delante que
     # repetía el getaddrinfo por cada salto sin validar nada distinto. Si el
-    # DNS no resuelve, _resolve_public_ip lanza URLError (fallo de conexión,
+    # DNS no resuelve, _resolve_public_ips lanza URLError (fallo de conexión,
     # no bloqueo SSRF).
-    ip = _resolve_public_ip(host)
-    if ip is None:
+    ips = _resolve_public_ips(host)
+    if ips is None:
         raise BlockedRedirectError(
             f"bloqueada una dirección no pública: {url}")
+    if deadline is not None and time.monotonic() >= deadline:
+        # Un DNS lento ya se comió el plazo: conectar ahora sería pasarse de él.
+        raise TimeoutError("timed out")
     cls = _PinnedHTTPSConnection if parts.scheme == "https" else _PinnedHTTPConnection
     # Puerto SIEMPRE explícito: con port=None http.client vuelve a partir el
     # host por el último ":" y a un IPv6 literal ("2606:4700:4700::1111") le
@@ -248,7 +302,7 @@ def _pinned_connection(
     port = parts.port
     if port is None:
         port = 443 if parts.scheme == "https" else 80
-    conn = cls(host, ip, port, timeout)
+    conn = cls(host, ips[0], port, timeout, fallback_ips=ips[1:], deadline=deadline)
     if deadline is not None:
         conn.response_class = functools.partial(  # type: ignore[assignment]
             _DeadlineResponse, deadline=deadline)
@@ -373,12 +427,15 @@ def _http_get(url: str, timeout: float = 10.0) -> tuple[str, str]:
     descarga: body_texto llega vacío. El cuerpo se pide en gzip y se infla
     con el mismo tope de bytes (ver read_body).
 
-    `timeout` es el plazo de la llamada ENTERA: conectar, cabeceras, cada
-    redirect y el cuerpo. Antes cada salto estrenaba el suyo y solo el cuerpo
-    tenía tope total, así que cinco redirects lentos o unas cabeceras que
-    gotean lo multiplicaban. Si se agota antes de que llegue un byte del
-    cuerpo lanza TimeoutError (un OSError); si se agota leyéndolo, devuelve lo
-    que llegó (sirve para leer el principio).
+    `timeout` es el plazo de la llamada ENTERA: DNS, conectar (a cada IP
+    validada, por turno), handshake TLS, cabeceras, cada redirect y el cuerpo.
+    Antes cada salto estrenaba el suyo y solo el cuerpo tenía tope total, así
+    que cinco redirects lentos o unas cabeceras que gotean lo multiplicaban.
+    Si se agota antes de que llegue un byte del cuerpo lanza TimeoutError (un
+    OSError); si se agota leyéndolo, devuelve lo que llegó (sirve para leer el
+    principio). Lo que tarda el DNS cuenta, pero getaddrinfo en sí no se puede
+    cortar desde aquí: un resolver colgado espera lo que dicten los timeouts
+    del sistema (resolv.conf) antes de que se mire el plazo.
     """
     deadline = time.monotonic() + timeout
     current = url

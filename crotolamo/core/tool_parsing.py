@@ -87,21 +87,24 @@ def coerce_text_tool_calls(content: str, known_names: set[str]) -> list[dict[str
     if not content or "{" not in content:
         return []
 
-    # Quitar cercas de código ```json ... ``` si las hay.
+    # Quitar cercas de código ```json ... ``` si las hay. TODAS, y cada una como
+    # un bloque aparte: el modelo que pide dos tools a veces pone cada llamada en
+    # su propia cerca, y quedarse con la primera tiraba la segunda sin avisar.
+    # Juntarlas en un texto no vale: el todo-o-nada de `_json_documents` haría
+    # que un ```bash con llaves al lado tumbara también la llamada buena.
     text = content.strip()
-    fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
-    if fence:
-        text = fence.group(1).strip()
-
-    # Del primer { o [ al último } o ]: un bloque, o varios seguidos.
-    start = min((text.find(c) for c in "{[" if c in text), default=-1)
-    end = max(text.rfind("}"), text.rfind("]"))
-    if start == -1 or end <= start:
-        return []
+    fences = re.findall(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
+    blocks = [fence.strip() for fence in fences] if fences else [text]
 
     candidates: list[Any] = []
-    for doc in _json_documents(text[start:end + 1]):
-        candidates.extend(doc if isinstance(doc, list) else [doc])
+    for block in blocks:
+        # Del primer { o [ al último } o ]: un bloque, o varios seguidos.
+        start = min((block.find(c) for c in "{[" if c in block), default=-1)
+        end = max(block.rfind("}"), block.rfind("]"))
+        if start == -1 or end <= start:
+            continue
+        for doc in _json_documents(block[start:end + 1]):
+            candidates.extend(doc if isinstance(doc, list) else [doc])
 
     calls: list[dict[str, Any]] = []
     for item in candidates:

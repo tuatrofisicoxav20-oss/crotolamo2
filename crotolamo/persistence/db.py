@@ -9,7 +9,7 @@ import sqlite3
 import unicodedata
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS shortcuts (
@@ -114,6 +114,36 @@ def all_shortcuts(db_path: Path | None = None) -> dict[str, dict]:
 # --- hechos (memoria persistente) ---
 def add_fact(texto: str, categoria: str = "general", db_path: Path | None = None) -> int:
     with connect(db_path) as conn:
+        cur = conn.execute(
+            "INSERT INTO facts (texto, categoria) VALUES (?, ?)", (texto, categoria)
+        )
+        return int(cur.lastrowid or 0)
+
+
+def add_fact_unique(
+    texto: str, categoria: str, clave: Callable[[str], str], db_path: Path | None = None
+) -> int:
+    """Guarda el hecho SIN copias y devuelve su id: las filas que dicen lo mismo
+    (misma `clave`) se sustituyen por esta, que queda como la más reciente.
+
+    Sustituir y no devolver el id de la que ya estaba: facts_context ancla los
+    MÁS RECIENTES, y repetir un hecho que ya salió de esa ventana tiene que
+    volver a meterlo (como hacía la copia nueva); si no, Crotolamo diría
+    "Anotado" y el hecho seguiría fuera del prompt. De paso recoge las copias que
+    traiga una libreta de antes (add_fact sigue siendo el INSERT crudo).
+
+    Mirar y escribir van en UNA transacción con el cerrojo de escritura tomado
+    desde el principio: shell y listener escriben el mismo fichero, y con la
+    lectura fuera de ella los dos podían mirar a la vez, no ver el hecho del
+    otro y dejar dos copias. La clave se compara en Python porque casefold no
+    tiene equivalente en SQLite (lower() solo pliega ASCII).
+    """
+    buscada = clave(texto)
+    with connect(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        filas = conn.execute("SELECT id, texto FROM facts").fetchall()
+        repetidas = [(f["id"],) for f in filas if clave(f["texto"]) == buscada]
+        conn.executemany("DELETE FROM facts WHERE id = ?", repetidas)
         cur = conn.execute(
             "INSERT INTO facts (texto, categoria) VALUES (?, ?)", (texto, categoria)
         )

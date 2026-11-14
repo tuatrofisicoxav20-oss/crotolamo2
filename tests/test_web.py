@@ -383,10 +383,10 @@ def redirect_server():
 def _permite_loopback(monkeypatch):
     """Deja que el pinning acepte el servidor local de mentiras (127.0.0.1),
     manteniendo la resolución real para cualquier otro host."""
-    real = _web._resolve_public_ip
+    real = _web._resolve_public_ips
     monkeypatch.setattr(
-        _web, "_resolve_public_ip",
-        lambda host: "127.0.0.1" if host == "127.0.0.1" else real(host),
+        _web, "_resolve_public_ips",
+        lambda host: ["127.0.0.1"] if host == "127.0.0.1" else real(host),
     )
 
 
@@ -487,5 +487,5 @@ def test_resolucion_mixta_publica_y_privada_se_niega(monkeypatch):
         lambda *a, **kw: [(2, 1, 6, "", ("93.184.216.34", 0)),
                           (2, 1, 6, "", ("10.0.0.5", 0))],
     )
-    assert _web._resolve_public_ip("mixto.example") is None
+    assert _web._resolve_public_ips("mixto.example") is None
     assert _web.is_public_url("https://mixto.example/") is False

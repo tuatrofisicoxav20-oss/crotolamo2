@@ -98,15 +98,22 @@ def _read_cached(path: Path, reader) -> Any:
 # --- helpers del env file (modo de voz) ---------------------------------------
 
 def _parse_mode_args(path: Path) -> str:
+    args = "--no-barge-in"
     try:
-        for line in path.read_text().splitlines():
+        # bytes + surrogateescape, como write_mode_args: un comentario en latin-1
+        # (que el escritor conserva) hacía fallar read_text() y el panel mostraba
+        # el modo por defecto mientras el servicio corría en otro
+        text = path.read_bytes().decode("utf-8", "surrogateescape")
+        for line in text.splitlines():
             if _is_mode_line(line):
-                return line.split("=", 1)[1].strip().strip('"').strip("'")
+                # systemd (EnvironmentFile=) aplica la ÚLTIMA asignación: el panel
+                # muestra esa, no la primera de un archivo editado a mano
+                args = line.split("=", 1)[1].strip().strip('"').strip("'")
     except FileNotFoundError:
         pass
     except Exception as exc:  # noqa: BLE001
         log.warning("No se pudo leer %s: %s", path, exc)
-    return "--no-barge-in"
+    return args
 
 
 def read_mode_args() -> str:
@@ -115,13 +122,17 @@ def read_mode_args() -> str:
     return _read_cached(path, lambda: _parse_mode_args(path))
 
 
-def write_mode_args(args: str) -> None:
+def write_mode_args(args: str) -> bool:
     """Guarda el modo en ENV_FILE tocando SOLO la línea CROTOLAMO_LISTEN_ARGS.
 
     El servicio carga el archivo ENTERO (EnvironmentFile=): cualquier otra línea
     (CROTOLAMO_LOG=DEBUG, un comentario) es del usuario y antes se perdía al
     elegir modo. Sin la línea, se añade al final. Si el archivo existe pero no se
     puede leer, no se pisa a ciegas: solo se registra.
+
+    Devuelve si quedó guardado (como write_listening_enabled): reiniciar el
+    servicio para aplicar un modo que no está en disco recarga los modelos de voz
+    y lo deja sordo unos segundos para nada.
     """
     path = ENV_FILE
     try:
@@ -137,8 +148,8 @@ def write_mode_args(args: str) -> None:
         found = False
         for i, line in enumerate(lines):
             if _is_mode_line(line):
-                # systemd se queda con la ÚLTIMA asignación y el panel lee la
-                # PRIMERA: todas llevan el valor nuevo para que digan lo mismo
+                # systemd se queda con la ÚLTIMA asignación (y el panel lee esa):
+                # todas llevan el valor nuevo para que ninguna diga otra cosa
                 lines[i] = new_line + ("\r" if line.endswith("\r") else "")
                 found = True
         if not found:
@@ -147,6 +158,8 @@ def write_mode_args(args: str) -> None:
         _replace_atomically(path, data.encode("utf-8", "surrogateescape"))
     except Exception as exc:  # noqa: BLE001
         log.warning("No se pudo escribir %s: %s", path, exc)
+        return False
+    return True
 
 
 # --- helpers del canal de pausa de escucha (panel <-> loop) -------------------

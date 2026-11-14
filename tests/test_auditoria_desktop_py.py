@@ -547,8 +547,8 @@ def test_write_mode_args_crea_el_archivo_y_su_carpeta(tmp_path, monkeypatch):
 
 
 def test_write_mode_args_clave_repetida_systemd_y_panel_coinciden(tmp_path, monkeypatch):
-    # systemd se queda con la ÚLTIMA asignación y el panel lee la PRIMERA: todas
-    # las líneas del modo llevan el valor elegido; un comentario no es una línea
+    # systemd se queda con la ÚLTIMA asignación (y el panel lee esa): todas las
+    # líneas del modo llevan el valor elegido; un comentario no es una línea
     env = tmp_path / "listener.env"
     env.write_text("CROTOLAMO_LISTEN_ARGS=--simple\n"
                    "# CROTOLAMO_LISTEN_ARGS=--no-barge-in\n"
@@ -571,6 +571,8 @@ def test_write_mode_args_respeta_bytes_que_no_son_utf8(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "ENV_FILE", env)
     config.write_mode_args("--barge-in")
     assert env.read_bytes() == b"# caf\xe9 (latin-1)\nCROTOLAMO_LISTEN_ARGS=--barge-in\n"
+    # el lector decodifica igual que el escritor: no cae al modo por defecto
+    assert config.read_mode_args() == "--barge-in"
 
 
 def test_write_mode_args_es_atomico_y_conserva_permisos(tmp_path, monkeypatch):

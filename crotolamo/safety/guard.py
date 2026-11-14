@@ -46,11 +46,16 @@ _PATH_PREFIXES = ("/", "~/", "./", "../")
 # único corral). Se lee como lo lee un parser de URLs (los navegadores; urllib
 # igual), que ignora los controles C0 y espacios de las puntas y los tabs/saltos
 # de línea de cualquier sitio: para quien lo abre, "fi\tle:///etc/pass\nwd" es
-# /etc/passwd. Con la barra, para no tomar por URI un texto como "file: x".
+# /etc/passwd. La barra tras el esquema NO hace falta: un navegador abre
+# "file:etc/passwd" y "file:\etc\passwd" como /etc/passwd, y urllib abre
+# "file:../x" relativo a su CWD; pedirla dejaba pasar esas formas sin
+# clasificar. Basta que siga algo que no sea un espacio, para no tomar por URI
+# un texto como "file: x".
 _URL_EDGE_JUNK = "".join(map(chr, range(0x21)))
 _URL_INNER_JUNK = ("\t", "\r", "\n")
 _FILE_URI_RE = re.compile(
-    r"[\x00-\x20]*" + r"[\t\r\n]*".join("file:/"), re.ASCII | re.IGNORECASE
+    r"[\x00-\x20]*" + r"[\t\r\n]*".join("file:") + r"(?=[\t\r\n]*\S)",
+    re.ASCII | re.IGNORECASE,
 )
 
 # Tope de anidamiento al recorrer argumentos (M4). Los argumentos de una tool MCP
@@ -75,14 +80,8 @@ _CONTENT_ARG_NAMES = {
 }
 
 
-def _file_uri_path(value: str) -> str | None:
-    """Ruta local de un URI file:// (None si `value` no lo es), con los %xx
-    decodificados."""
-    if not _FILE_URI_RE.match(value):
-        return None
-    uri = value.strip(_URL_EDGE_JUNK)
-    for junk in _URL_INNER_JUNK:
-        uri = uri.replace(junk, "")
+def _uri_path(uri: str) -> str:
+    """La ruta de un URI file: ya limpio, con los %xx decodificados."""
     try:
         path = urlsplit(uri).path
     except ValueError:
@@ -92,6 +91,27 @@ def _file_uri_path(value: str) -> str | None:
     return unquote(path)
 
 
+def _file_uri_paths(value: str) -> list[str]:
+    """Las rutas locales que abre un URI file: ([] si `value` no lo es).
+
+    Dos lecturas, y el guard clasifica las dos: la de un parser WHATWG (los
+    navegadores, Node), que toma "\\" por "/" y lee desde la raíz lo que no
+    lleva barra ("file:etc/passwd" es /etc/passwd), y la de urllib, que abre el
+    resto tal cual, relativo a su CWD si no empieza por "/". Con barra suelen
+    coincidir y queda una sola.
+    """
+    if not _FILE_URI_RE.match(value):
+        return []
+    uri = value.strip(_URL_EDGE_JUNK)
+    for junk in _URL_INNER_JUNK:
+        uri = uri.replace(junk, "")
+    browser = _uri_path("file:" + uri[len("file:"):].replace("\\", "/"))
+    if not browser.startswith("/"):
+        browser = "/" + browser
+    plain = _uri_path(uri)
+    return [browser] if plain == browser else [browser, plain]
+
+
 def _looks_like_path(value: str) -> bool:
     # Se mira recortado: " /etc/passwd" y "/etc/passwd\n" son rutas para un
     # server que haga trim. Un salto de línea ENTRE medias sí es contenido (un
@@ -99,24 +119,24 @@ def _looks_like_path(value: str) -> bool:
     text = value.strip()
     if text.startswith(_PATH_PREFIXES) and "\n" not in text:
         return True
-    # ...salvo en un URI file://: quien lo abre le quita los saltos de línea.
-    return _file_uri_path(value) is not None
+    # ...salvo en un URI file: (quien lo abre le quita los saltos de línea).
+    return _FILE_URI_RE.match(value) is not None
 
 
 def _path_forms(value: str, path_name: bool) -> list[str]:
     """Las rutas locales que `value` puede acabar siendo para quien lo reciba.
 
     El guard las clasifica TODAS y manda la zona más estricta:
-    - Un URI file:// es su ruta. Bajo un nombre de ruta (`path_name`) cuenta
-      además tal cual: una tool nativa no entiende el esquema y lo abriría como
-      ruta relativa.
+    - Un URI file: es su ruta (o sus dos lecturas, ver _file_uri_paths). Bajo
+      un nombre de ruta (`path_name`) cuenta además tal cual: una tool nativa
+      no entiende el esquema y lo abriría como ruta relativa.
     - Un valor con espacios o saltos de línea en las puntas se mira recortado
       (lo que abriría un server que haga trim) y tal cual (las tools nativas no
       recortan).
     """
-    local = _file_uri_path(value)
-    if local is not None:
-        return [local, value] if path_name else [local]
+    local = _file_uri_paths(value)
+    if local:
+        return [*local, value] if path_name else local
     text = value.strip()
     return [text] if text == value else [text, value]
 
@@ -224,12 +244,17 @@ class Guard:
         too_deep: list[str] = []
         # Una ruta relativa se clasifica donde la va a abrir quien la recibe
         # (T10). Un server MCP (strict_args=False) la resuelve contra su
-        # directorio de trabajo, que hereda de este proceso: ahí manda el CWD.
-        # Las tools nativas no pueden depender de él (la misma orden pasaba
-        # libre desde el repo, pedía confirmación desde el home y se bloqueaba
-        # desde /; como servicio, make_dir("x") caía dentro del repo de
-        # Crotolamo): ver más abajo.
+        # directorio de trabajo: el `cwd` de su config si lo tiene (el bridge
+        # lo deja en tool.path_base) y, si no, el que hereda de este proceso,
+        # el CWD. Clasificarla siempre contra el CWD dejaba que un server con
+        # cwd = ~/proyectos/privado leyera ".env" sin preguntar (el CWD del
+        # .service es el repo, zona libre). Las tools nativas no pueden depender
+        # del CWD (la misma orden pasaba libre desde el repo, pedía
+        # confirmación desde el home y se bloqueaba desde /; como servicio,
+        # make_dir("x") caía dentro del repo de Crotolamo): ver más abajo.
         native = getattr(tool, "strict_args", True)
+        server_cwd = None if native else getattr(tool, "path_base", None)
+        server_base = Path(server_cwd) if server_cwd else None
         for arg_name, value, depth in _iter_strings(arguments, "", 0, too_deep):
             name = arg_name.lower()
             # La exención de contenido solo aplica al argumento de PRIMER nivel
@@ -257,6 +282,11 @@ class Guard:
                     if self.relative_base is not None:
                         candidate = self.relative_base / candidate
                         shown = str(candidate)
+                elif server_base is not None and _is_relative(candidate):
+                    # La del server MCP con cwd propio: se clasifica (y se
+                    # nombra) la que él va a abrir.
+                    candidate = server_base / candidate
+                    shown = str(candidate)
                 if self._path_inside_allowed(candidate):
                     continue
                 if self._path_inside_confirm(candidate):

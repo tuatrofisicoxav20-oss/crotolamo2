@@ -201,16 +201,23 @@ def find_in_project(project: str, pattern: str) -> str:
     if not pattern.strip():
         return "Dame algo que buscar, patrón."
 
+    # El modelo pasa código tal cual, y grep lo lee como regex: `list[str]` es
+    # "list" + una de {s,t,r}, que no casa con "list[str]" pero SÍ con "lists"
+    # (en cualquier código real); `arr[` ni siquiera es un regex. Con
+    # metacaracteres se busca PRIMERO tal cual: probando el literal solo cuando
+    # el regex no daba nada, salían las líneas falsas y las de verdad quedaban
+    # escondidas. Lo que se pidió como regex (`^class Tool[A-Z]`) no aparece
+    # tal cual y cae al regex: siguen siendo dos greps como mucho.
+    literal = bool(_REGEX_META.intersection(pattern))
     try:
-        result = _grep(base, pattern)
+        result = _grep(base, pattern, literal=literal)
         lines = result.stdout.strip().splitlines()
-        # El modelo pasa código tal cual, y grep lo lee como regex: `list[str]`
-        # es "lis" + una de {s,t,r} y no casa con "list[str]"; `arr[` ni
-        # siquiera es un regex (grep sale con 2 y sin salida). Si como regex no
-        # salió nada y el patrón lleva metacaracteres, se busca como texto.
-        if not lines and _REGEX_META.intersection(pattern):
-            result = _grep(base, pattern, literal=True)
-            lines = result.stdout.strip().splitlines()
+        if not lines and literal:
+            regex = _grep(base, pattern)
+            # Sin coincidencias, manda el rc/stderr del literal: el del regex
+            # puede ser "Unmatched [" (no era un regex), no un archivo ilegible.
+            if regex_lines := regex.stdout.strip().splitlines():
+                result, lines = regex, regex_lines
     except (OSError, subprocess.TimeoutExpired):
         return "La búsqueda falló o tardó demasiado, patrón."
 

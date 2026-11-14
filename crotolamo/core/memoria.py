@@ -43,6 +43,7 @@ import os
 os.environ["MEM0_TELEMETRY"] = "False"
 
 import atexit  # noqa: E402
+import math  # noqa: E402
 import queue  # noqa: E402
 import re  # noqa: E402
 import threading  # noqa: E402
@@ -51,7 +52,8 @@ from concurrent.futures import Future  # noqa: E402
 from concurrent.futures import TimeoutError as FutureTimeout  # noqa: E402
 from dataclasses import dataclass  # noqa: E402
 from pathlib import Path  # noqa: E402
-from typing import TYPE_CHECKING, Any, Callable, Protocol  # noqa: E402
+from typing import TYPE_CHECKING, Any, Callable, Protocol, TypeVar  # noqa: E402
+from urllib.parse import urlsplit  # noqa: E402
 
 from crotolamo.core.turn import DaemonPool, TurnInfo, wants_turn  # noqa: E402
 from crotolamo.logging_setup import get_logger  # noqa: E402
@@ -195,6 +197,59 @@ def parece_secreto(texto: str) -> bool:
 # Config
 # ---------------------------------------------------------------------------
 
+_N = TypeVar("_N", int, float)
+
+
+def _knob_numero(raw: dict[str, Any], clave: str, default: _N,
+                 tipo: Callable[[Any], _N]) -> _N:
+    """Un número opcional de [memoria]. Uno que no lo es (un typo en el toml: "0,03",
+    "1.5s", "tres", inf) se avisa y se usa el default.
+
+    from_settings corre aunque la memoria esté apagada (get_memoria dentro del try
+    de build_agent, el doctor) y su ValueError dejaba a Crotolamo SIN tools por un
+    knob de un subsistema opcional; lo mismo que shell._memory_knob con [memory].
+    Lo que float()/int() ya entendían ("0.05", 3 para un float) sigue valiendo.
+    """
+    valor = raw.get(clave, default)
+    if not isinstance(valor, bool):  # True no es un número de nada aquí
+        try:
+            numero = tipo(valor)
+        except (TypeError, ValueError, OverflowError):
+            pass
+        else:
+            if math.isfinite(numero):
+                return numero
+    log.warning("[memoria].%s = %r no es un número; lo ignoro (uso %r)", clave, valor, default)
+    return default
+
+
+def _knob_booleano(raw: dict[str, Any], clave: str, default: bool) -> bool:
+    """Un booleano de [memoria]: solo true/false de TOML cuentan. Otra cosa ("false"
+    entre comillas, 0) se avisa y APAGA, como siempre hizo `enabled`: con bool(),
+    `extraer = "false"` era True y cada turno seguía yendo a la nube a extraer."""
+    valor = raw.get(clave, default)
+    if isinstance(valor, bool):
+        return valor
+    log.warning("[memoria].%s = %r no es true/false (sin comillas); lo tomo como false",
+                clave, valor)
+    return False
+
+
+def _knob_usuario(raw: dict[str, Any]) -> str:
+    """El user_id de mem0. mem0 2.1.0 recorta los bordes y RECHAZA uno con espacios
+    dentro en CADA llamada (add, search, get_all): con "el patron" fallaban todas
+    las búsquedas y los recordar. Se avisa y se usa el default."""
+    valor = raw.get("usuario")
+    if not valor:
+        return DEFAULT_USUARIO
+    usuario = str(valor).strip()
+    if not usuario or any(c.isspace() for c in usuario):
+        log.warning("[memoria].usuario = %r no puede llevar espacios; uso %r",
+                    valor, DEFAULT_USUARIO)
+        return DEFAULT_USUARIO
+    return usuario
+
+
 @dataclass
 class MemoriaConfig:
     enabled: bool = False
@@ -211,22 +266,25 @@ class MemoriaConfig:
 
     @classmethod
     def from_settings(cls, settings: Any) -> "MemoriaConfig":
+        """La config de [memoria]. NUNCA lanza: un knob mal escrito se avisa y toma
+        su default (ver _knob_numero), esté la memoria encendida o no."""
         raw = settings if isinstance(settings, dict) else getattr(settings, "memoria", None)
         raw = raw if isinstance(raw, dict) else {}
         ruta = raw.get("ruta") or DEFAULT_RUTA
         return cls(
             # Solo un booleano TOML cuenta: `enabled = "false"` (string) es truthy.
-            enabled=raw.get("enabled") is True,
-            umbral=float(raw.get("umbral", DEFAULT_UMBRAL)),
-            top_k=max(1, int(raw.get("top_k", DEFAULT_TOP_K))),
+            enabled=_knob_booleano(raw, "enabled", False),
+            umbral=_knob_numero(raw, "umbral", DEFAULT_UMBRAL, float),
+            top_k=max(1, _knob_numero(raw, "top_k", DEFAULT_TOP_K, int)),
             ruta=Path(os.path.expandvars(os.path.expanduser(str(ruta)))),
-            usuario=str(raw.get("usuario") or DEFAULT_USUARIO),
+            usuario=_knob_usuario(raw),
             modelo_embeddings=str(raw.get("modelo_embeddings") or DEFAULT_EMBEDDER),
-            dims_embeddings=int(raw.get("dims_embeddings", DEFAULT_EMBEDDER_DIMS)),
+            dims_embeddings=_knob_numero(raw, "dims_embeddings", DEFAULT_EMBEDDER_DIMS, int),
             llm_provider=str(raw.get("llm_provider") or DEFAULT_LLM_PROVIDER).lower(),
             llm_model=str(raw.get("llm_model") or DEFAULT_LLM_MODEL),
-            timeout_busqueda_s=float(raw.get("timeout_busqueda_s", DEFAULT_TIMEOUT_BUSQUEDA_S)),
-            extraer=bool(raw.get("extraer", True)),
+            timeout_busqueda_s=_knob_numero(raw, "timeout_busqueda_s",
+                                            DEFAULT_TIMEOUT_BUSQUEDA_S, float),
+            extraer=_knob_booleano(raw, "extraer", True),
         )
 
 
@@ -324,22 +382,46 @@ def _llm_config(cfg: MemoriaConfig, settings: Any) -> dict[str, Any]:
 
 
 # Variables de entorno de las que el SDK de cada proveedor saca la key cuando la
-# config de mem0 no trae una (mem0/llms/openai.py y groq.py). Ollama no usa key.
-_ENVS_KEY_SDK: dict[str, tuple[str, ...]] = {
-    "openai": ("OPENAI_API_KEY", "OPENROUTER_API_KEY"),
-    "groq": ("GROQ_API_KEY",),
+# config de mem0 no trae una (mem0/llms/openai.py y groq.py), con el host al que
+# ese SDK la manda (None: siempre a su emisor). Ollama no usa key.
+# - OPENAI_API_KEY viaja al `openai_base_url` de la config, que aquí es SIEMPRE el
+#   de [llm.glm] (Z.ai de fábrica): solo cuenta si ese base_url ES OpenAI. Contarla
+#   siempre dejaba encendida la extracción sin key de la nube, y cada turno mandaba
+#   la key de OpenAI del patrón a Z.ai (401), con el doctor en verde.
+# - OPENROUTER_API_KEY: mem0 la mira ANTES que la config y se va a OpenRouter
+#   ignorando api_key y base_url; solo cuenta si la nube ES OpenRouter (con otra,
+#   la extracción iba a OpenRouter con el modelo de esa otra nube).
+# - GROQ_API_KEY: el SDK de Groq siempre va a Groq.
+_ENVS_KEY_SDK: dict[str, tuple[tuple[str, str | None], ...]] = {
+    "openai": (("OPENAI_API_KEY", "api.openai.com"), ("OPENROUTER_API_KEY", "openrouter.ai")),
+    "groq": (("GROQ_API_KEY", None),),
 }
 _KEY_RELLENO = "sin-key"
 
 
+def _host(url: str) -> str:
+    """El host de `url` (minúsculas), o '' si no se puede leer. Por host y no por
+    substring: "https://otro.example/api.openai.com" no es OpenAI."""
+    try:
+        return (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
 def _sin_key(llm: dict[str, Any]) -> bool:
-    """True si el SDK del LLM de extracción se quedaría sin key: ni en la config
-    de mem0 ni en las variables de las que la toma él solo. Ollama no usa key."""
+    """True si el SDK del LLM de extracción se quedaría sin una key de SU destino:
+    ni en la config de mem0 ni en una variable de las que la toma él solo que vaya
+    a quien la emitió (ver _ENVS_KEY_SDK). Ollama no usa key."""
     envs = _ENVS_KEY_SDK.get(llm["provider"])
     if not envs:
         return False
-    return not llm["config"].get("api_key") and not any(
-        os.environ.get(env, "").strip() for env in envs)
+    if llm["config"].get("api_key"):
+        return False
+    # Adónde manda el SDK de OpenAI la key de la env, elegido como lo elige mem0.
+    destino = _host(str(llm["config"].get("openai_base_url")
+                        or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1"))
+    return not any(os.environ.get(env, "").strip() and (host is None or destino == host)
+                   for env, host in envs)
 
 
 def extraccion_sin_key(cfg: MemoriaConfig, settings: Any) -> bool:

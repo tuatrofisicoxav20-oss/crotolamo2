@@ -47,7 +47,11 @@ def read_hud_state(path: Path | None = None) -> dict[str, Any]:
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return {}
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
+        # ValueError: bytes que no son UTF-8 (disco dañado, otra herramienta)
+        # dan UnicodeDecodeError, que NO es OSError. Esto corre en callbacks de
+        # GLib: el HUD perdía su timer y el panel se quedaba con _syncing=True,
+        # sordo a los clics, hasta que el loop reescribiera el archivo.
         log.debug("No se pudo leer %s: %s", path, exc)
         return {}
     return parse_hud_state(raw)

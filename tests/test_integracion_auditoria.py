@@ -698,7 +698,8 @@ _ENVS_KEY_MEMORIA = ("CROTOLAMO_GLM_API_KEY", "ZAI_API_KEY", "ZHIPU_API_KEY",
                      "OPENAI_API_KEY", "OPENROUTER_API_KEY", "GROQ_API_KEY")
 
 
-def _check_memoria_del_doctor(monkeypatch, tmp_path, faltan=(), env=None, **memoria):
+def _check_memoria_del_doctor(monkeypatch, tmp_path, faltan=(), env=None, llm=None,
+                              **memoria):
     from scripts import crotolamo_doctor as doctor
 
     for nombre in _ENVS_KEY_MEMORIA:
@@ -710,6 +711,8 @@ def _check_memoria_del_doctor(monkeypatch, tmp_path, faltan=(), env=None, **memo
     monkeypatch.setattr(doctor, "_import_error",
                         lambda m: f"ModuleNotFoundError: {m}" if m in faltan else None)
     raw = {"memoria": {"enabled": True, "ruta": str(tmp_path / "mem"), **memoria}}
+    if llm is not None:
+        raw["llm"] = llm
     settings = settings_mod.Settings(raw=raw, user="test", home=tmp_path,
                                      paths={"home": tmp_path})
     ctx = doctor._Ctx(settings=settings, doctor={}, backend="glm", today=date(2026, 9, 30))
@@ -737,12 +740,14 @@ def test_doctor_memoria_sin_key_avisa_que_no_extrae(monkeypatch, tmp_path, provi
     assert "CROTOLAMO_GLM_API_KEY" in check.fix
 
 
-@pytest.mark.parametrize("env", [
-    {"CROTOLAMO_GLM_API_KEY": "clave-de-zai"},
-    {"OPENAI_API_KEY": "clave-del-sdk"},  # el SDK la toma solo: el runtime extrae
+@pytest.mark.parametrize("env, llm", [
+    ({"CROTOLAMO_GLM_API_KEY": "clave-de-zai"}, None),
+    # El SDK toma OPENAI_API_KEY solo y la manda al base_url de la nube: con la de
+    # OpenAI el runtime extrae (con la de Z.ai no: ver test_revision_final_u09.py).
+    ({"OPENAI_API_KEY": "clave-del-sdk"}, {"glm": {"base_url": "https://api.openai.com/v1"}}),
 ])
-def test_doctor_memoria_con_key_es_un_ok_liso(monkeypatch, tmp_path, env):
-    check = _check_memoria_del_doctor(monkeypatch, tmp_path, env=env)
+def test_doctor_memoria_con_key_es_un_ok_liso(monkeypatch, tmp_path, env, llm):
+    check = _check_memoria_del_doctor(monkeypatch, tmp_path, env=env, llm=llm)
     assert check.ok and not check.warn and "sin API key" not in check.detail
 
 

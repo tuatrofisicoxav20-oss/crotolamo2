@@ -11,14 +11,28 @@ import json
 from typing import Any, Callable
 
 from crotolamo.core.tool_parsing import arguments_complete, parse_arguments
+from crotolamo.logging_setup import get_logger
+
+log = get_logger("core.sse")
+
+# `finish_reason` de un final NORMAL: el modelo acabó lo que quería decir o
+# pedir. Cualquier otro (`length`, `sensitive`, `model_context_window_exceeded`
+# o uno que aún no conocemos) es un CORTE: lo que llegó puede estar a medias.
+# Tupla y no set: un `finish_reason` basura (un dict) no es hasheable.
+_FIN_NORMAL = ("stop", "tool_calls")
+# Z.ai/BigModel: "network_error" = fallo de inferencia del modelo. No es un
+# final, es el servidor avisando de su propio fallo.
+_FALLO_DE_INFERENCIA = "network_error"
 
 
 class SSEError(Exception):
-    """El servidor mandó un objeto `error` DENTRO del stream, ya con el 200 dado."""
+    """El servidor avisó de un fallo DENTRO del stream, ya con el 200 dado: un
+    objeto `error` o el `finish_reason` de fallo de inferencia (`network_error`)."""
 
 
 class SSETruncated(Exception):
-    """El stream se acabó sin `[DONE]` ni `finish_reason` y sin nada usable."""
+    """El stream se acabó a medias: sin `[DONE]` ni `finish_reason` y sin nada
+    usable, o con un tool_call cuyos argumentos no llegaron enteros."""
 
 
 def _error_text(error: Any) -> str:
@@ -28,6 +42,11 @@ def _error_text(error: Any) -> str:
         code = error.get("code")
         error = f"{message} ({code})" if code else message
     return str(error)[:300]
+
+
+def _args_enteros(acc: dict[int, dict[str, Any]]) -> bool:
+    """¿Llegaron enteros los `arguments` de TODOS los tool_calls reensamblados?"""
+    return all(arguments_complete("".join(slot["args"])) for slot in acc.values())
 
 
 def consume_sse(
@@ -54,7 +73,9 @@ def parse_sse(
     `finish_reason`): con él, el cliente le avisa al transporte que el socket
     se puede reutilizar.
 
-    Lanza `SSEError` si el servidor avisa de un fallo dentro del stream. Si el
+    Lanza `SSEError` si el servidor avisa de un fallo dentro del stream: un
+    objeto `error` o `finish_reason: "network_error"` (el cliente lo trata como
+    transitorio y FallbackLLM puede repetir la llamada en el local). Si el
     stream se acaba sin su cierre, lanza `SSETruncated` cuando no deja nada
     usable: ni texto ni tool_calls, o un tool_call cuyos argumentos no llegaron
     enteros (degradados a {} se ejecutaba con sus defaults). Con algo usable
@@ -62,6 +83,12 @@ def parse_sse(
     del servidor, y tratarlo como error rompería TODAS las respuestas de un
     proveedor que no la mande. El cliente lo avisa en el log. Un corte de red
     a medio chunk no llega aquí: http.client lanza IncompleteRead.
+
+    Un `finish_reason` de corte (ni "stop" ni "tool_calls": `length` con
+    [llm.glm].max_tokens, `sensitive`, el contexto desbordado) SÍ es el fin
+    lógico, pero lo que dejó puede estar a medias: un tool_call sin sus
+    argumentos enteros es `SSETruncated`, igual que sin cierre, y lo demás se
+    devuelve con un aviso en el log (lo vacío lo contesta el agente).
 
     Si on_token trae `checkpoint` (LiveStreamer), se consulta con CADA línea
     leída y lo que lance (TurnCancelled) sale tal cual: un tool-call o un
@@ -80,6 +107,8 @@ def parse_sse(
     # cierran tras ese chunk sin mandar `[DONE]`). Que el HTTP no se queje no
     # basta: un FIN entre dos chunks acaba la iteración por líneas sin error.
     complete = False
+    # El último `finish_reason` que llegó: decide si el fin fue normal o un corte.
+    finish: Any = None
 
     for raw_line in resp:
         if checkpoint is not None:
@@ -111,6 +140,12 @@ def parse_sse(
             continue
         if choices[0].get("finish_reason"):
             complete = True
+            finish = choices[0]["finish_reason"]
+            if finish == _FALLO_DE_INFERENCIA:
+                # Lo que haya llegado es lo que el modelo alcanzó a generar antes
+                # de fallar: aceptarlo como respuesta dejaba el turno en blanco o
+                # a media frase, sin probar el local.
+                raise SSEError(f"error de inferencia del modelo ({finish})")
         delta = choices[0].get("delta", {}) or {}
 
         text = delta.get("content") or ""
@@ -133,11 +168,17 @@ def parse_sse(
     content = "".join(parts)
     # Sin cierre vale lo que llegó si es usable (el cliente avisa del posible
     # truncado), pero jamás un tool_call con los argumentos a medio llegar.
-    if not complete and (
-        not (content.strip() or acc)
-        or not all(arguments_complete("".join(slot["args"])) for slot in acc.values())
-    ):
+    if not complete and (not (content.strip() or acc) or not _args_enteros(acc)):
         raise SSETruncated("el stream acabó sin [DONE]")
+    if finish is not None and finish not in _FIN_NORMAL:
+        # Tras un corte, lo mismo: la marca dice que el modelo NO acabó, así
+        # que un tool_call a medias no se ejecuta con {} por haberla traído.
+        if not _args_enteros(acc):
+            raise SSETruncated(f"el stream acabó por {finish!r} con un tool_call a medias")
+        log.warning(
+            "el stream acabó por finish_reason=%r: respuesta posiblemente "
+            "incompleta (%d caracteres, %d tool_calls)", finish, len(content), len(acc),
+        )
 
     message: dict[str, Any] = {"role": "assistant", "content": content}
     if acc:

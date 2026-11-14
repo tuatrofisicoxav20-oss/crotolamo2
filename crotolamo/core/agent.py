@@ -803,10 +803,18 @@ class ToolAgent(Agent):
                     # camino final normal (líneas del bloque `if not calls`).
                     turn.via = VIA_DIRECT
                     reply = self._apply(self.post_hooks, result)
-                    if streamer is not None:
+                    if emit is not None:
                         # En modo voz/streaming el caller solo lee on_token; hay
                         # que emitir el texto o el patrón se queda en silencio.
-                        streamer.flush_if_held(reply)
+                        # Por el Emitter, no por `streamer.flush_if_held`: con
+                        # "sentence" el streamer pudo soltar ya un preámbulo de
+                        # dos frases y quedar en vivo, y entonces no emite nada
+                        # (el StreamSpeaker había hablado, así que el listener
+                        # tampoco caía a speak_sentences: el patrón oía "voy a
+                        # revisar" y nunca la respuesta). El resultado de la tool
+                        # nunca salió por el stream: va entero, en frase aparte
+                        # si ya se habló algo en el turno, como el aviso de error.
+                        emit(f"\n{reply}" if emit.released else reply)
                     self.conversation.add_assistant(reply)
                     return reply
             # Si no hubo short-circuit, volvemos a pedirle al LLM que decida con
@@ -823,8 +831,11 @@ class ToolAgent(Agent):
         if self.stop_on_repeated_failure:
             return self._exhausted_reply(turn, reply, emit, should_abort, clean_head)
         self.conversation.add_assistant(reply)
-        if on_token is not None:
-            on_token(reply)
+        if emit is not None:
+            # Por el Emitter, como en _exhausted_reply: con "sentence" pudo sonar
+            # ya un preámbulo y la frase pegada ("ahora mismo.Me enredé") el TTS
+            # no la corta y espeak lee el punto como "punto". Va en línea aparte.
+            emit(f"\n{reply}" if emit.released else reply)
         return reply
 
     def _exhausted_reply(self, turn: TurnInfo, canned: str, emit, should_abort,

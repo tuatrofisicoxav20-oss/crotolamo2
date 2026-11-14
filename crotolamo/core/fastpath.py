@@ -56,23 +56,35 @@ _COMPILED = [(re.compile(pattern), name, args) for pattern, name, args in _RULES
 _OPEN_APP = re.compile(r"^(abre(me)?|abrime|lanza) (la |el )?(?P<app>[\w+ ]{2,30})$")
 
 
-def _known_apps() -> set[str]:
-    apps: set[str] = set()
-    try:
-        from crotolamo.settings import get_settings
+def _known_apps() -> dict[str, str]:
+    """{nombre como lo deja _norm: clave que open_app reconoce}.
 
-        apps.update(_norm(k) for k in get_settings().raw.get("apps", {}))
-    except Exception:  # noqa: BLE001 - sin config igual sirven los defaults
-        pass
+    El texto se compara ya pasado por _norm (sin puntuación), pero open_app
+    busca con normalize_key, que conserva '-' y '.': una clave de [apps] como
+    "obs-studio" casaba como "obs studio" y open_app contestaba que no la
+    conocía. Por eso el atajo manda la clave TAL COMO la conoce open_app.
+    """
+    keys: list[str] = []
     try:
-        from crotolamo.tools.desktop import APP_COMMANDS
+        # _config_apps: las mismas entradas de [apps] (ya normalizadas) que
+        # open_app acepta; si la config no se lee, devuelve {} y valen los
+        # defaults.
+        from crotolamo.tools.desktop import APP_COMMANDS, _config_apps
 
-        apps.update(_norm(k) for k in APP_COMMANDS)
-    except Exception:  # noqa: BLE001
+        keys.extend(_config_apps())
+        keys.extend(APP_COMMANDS)
+    except Exception:  # noqa: BLE001 - sin desktop no hay open_app que atajar
         pass
     # "terminal" no vive en APP_COMMANDS (open_app la resuelve vía
     # _detect_terminal), pero sigue siendo un destino válido del atajo.
-    apps.add("terminal")
+    keys.append("terminal")
+    apps: dict[str, str] = {}
+    for key in keys:
+        spoken = _norm(key)
+        # Si dos claves solo se distinguen por la puntuación ("obs studio" y
+        # "obs-studio"), gana la que _norm deja igual: es la que se nombró.
+        if spoken and (spoken not in apps or spoken == key):
+            apps[spoken] = key
     return apps
 
 
@@ -87,6 +99,7 @@ def match(text: str) -> tuple[str, dict[str, Any]] | None:
     m = _OPEN_APP.match(norm)
     if m:
         app = m.group("app").strip()
-        if app in _known_apps():
-            return "open_app", {"name": app}
+        known = _known_apps()
+        if app in known:
+            return "open_app", {"name": known[app]}
     return None

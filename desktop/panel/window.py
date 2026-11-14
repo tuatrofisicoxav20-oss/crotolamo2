@@ -25,6 +25,7 @@ from common.gtk_util import apply_css, swap_class  # noqa: E402
 
 from .config import (  # noqa: E402
     ARGS_BY_KEY,
+    ENV_FILE,
     KEY_BY_ARGS,
     MODES,
     read_listening_enabled,
@@ -506,7 +507,19 @@ class Panel(Gtk.ApplicationWindow):
         key = combo.get_active_id()
         if not key:
             return
-        write_mode_args(ARGS_BY_KEY[key])
+        if not write_mode_args(ARGS_BY_KEY[key]):
+            # El modo no quedó en disco (disco lleno, sin permiso…): reiniciar
+            # dejaría la voz sorda y recargaría los modelos para volver al MISMO
+            # modo. El combo vuelve ya al guardado y el subtítulo dice por qué;
+            # antes rebotaba en el siguiente tick sin explicación. (El errno va
+            # al log: write_mode_args solo devuelve si quedó guardado.)
+            self._action_error = (_state_key(self._last_state),
+                                  f"no pude guardar el modo en {ENV_FILE}")
+            self._apply_state(self._last_state)
+            return
+        # Otra acción: el aviso anterior (p. ej. un modo que no se pudo guardar)
+        # ya no aplica; con el servicio parado nadie más lo borraría.
+        self._action_error = None
         # si está escuchando, reiniciar para aplicar el nuevo modo
         if self._last_state.get("ActiveState") == "active":
             self._systemctl("restart", SERVICE)

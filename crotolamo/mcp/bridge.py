@@ -152,12 +152,24 @@ def _expand(value: str, where: str = "[mcp]") -> str:
     return out
 
 
+# Tope técnico de un plazo de la config: lo que admiten TODAS las esperas por
+# las que pasa. Lock.acquire/Event.wait llegan a threading.TIMEOUT_MAX, pero el
+# escritor con la tubería llena espera en select.poll, que lo toma en ms en un
+# int de C (2**31-1, ~24,8 días). Pasado eso, o con `inf` (TOML lo admite: la
+# forma natural de decir "sin límite"), cada espera lanzaba OverflowError: el
+# server "no arrancaba" o cada llamada "reventaba" con traza. Segundos enteros
+# por debajo del límite: margen para el redondeo de deadline - monotonic().
+MAX_TIMEOUT_S = float(min(threading.TIMEOUT_MAX, (2**31 - 1) // 1000))
+
+
 def _positive_number(raw: Any, default: float, key: str, where: str) -> float:
     if raw is None:
         return default
-    if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw > 0:
+    # El tope también deja fuera inf (no es <= tope) y nan (no es > 0).
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool) and 0 < raw <= MAX_TIMEOUT_S:
         return float(raw)
-    log.warning("%s: %s=%r no es un número positivo; uso %g", where, key, raw, default)
+    log.warning("%s: %s=%r no es un número positivo de hasta %d s (~24 días); uso %g",
+                where, key, raw, MAX_TIMEOUT_S, default)
     return default
 
 
@@ -462,6 +474,17 @@ _STARTING: set[StdioMCPClient] = set()
 # alcanza y lo busca _kill_unspawned, por la marca de entorno de su lanzamiento
 # ("<pid de Crotolamo>.<n>", una distinta cada vez).
 _SPAWNING: set[StdioMCPClient] = set()
+# Clientes que _retire ya sacó de _STATE y está cerrando: close() le da al
+# server su gracia tras el EOF (1 s) antes del SIGTERM, y hasta ~6 s si se
+# resiste. Sin esto, una señal de apagado en esa ventana no los veía
+# terminate_all() y os._exit mataba el hilo antes de su SIGTERM: el server
+# (colgado, justo el que se retira tras dos timeouts) sobrevivía a Crotolamo.
+_CLOSING: set[StdioMCPClient] = set()
+# Avisa a close_all() de cada cierre de _retire que acaba (ver close_all).
+_CLOSING_DONE = threading.Condition(_STATE_LOCK)
+# Tope de esa espera: close() ya está acotado (~6 s el peor caso); esto solo
+# cubre un hilo que dejó de avanzar, para que el atexit no se cuelgue por él.
+_CLOSING_WAIT_S = 10.0
 _MARCA_ENV = "CROTOLAMO_MCP_LANZAMIENTO"
 _LANZAMIENTOS = itertools.count(1)
 _ATEXIT_REGISTERED = False
@@ -502,6 +525,8 @@ def _retire(state: _ServerState, registry: Registry, why: str | None = None) -> 
         if _STATE.get(name) is not state:
             return False
         del _STATE[name]
+        # En la misma sección: ni un instante fuera del alcance del apagado.
+        _CLOSING.add(state.client)
         if why is not None:
             log.warning("MCP '%s': %s; retiro sus %d tools", name, why, len(state.tools))
         targets = [registry, state.registry, *state.registries]
@@ -513,8 +538,14 @@ def _retire(state: _ServerState, registry: Registry, why: str | None = None) -> 
                 seen.append(target)
                 target.unregister(tool.name)
         router.unregister_group(state.group)
-    # Fuera del lock: cerrar puede tardar segundos (SIGTERM -> SIGKILL).
-    state.client.close()
+    # Fuera del lock: cerrar puede tardar segundos (EOF, SIGTERM -> SIGKILL).
+    # Sale de _CLOSING DESPUÉS de cerrarlo, como en _abandon.
+    try:
+        state.client.close()
+    finally:
+        with _CLOSING_DONE:
+            _CLOSING.discard(state.client)
+            _CLOSING_DONE.notify_all()
     log.info("MCP '%s': desconectado (%d tools retiradas)", name, len(state.tools))
     return True
 
@@ -1022,25 +1053,33 @@ def unregister_server(registry: Registry, name: str) -> bool:
 
 
 def close_all() -> None:
-    """Cierra todos los servers conectados o arrancando (atexit y tests)."""
+    """Cierra todos los servers conectados o arrancando (atexit y tests), y
+    espera a los que otro hilo ya está cerrando (_retire)."""
     with _STATE_LOCK:
         states = list(_STATE.values())
         starting = list(_STARTING)
+        closing = set(_CLOSING)
     for state in states:
         unregister_server(state.registry, state.config.name)
     for client in starting:
         client.close()  # su handshake falla y _connect lo da por no arrancado
+    if closing:
+        # Su close() ya está en marcha en otro hilo (llamarlo aquí no hace
+        # nada). Volver antes dejaba que el intérprete parase ese hilo daemon
+        # a medio cierre, antes del SIGTERM: el server quedaba huérfano.
+        with _CLOSING_DONE:
+            _CLOSING_DONE.wait_for(lambda: _CLOSING.isdisjoint(closing), _CLOSING_WAIT_S)
 
 
 def terminate_all() -> None:
     """Para el apagado por SEÑAL del listener, que sale con os._exit y se salta
     atexit: manda SIGTERM al grupo de cada server (también los que siguen en el
-    handshake) sin esperar a nadie. Sin esto, un wrapper (npx, sh -c) o un
-    server que ignora el EOF de stdin quedaba huérfano al parar el servicio.
-    Al que la señal pilla en pleno Popen lo busca _kill_unspawned.
-    Best-effort, nunca lanza."""
+    handshake o a medio cierre en _retire) sin esperar a nadie. Sin esto, un
+    wrapper (npx, sh -c) o un server que ignora el EOF de stdin quedaba
+    huérfano al parar el servicio. Al que la señal pilla en pleno Popen lo
+    busca _kill_unspawned. Best-effort, nunca lanza."""
     with _STATE_LOCK:
-        clients = [state.client for state in _STATE.values()] + list(_STARTING)
+        clients = [state.client for state in _STATE.values()] + list(_STARTING) + list(_CLOSING)
         spawning = list(_SPAWNING)
     for client in clients:
         try:

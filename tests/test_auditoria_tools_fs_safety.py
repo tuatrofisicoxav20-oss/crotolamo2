@@ -86,6 +86,12 @@ def test_guard_no_toma_por_ruta_la_categoria_de_un_hecho(tmp_path):
     "file:///etc/passwd#\nnota",
     "fi\tle:///etc/passwd",
     "\x01file:///etc/passwd",
+    # Sin barra tras el esquema: un navegador lo lee desde la raíz ("\" es "/")
+    # y urllib, relativo a su CWD (ver tests/test_revision_final_u18.py).
+    "file:etc/passwd",
+    "file:\\etc\\passwd",
+    "file:../../../../../../../../etc/passwd",
+    "file:%2Fetc/passwd",
 ])
 def test_guard_bloquea_un_uri_file_fuera_del_corral(zonas, uri):
     """Un server MCP de navegador/fetch abre file:///... igual que una ruta, pero
@@ -1074,24 +1080,34 @@ def test_find_in_project_encuentra_codigo_literal_con_metacaracteres(
         "    re.sub(r\"\\s+\", \" \", x)\n",
         encoding="utf-8",
     )
+    # Lo que SÍ casa con cada patrón leído como regex y no tal cual ("lists"
+    # para `list[str]`): con el regex por delante salían estas líneas falsas y
+    # las de tipos.py quedaban escondidas.
+    (proyecto / "ruido.py").write_text(
+        "def lists(): pass\n"
+        "arr0 = gargs)\n"
+        "re.sub(r\" +\", x)\n",
+        encoding="utf-8",
+    )
     out = projects.find_in_project("p", texto)
     assert out == f"Encontré «{texto}» en p, patrón:\n{linea}"
-    # Primero como regex (lo de siempre) y, al no salir nada, tal cual.
-    assert len(espia_grep) == 2
-    assert "-F" not in espia_grep[0] and "-F" in espia_grep[1]
+    # Con metacaracteres, primero tal cual: está, así que un solo grep.
+    assert len(espia_grep) == 1
+    assert "-F" in espia_grep[0]
     for argv in espia_grep:
         assert argv[argv.index("-e") + 1] == texto and argv[-2:] == ["--", str(proyecto)]
 
 
-def test_find_in_project_un_regex_que_encuentra_no_se_repite_como_literal(proyecto, espia_grep):
-    """Lo que ya funcionaba no cambia ni cuesta más: si el regex da resultados,
-    esos son los que salen, con un solo grep."""
+def test_find_in_project_un_regex_que_no_esta_tal_cual_se_busca_como_regex(proyecto, espia_grep):
+    """Un regex de verdad sigue funcionando: tal cual no aparece en el código,
+    así que el segundo grep lo lee como regex. Dos greps como mucho."""
     from crotolamo.tools import projects
 
     (proyecto / "agente.py").write_text("class ToolAgent:\n    pass\n", encoding="utf-8")
     out = projects.find_in_project("p", "^class Tool[A-Z]gent")
     assert out == "Encontré «^class Tool[A-Z]gent» en p, patrón:\nagente.py:1:class ToolAgent:"
-    assert len(espia_grep) == 1
+    assert len(espia_grep) == 2
+    assert "-F" in espia_grep[0] and "-F" not in espia_grep[1]
 
 
 @pytest.mark.parametrize("texto, greps", [

@@ -165,12 +165,19 @@ def test_mode_args_cache_no_relee_si_no_cambio(tmp_path, monkeypatch):
 
     lecturas = []
     real_read_text = Path.read_text
+    real_read_bytes = Path.read_bytes
 
     def contando(self, *a, **kw):
         lecturas.append(self)
         return real_read_text(self, *a, **kw)
 
+    def contando_bytes(self):
+        lecturas.append(self)
+        return real_read_bytes(self)
+
     monkeypatch.setattr(Path, "read_text", contando)
+    # el lector lee bytes (decodifica como write_mode_args): contar ambas vías
+    monkeypatch.setattr(Path, "read_bytes", contando_bytes)
     assert config.read_mode_args() == "--simple"
     assert env not in lecturas  # mismo mtime → sirvió la caché
 

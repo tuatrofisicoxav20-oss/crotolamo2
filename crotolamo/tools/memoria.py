@@ -52,15 +52,30 @@ def _buscar_sqlite(pregunta: str) -> str:
 
 
 # Palabras que no dicen DE QUÉ trata un recuerdo: artículos, preposiciones,
-# conjunciones, pronombres, posesivos... y las de la propia orden ("olvida lo
-# de mi X"). En minúsculas, con y sin acento.
+# conjunciones, pronombres, posesivos, interrogativos ("dónde vive mi mamá" no
+# trata de "dónde"), "patrón" (los hechos se guardan también en tercera persona:
+# "el patrón toma...")... y las de la propia orden ("olvida lo de mi X"). En
+# minúsculas, con y sin acento.
 _PALABRAS_VACIAS = frozenset(
     "a al ante bajo con contra de del desde en entre hacia hasta para por según segun sin "
     "sobre tras el la los las lo un una unos unas y e o u ni que qué pero si sí como cómo "
     "porque yo tú tu él me mí mi mis te ti tus se su sus le les nos este esta esto estos "
     "estas ese esa eso esos esas aquel aquella aquello es son era fue ser estar está hay no "
     "ya muy más mas también tambien olvida olvidar olvídate olvidate borra borrar quita "
-    "quitar elimina eliminar recuerdo recuerdos".split()
+    "quitar elimina eliminar recuerdo recuerdos dónde donde cuál cual cuáles cuales cuándo "
+    "cuando quién quien quiénes quienes cuánto cuanto cuánta cuanta cuántos cuantos cuántas "
+    "cuantas patrón patron".split()
+)
+
+# Palabras que dicen QUÉ CLASE de hecho es, no de qué trata: "cómo se llama mi
+# gato" trata del gato, no de "llama", que comparten el perro, el jefe y la
+# hermana. No bastan para elegir el hecho a borrar; sí desempatan entre los que
+# tratan del tema ("cómo se llama mi perro": el del nombre, no el de las
+# croquetas) y son el tema si la descripción no trae otra cosa ("olvida dónde
+# vivo"). Sin acentos: se comparan ya normalizadas.
+_PALABRAS_DEBILES = frozenset(
+    "llama llamo llamas llaman nombre nombres gusta gustan gusto encanta encantan tengo tiene "
+    "tienes tienen vive vivo vives viven favorito favorita favoritos favoritas".split()
 )
 
 
@@ -74,16 +89,41 @@ def _palabras_con_contenido(texto: str) -> set[str]:
 def _olvidar_sqlite(descripcion: str) -> str:
     # facts.search ORDENA por parecido pero no descarta nada (dos frases
     # cualesquiera comparten alguna letra o un "de"): con su top-1 a ciegas,
-    # "olvida lo de mi coche" BORRABA «me gusta el café de olla». Borrar exige que
-    # el hecho comparta con la descripción al menos una palabra con contenido; se
-    # borra el mejor del ranking que lo cumpla y, si ninguno, nada.
+    # "olvida lo de mi coche" BORRABA «me gusta el café de olla». Tampoco vale "el
+    # primero del ranking que comparta UNA palabra": el ranking cuenta las vacías
+    # y basta un verbo genérico, y "cómo se llama mi gato" borraba «mi jefe se
+    # llama Ramiro». Cada hecho se puntúa por las palabras del TEMA que comparte
+    # (y, a igualdad, por todas); se borra el único mejor. Si ninguno trata del
+    # tema, o empatan hechos distintos, no se borra nada: olvidar por voz debe ser
+    # conservador (como Memoria.olvidar), y un borrado es para siempre.
     claves = _palabras_con_contenido(descripcion)
-    candidatos = facts_sqlite.search(descripcion, top=None) if claves else []
-    for row in candidatos:
-        if claves & _palabras_con_contenido(row["texto"]):
-            if facts_sqlite.forget(int(row["id"])):
-                return f"Olvidado, patrón: «{row['texto']}».{_AVISO_RESPALDO}"
-            break
+    tema = (claves - _PALABRAS_DEBILES) or claves
+    mejor: tuple[int, int] = (0, 0)
+    empatados: list[dict] = []
+    for row in (facts_sqlite.recall() if tema else []):
+        palabras = _palabras_con_contenido(row["texto"])
+        puntos = (len(tema & palabras), len(claves & palabras))
+        if puntos > mejor:
+            mejor, empatados = puntos, [row]
+        elif puntos == mejor:
+            empatados.append(row)
+    if mejor[0] == 0:
+        return f"No encontré ningún recuerdo sobre «{descripcion}», patrón.{_AVISO_RESPALDO}"
+    # Dos copias del mismo hecho (recordar dos veces) son UN recuerdo, no un
+    # empate: si no, "olvida lo del pozole" preguntaría "¿cuál?" para siempre.
+    distintos: dict[str, str] = {}
+    for row in empatados:
+        distintos.setdefault(normalize_key(row["texto"]), row["texto"])
+    if len(distintos) > 1:
+        textos = list(distintos.values())
+        lista = ", ".join(f"«{texto}»" for texto in textos[:3])
+        if len(textos) > 3:
+            lista += f" y {len(textos) - 3} más"
+        return (f"Tengo varios recuerdos sobre «{descripcion}», patrón, y no borré "
+                f"ninguno: {lista}. Dime cuál olvido.{_AVISO_RESPALDO}")
+    row = empatados[0]
+    if facts_sqlite.forget(int(row["id"])):
+        return f"Olvidado, patrón: «{row['texto']}».{_AVISO_RESPALDO}"
     return f"No encontré ningún recuerdo sobre «{descripcion}», patrón.{_AVISO_RESPALDO}"
 
 

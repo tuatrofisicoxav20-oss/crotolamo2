@@ -287,10 +287,17 @@ class StdioMCPClient:
 
     def _pipe_threads(self) -> list[threading.Thread]:
         """Hilos lector y drenador que hay que ver terminar (no el actual: un
-        close() desde el propio hilo lector no puede esperarse a sí mismo)."""
+        close() desde el propio hilo lector no puede esperarse a sí mismo).
+
+        Solo los vivos: sin hilos libres ("can't start new thread") start()
+        deja el Thread asignado sin arrancar, y su join() lanza; close()
+        reventaba sin cerrar las tuberías y el error tumbaba el registro de
+        TODOS los servers en bridge._launch. Uno que ya terminó no hay que
+        esperarlo. is_alive() y no `ident`: este se pone antes de que el hilo
+        cuente como arrancado, y en ese hueco join() también lanza."""
         return [
             t for t in (self._reader, self._stderr_thread)
-            if t is not None and t is not threading.current_thread()
+            if t is not None and t.is_alive() and t is not threading.current_thread()
         ]
 
     def _wait_exit(self, proc: subprocess.Popen[bytes], timeout: float) -> bool:
@@ -665,7 +672,11 @@ class StdioMCPClient:
         como mucho `wait_s` a que el drenador acabe y el proceso salga."""
         deadline = time.monotonic() + wait_s
         stderr_thread = self._stderr_thread
-        if stderr_thread is not None and stderr_thread is not threading.current_thread():
+        # Un drenador sin arrancar (sin hilos libres, o aún dentro de su start()
+        # mientras el lector ya ve morir al server) no se espera: su join()
+        # lanza y el lector moría sin dar el motivo (ver _pipe_threads).
+        if (stderr_thread is not None and stderr_thread.is_alive()
+                and stderr_thread is not threading.current_thread()):
             stderr_thread.join(wait_s)
         parts: list[str] = []
         try:

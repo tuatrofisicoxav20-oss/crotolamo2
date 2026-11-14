@@ -313,10 +313,16 @@ def test_con_key_la_extraccion_sigue_llamando_al_llm(monkeypatch, tmp_path):
 
 def test_key_solo_en_la_env_del_sdk_no_se_pisa_con_la_de_relleno(monkeypatch, tmp_path):
     """mem0 cae a OPENAI_API_KEY / GROQ_API_KEY si la config no trae key: eso ya
-    funcionaba y debe seguir igual (la key de relleno es solo para cuando no hay)."""
+    funcionaba y debe seguir igual (la key de relleno es solo para cuando no hay).
+    OPENAI_API_KEY va al base_url de la nube: solo cuenta si esa nube ES OpenAI (con
+    la de Z.ai se mandaba a Z.ai; ver tests/test_revision_final_u09.py)."""
+    from crotolamo.settings import Settings
+
     monkeypatch.setenv("OPENAI_API_KEY", "clave-del-sdk")
     arrancados = _mem0_como_el_real(monkeypatch)
-    backend = Mem0Backend(MemoriaConfig(enabled=True, ruta=tmp_path / "mem"))
+    nube_openai = Settings(raw={"llm": {"glm": {"base_url": "https://api.openai.com/v1"}}},
+                           user="t", home=tmp_path)
+    backend = Mem0Backend(MemoriaConfig(enabled=True, ruta=tmp_path / "mem"), nube_openai)
     assert backend.extraer("me gusta el pozole", "va, patrón") == ["hecho extraído"]
     conf, _mem = arrancados[0]
     assert "api_key" not in conf["llm"]["config"]
@@ -522,7 +528,9 @@ def test_cli_migrar_se_puede_repetir_sin_duplicar(monkeypatch, tmp_path, capsys)
 
     # Lo apuntado en la libreta mientras la memoria estuvo caída: entra SOLO eso.
     facts.remember("los viernes juego básquet")
-    facts.remember("Mi perro se llama Tletl.")  # repetido dentro de la propia libreta
+    # Repetido dentro de la propia libreta: remember() ya no deja copias, pero
+    # una libreta de antes puede traerlas (add_fact es el INSERT crudo).
+    facts.db.add_fact("Mi perro se llama Tletl.")
     assert memoria_mod.run_cli(["migrar"]) == 0
     out = capsys.readouterr().out
     assert "Migrados 1 de 4 hechos" in out and "3 ya estaban" in out

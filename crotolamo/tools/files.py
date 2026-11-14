@@ -12,15 +12,39 @@ ejecutar la tool; aquí solo se rechaza lo que queda fuera de ambas zonas.
 
 from __future__ import annotations
 
+import fnmatch
+import os
+import re
 from pathlib import Path
 
 from crotolamo.safety.paths import path_inside_roots
 from crotolamo.settings import get_settings
-from crotolamo.tools.base import SKIP_DIRS, read_text_capped, replace_surrogates, tool
+from crotolamo.tools.base import (
+    SKIP_DIRS,
+    normalize_key,
+    read_text_capped,
+    replace_surrogates,
+    tool,
+)
 
 # Tope del nombre de una nota, en BYTES: NAME_MAX es 255 en ext4/btrfs/xfs y hay
 # que dejar sitio a ".md" y al sufijo "_N" de las notas con título repetido.
 _NOTE_STEM_MAX_BYTES = 240
+
+# Cuánto mira read_file para decidir si un archivo es binario (lo mismo que git).
+_BINARY_SNIFF_BYTES = 8192
+
+# Lo que separa palabras en un nombre de archivo: create_note guarda "Lista de
+# compras" como Lista_de_compras.md, y otros usan '-'.
+_NAME_SEPARATORS = str.maketrans("_-", "  ")
+
+# Las letras que en un nombre pueden ir con tilde, diéresis, virgulilla o
+# cedilla, y esas variantes: en el patrón de find cada una va como clase (ver
+# _find_glob).
+_ACCENTED = {
+    "a": "áàâäãå", "e": "éèêë", "i": "íìîï", "o": "óòôöõ", "u": "úùûü",
+    "n": "ñ", "c": "ç", "y": "ýÿ",
+}
 
 
 def _resolve(path: str) -> Path:
@@ -40,25 +64,58 @@ def _resolve(path: str) -> Path:
     dónde caen los archivos y, si el ancla es el home, añade una confirmación.
     El guard clasifica esa misma ruta (Guard.relative_base).
     """
-    p = Path(path).expanduser()
-    base = get_settings().relative_base
-    if base is not None and not p.is_absolute():
-        p = base / p
+    p = _anchored(path)
     try:
         return p.resolve()
     except (OSError, RuntimeError, ValueError):
         return p
 
 
-def _outside_corral(p: Path) -> str | None:
+def _anchored(path: str) -> Path:
+    """`path` con el ~ expandido y, si es relativa, anclada como en _resolve."""
+    p = Path(path).expanduser()
+    base = get_settings().relative_base
+    if base is not None and not p.is_absolute():
+        p = base / p
+    return p
+
+
+def _entry(path: str) -> Path:
+    """La ENTRADA que nombra `path`: su carpeta resuelta y el último nombre tal
+    cual, sin seguirlo si es un enlace simbólico.
+
+    Borrar y mover actúan sobre lo que nombró el patrón. Con _resolve, "borra el
+    acceso directo" borraba el archivo al que apuntaba (el guard pregunta sin
+    decir ruta) y dejaba el enlace roto, que luego ya no se podía borrar ("No
+    existe"); mover un enlace se llevaba el archivo real. unlink() y rename() no
+    siguen el último nombre y la carpeta va resuelta una sola vez, igual que en
+    _resolve, así que la ventana TOCTOU sigue cerrada. '.', '..' y la raíz no
+    nombran una entrada: esas se resuelven enteras.
+    """
+    p = _anchored(path)
+    if p.name in ("", ".", ".."):
+        return _resolve(path)
+    try:
+        return p.parent.resolve() / p.name
+    except (OSError, RuntimeError, ValueError):
+        return p
+
+
+def _outside_corral(p: Path, *, entry: bool = False) -> str | None:
     """Devuelve un mensaje de bloqueo si `p` está fuera del corral; si no, None.
 
     El corral acepta allowed_roots (zona libre) Y confirm_roots (zona con
     confirmación): si la ruta está en la segunda, el guard ya preguntó al patrón.
+
+    Con entry=True, `p` viene de _entry: si es un enlace, lo que se va a tocar
+    es el enlace, así que cuenta la carpeta que lo contiene y no adónde apunta.
+    (os.path.islink, no Path.is_symlink: este no se traga un EACCES y la tool
+    reventaría en vez de responder que la ruta está fuera.)
     """
     settings = get_settings()
     roots = list(settings.allowed_roots) + list(settings.confirm_roots)
-    if not path_inside_roots(p, roots):
+    checked = p.parent if entry and os.path.islink(p) else p
+    if not path_inside_roots(checked, roots):
         return (f"La ruta '{p}' está fuera de las zonas permitidas, patrón. "
                 "No salgo del corral.")
     return None
@@ -83,6 +140,15 @@ def read_file(path: str) -> str:
     if not p.is_file():
         return f"Eso no es un archivo normal, patrón, no lo puedo leer: {p}"
     try:
+        # Un PDF, un .docx o una sqlite decodificados "con reemplazo" eran
+        # 20 000 caracteres de U+FFFD y NUL que el modelo no puede usar y que
+        # viajaban en cada petición siguiente (50-120 KB de JSON). El criterio
+        # de git: un NUL en los primeros 8 KB es binario. Un texto en Latin-1
+        # no lleva NUL y se sigue leyendo; uno en UTF-16 sí (y tampoco se leía:
+        # salía un \u0000 entre letra y letra).
+        with p.open("rb") as fh:
+            if b"\x00" in fh.read(_BINARY_SNIFF_BYTES):
+                return f"Eso no es texto, patrón: parece un archivo binario, no lo puedo leer: {p}"
         return read_text_capped(p)
     except OSError as error:
         return f"No pude leer {p}, patrón: {error}"
@@ -166,11 +232,13 @@ def move_file(src: str, dest: str) -> str:
         src: ruta origen.
         dest: ruta destino.
     """
-    source = _resolve(src)
+    # El origen es la entrada (_entry): mover un enlace mueve el enlace, como mv.
+    source = _entry(src)
     target = _resolve(dest)
-    if (blocked := _outside_corral(source) or _outside_corral(target)):
+    if (blocked := _outside_corral(source, entry=True) or _outside_corral(target)):
         return blocked
-    if not source.exists():
+    # lexists: un enlace roto también se puede mover.
+    if not os.path.lexists(source):
         return f"No existe el origen, patrón: {source}"
     # Semántica de `mv`: si el destino es una carpeta que ya existe, se mueve
     # DENTRO de ella. Con rename a secas, "mueve informe.pdf a respaldo" fallaba
@@ -195,12 +263,15 @@ def delete_file(path: str) -> str:
     Args:
         path: ruta del archivo a borrar.
     """
-    p = _resolve(path)
-    if (blocked := _outside_corral(p)):
+    # La entrada (_entry): borrar un acceso directo quita el enlace, no el original.
+    p = _entry(path)
+    if (blocked := _outside_corral(p, entry=True)):
         return blocked
-    if not p.exists():
+    # lexists: un enlace roto también es algo que borrar.
+    if not os.path.lexists(p):
         return f"No existe, patrón, así que nada que borrar: {p}"
-    if p.is_dir():
+    # Un enlace a una carpeta es un enlace: se quita él y la carpeta queda.
+    if not os.path.islink(p) and p.is_dir():
         return f"Es una carpeta, patrón. No borro carpetas con esta tool por seguridad: {p}"
     try:
         p.unlink()
@@ -220,7 +291,11 @@ def search_files(query: str) -> str:
 
     base = get_settings().paths.get("documentos", Path.home() / "Documentos")
     query = query.strip()
-    if not query:
+    # Plegada como los nombres (_fold_name): "lista de compras" tiene que dar
+    # con Lista_de_compras.md, y "reunión" (la tilde la pone Whisper) con
+    # reunion_lunes.txt. Una consulta que solo era '_' o '-' no busca nada.
+    folded = _fold_name(query)
+    if not folded:
         return "Dame un nombre que buscar, patrón."
     if not base.exists():
         return f"No existe la base de búsqueda, patrón: {base}"
@@ -232,7 +307,7 @@ def search_files(query: str) -> str:
     skip: list[str] = []
     for name in sorted(SKIP_DIRS - {base.name}):
         skip += ["-o", "-name", name] if skip else ["-name", name]
-    match = ["-iname", f"*{query}*", "-print"]
+    match = ["-iname", _find_glob(folded), "-print"]
     try:
         # errors="replace": un solo nombre con bytes que no son UTF-8 (un ZIP
         # hecho en Windows) y la decodificación estricta de text=True lanzaba
@@ -246,12 +321,53 @@ def search_files(query: str) -> str:
     except OSError as error:
         # find ausente o no ejecutable: la búsqueda ni empezó, no es que "tardara".
         return f"No pude lanzar la búsqueda, patrón: {error}"
-    lines = result.stdout.strip().splitlines()
+    # find es el colador grueso; quien decide es esto, sobre los nombres
+    # plegados igual que la consulta. Los comodines que mande el modelo
+    # ("*.pdf") siguen valiendo.
+    wanted = re.compile(fnmatch.translate(f"*{folded}*"))
+    lines = [
+        line for line in result.stdout.strip().splitlines()
+        if wanted.match(_fold_name(os.path.basename(line)))
+    ]
     if not lines:
         return f"No encontré archivos con «{query}», patrón."
     shown = lines[:20]
     extra = f"\n...y {len(lines) - 20} más." if len(lines) > 20 else ""
     return "Encontré esto, patrón:\n" + "\n".join(shown) + extra
+
+
+def _find_glob(folded: str) -> str:
+    """Patrón -iname para find que deja pasar todo nombre cuyo plegado casa con
+    `folded` (la consulta ya plegada), y alguno más: el filtro de Python decide.
+
+    Cada letra que puede llevar tilde va como clase con sus variantes y un '*'
+    detrás, que se traga la tilde suelta de un nombre en NFD (o + U+0301) y, en
+    el locale C, donde find compara bytes, el segundo byte de la 'ó' en UTF-8 (la
+    clase casa con el primero). Así sirve en cualquier locale y con nombres que
+    no son UTF-8. Lo que no es letra o cifra ASCII (un separador, un comodín, un
+    carácter de otro alfabeto) va como '*'.
+    """
+    parts: list[str] = []
+    for char in folded:
+        if char in _ACCENTED:
+            variants = char + _ACCENTED[char]
+            parts.append(f"[{variants}{variants.upper()}]*")
+        elif char.isascii() and char.isalnum():
+            parts.append(char)
+        else:
+            parts.append("*")
+    return re.sub(r"\*+", "*", "*" + "".join(parts) + "*")
+
+
+def _fold_name(text: str) -> str:
+    """Forma comparable de un nombre de archivo: sin mayúsculas ni tildes (también
+    las de un nombre en NFD) y con '_', '-' y los espacios como un solo espacio."""
+    # Corre sobre cada nombre que deja pasar find (miles, con una consulta corta
+    # en un Documentos grande): quitar tildes es lo caro, y en un nombre ASCII no
+    # hay ninguna que quitar.
+    if not text.isascii():
+        text = normalize_key(text)
+    return " ".join(text.lower().translate(_NAME_SEPARATORS).split())
 
 
 @tool

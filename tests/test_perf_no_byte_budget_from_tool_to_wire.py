@@ -224,7 +224,7 @@ def web(monkeypatch):
     hilo = threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.02},
                             daemon=True)
     hilo.start()
-    monkeypatch.setattr(_web, "_resolve_public_ip", lambda host: "127.0.0.1")
+    monkeypatch.setattr(_web, "_resolve_public_ips", lambda host: ["127.0.0.1"])
     yield f"http://pagina.test:{srv.server_address[1]}", _Web
     srv.shutdown()
     srv.server_close()
@@ -362,7 +362,7 @@ def test_unas_cabeceras_que_gotean_no_estiran_el_plazo(monkeypatch):
             conn.sendall(b"a")
 
     port, parar = _servidor_crudo(guion)
-    monkeypatch.setattr(_web, "_resolve_public_ip", lambda host: "127.0.0.1")
+    monkeypatch.setattr(_web, "_resolve_public_ips", lambda host: ["127.0.0.1"])
     try:
         error, segundos = _get_en_hilo(f"http://127.0.0.1:{port}/", timeout=0.6, espera=10)
     finally:
@@ -418,7 +418,7 @@ def test_el_ultimo_recv_del_cuerpo_no_se_pasa_del_plazo(monkeypatch):
             conn.sendall(b"gota\n")
 
     port, parar = _servidor_crudo(guion)
-    monkeypatch.setattr(_web, "_resolve_public_ip", lambda host: "127.0.0.1")
+    monkeypatch.setattr(_web, "_resolve_public_ips", lambda host: ["127.0.0.1"])
     try:
         resultado, segundos = _get_en_hilo(f"http://127.0.0.1:{port}/", timeout=1.0, espera=10)
     finally:
@@ -438,7 +438,7 @@ def test_un_cuerpo_que_no_llega_a_tiempo_es_timeout(monkeypatch):
         alto.wait(5)
 
     port, parar = _servidor_crudo(guion)
-    monkeypatch.setattr(_web, "_resolve_public_ip", lambda host: "127.0.0.1")
+    monkeypatch.setattr(_web, "_resolve_public_ips", lambda host: ["127.0.0.1"])
     try:
         error, segundos = _get_en_hilo(f"http://127.0.0.1:{port}/", timeout=0.5, espera=10)
     finally:

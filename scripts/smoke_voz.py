@@ -15,9 +15,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-import tempfile
 import time
-import wave
 from pathlib import Path
 
 try:
@@ -31,14 +29,6 @@ except ModuleNotFoundError:  # ejecutado como script suelto (launch.sh sin .venv
     from crotolamo.voice.tts import TTS
 
 FRASE = "crotolamo prueba uno dos tres"
-
-
-def _write_wav_16k(path: Path, pcm16) -> None:
-    with wave.open(str(path), "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(16000)
-        w.writeframes(pcm16.tobytes())
 
 
 def circular() -> int:
@@ -65,21 +55,27 @@ def circular() -> int:
             print("FALLO: Piper no produjo audio")
             return 1
 
-        # Resamplea de la tasa de Piper (22050) a los 16 kHz que espera Whisper.
-        pcm16 = resample_poly(pcm.astype(np.float32), 16000, src_rate).astype(np.int16)
+        # Resamplea de la tasa de Piper (22050) a los 16 kHz que espera Whisper y
+        # se lo pasa EN MEMORIA como float32 normalizado, igual que el daemon
+        # (record_audio_until_silence -> transcribe(ndarray)). Antes iba por un
+        # WAV temporal: con av 19 (Python >= 3.12) faster-whisper revienta al
+        # abrir el archivo (TypeError por metadata_errors), un «voz rota» falso
+        # por un camino que producción no usa; y el .astype(int16) volteaba los
+        # picos, porque el resampleo se pasa del rango int16.
+        audio = (resample_poly(pcm.astype(np.float32), 16000, src_rate)
+                 / 32768.0).astype(np.float32)
 
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as t:
-            wav_path = Path(t.name)
-        try:
-            _write_wav_16k(wav_path, pcm16)
-            t1 = time.perf_counter()
-            texto = stt.transcribe(wav_path)
-            t_stt = time.perf_counter() - t1
-        finally:
-            # También si el STT falla: el WAV temporal no se queda huérfano en /tmp.
-            wav_path.unlink(missing_ok=True)
+        t1 = time.perf_counter()
+        texto = stt.transcribe(audio)
+        t_stt = time.perf_counter() - t1
     except (VoiceUnavailable, ImportError, OSError) as error:
         print("FALLO:", error)
+        return 1
+    except Exception as error:
+        # Es el diagnóstico de arriba del todo: un error que no esperábamos de la
+        # cadena (librería nueva, modelo raro) también es "FALLO: ...", con su
+        # tipo para poder buscarlo, nunca un traceback.
+        print(f"FALLO: {type(error).__name__}: {error}")
         return 1
 
     print(f"TTS dijo:      '{FRASE}'")

@@ -259,7 +259,7 @@ def test_contexto_tls_compartido_sigue_verificando_certificados(monkeypatch):
 def test_http_get_respuesta_rota_es_urlerror(monkeypatch, payload):
     """El docstring de _http_get promete OSError/URLError si la red falla."""
     port, srv = _servidor_crudo(payload)
-    monkeypatch.setattr(_web, "_resolve_public_ip", lambda host: "127.0.0.1")
+    monkeypatch.setattr(_web, "_resolve_public_ips", lambda host: ["127.0.0.1"])
     try:
         with pytest.raises(urllib.error.URLError):
             _web._http_get(f"http://127.0.0.1:{port}/x", timeout=5.0)
@@ -269,7 +269,7 @@ def test_http_get_respuesta_rota_es_urlerror(monkeypatch, payload):
 
 def test_read_page_respuesta_cortada_responde_en_personaje(monkeypatch):
     port, srv = _servidor_crudo(CHUNK_CORTADO_HTML)
-    monkeypatch.setattr(_web, "_resolve_public_ip", lambda host: "127.0.0.1")
+    monkeypatch.setattr(_web, "_resolve_public_ips", lambda host: ["127.0.0.1"])
     monkeypatch.setattr(_web, "is_public_url", lambda url: True)
     try:
         out = default_registry().run("read_page", {"url": f"http://127.0.0.1:{port}/x"})
@@ -453,7 +453,7 @@ def paginas(monkeypatch):
     thread = threading.Thread(
         target=server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True)
     thread.start()
-    monkeypatch.setattr(_web, "_resolve_public_ip", lambda host: "127.0.0.1")
+    monkeypatch.setattr(_web, "_resolve_public_ips", lambda host: ["127.0.0.1"])
     monkeypatch.setattr(_web, "is_public_url", lambda url: True)
     yield f"http://127.0.0.1:{server.server_port}", _Paginas.rutas, _Paginas.pedidos
     server.shutdown()
@@ -655,7 +655,7 @@ def test_servidor_que_gotea_no_cuelga_la_lectura(monkeypatch):
     port, parar = _servidor_goteo(
         b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\r\n",
         b"<p>gota</p>", cada=0.02)
-    monkeypatch.setattr(_web, "_resolve_public_ip", lambda host: "127.0.0.1")
+    monkeypatch.setattr(_web, "_resolve_public_ips", lambda host: ["127.0.0.1"])
     resultado: list[tuple[str, str]] = []
     hilo = threading.Thread(
         target=lambda: resultado.append(_web._http_get(f"http://127.0.0.1:{port}/", timeout=1.0)),
@@ -906,8 +906,13 @@ def _urls_frigate(monkeypatch, respuesta) -> list[str]:
 def test_camaras_no_piden_miniaturas(cams_cfg, monkeypatch, llamada):
     urls = _urls_frigate(monkeypatch, [])
     llamada()
-    assert len(urls) == 1
-    assert parse_qs(urlsplit(urls[0]).query)["include_thumbnails"] == ["0"]
+    # Con el filtro por cámara vacío la tool pregunta además a /api/config si
+    # la cámara existe (test_revision_final_u22): eso no son eventos ni lleva
+    # miniaturas. De /api/events, una sola petición y sin miniaturas.
+    eventos = [u for u in urls if urlsplit(u).path == "/api/events"]
+    assert set(urls) - set(eventos) <= {"http://frigate.test:5000/api/config"}
+    assert len(eventos) == 1
+    assert parse_qs(urlsplit(eventos[0]).query)["include_thumbnails"] == ["0"]
 
 
 class _FrigateFalso(http.server.BaseHTTPRequestHandler):
@@ -1234,7 +1239,7 @@ def test_resolve_target_sin_config_legible_usa_los_defaults(monkeypatch):
 # desktop.terminal_exec: open_app("terminal") respeta [apps].terminal, y tanto
 # open_app como launch_project contestan "Cablea uno en [apps]" cuando no hay
 # terminal... pero terminal_exec solo autodetectaba. Con terminal = ["ptyxis"]
-# (el de Fedora, que no está en _TERMINALS) "abre terminal" funcionaba y
+# (el de Fedora, que entonces no estaba en _TERMINALS) "abre terminal" funcionaba y
 # launch_project seguía pidiendo que cablearas lo que ya estaba cableado.
 # ---------------------------------------------------------------------------
 
@@ -1295,6 +1300,8 @@ def test_launch_project_abre_el_terminal_cableado(apps_cfg, monkeypatch, fake_pr
     ("alacritty", ["alacritty", "-e", *_INNER]),
     ("wezterm", ["wezterm", "start", "--", *_INNER]),
     ("gnome-terminal", ["gnome-terminal", "--", *_INNER]),
+    # El de fábrica de Fedora 41+: ahora también se autodetecta (revisión final u23).
+    ("ptyxis", ["ptyxis", "--", *_INNER]),
     ("konsole", ["konsole", "-e", *_INNER]),
     ("xterm", ["xterm", "-e", *_INNER]),
 ])
@@ -2171,7 +2178,9 @@ class _PlayerctlFalso:
             if rep.sin_pista:
                 return False, ""
             linea = formato
-            for clave, valor in (("playerName", rep.nombre), ("status", rep.estado),
+            # Reproductores de una sola instancia: la instancia es el nombre.
+            for clave, valor in (("playerName", rep.nombre), ("playerInstance", rep.nombre),
+                                 ("status", rep.estado),
                                  ("artist", rep.artista), ("title", rep.titulo)):
                 linea = linea.replace("{{%s}}" % clave, valor)
             return True, linea + "\n"
@@ -2344,7 +2353,7 @@ if not elegidos:
     sys.exit("No players found")
 for rep in elegidos:
     if orden == "metadata":
-        linea = formato
+        linea = formato.replace("{{playerInstance}}", rep[0])
         for clave, valor in zip(("playerName", "status", "artist", "title"), rep):
             linea = linea.replace("{{" + clave + "}}", valor)
         print(linea)

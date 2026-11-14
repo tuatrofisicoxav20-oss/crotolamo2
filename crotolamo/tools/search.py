@@ -59,6 +59,28 @@ _MAX_RESULTS = 5
 _BLOQUEO_RED_INTERNA = ("Esa dirección es de la red interna, patrón. No leo ahí: "
                         "solo páginas públicas de internet.")
 
+# Marcas del captcha anti-bots de html.duckduckgo.com: el modal y el formulario
+# que manda a anomaly.js. Llega con HTTP 202 (que _http_get da por bueno) y sin
+# un solo result__a: sin mirarlas, un bloqueo se contaba como "no hay resultados".
+_DDG_CAPTCHA = ("anomaly-modal", "duckduckgo.com/anomaly.js")
+
+# Tipos que llevan marcado y van al extractor de HTML; el resto de text/*
+# (plain, markdown, csv...) es texto tal cual. Sin Content-Type se asume HTML;
+# text/xml (un RSS) conserva lo de siempre: sus <title>.
+_MARKUP_MIMES = frozenset({"", "text/html", "application/xhtml+xml", "text/xml"})
+
+
+def _es_anuncio(url: str) -> bool:
+    """True si el resultado es un anuncio de DDG (div.result--ad): enlaza a
+    duckduckgo.com/y.js?ad_domain=..., que redirige al aclick de bing."""
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname or ""
+    except ValueError:  # URL que ni se puede partir: no es la de un anuncio
+        return False
+    return parsed.path == "/y.js" and (host == "duckduckgo.com"
+                                       or host.endswith(".duckduckgo.com"))
+
 
 def is_blocked_query(text: str) -> bool:
     lower = normalize_key(text)
@@ -119,8 +141,16 @@ def fetch_web_results(query: str) -> str:
 
     parser = _web._DDGResultsParser()
     parser.feed(body)
-    results = parser.results[:_MAX_RESULTS]
+    # Los anuncios van ANTES de los orgánicos: sin filtrarlos se comían los
+    # primeros huecos, el LLM leía un anuncio como "el primer resultado" y cada
+    # uno metía kilobyte y medio de URL de rastreo en el turno.
+    results = [item for item in parser.results if not _es_anuncio(item["url"])]
+    results = results[:_MAX_RESULTS]
     if not results:
+        if any(marca in body for marca in _DDG_CAPTCHA):
+            return (f"DuckDuckGo me frenó con un captcha anti-bots, patrón: no pude ver los "
+                    f"resultados de '{query}'. Si quieres te abro la búsqueda en el "
+                    f"navegador con search_web.")
         return f"No encontré resultados para '{query}', patrón."
 
     lines = [f"Resultados de la búsqueda '{query}':"]
@@ -175,7 +205,10 @@ def read_page(url: str) -> str:
     if mime and not (mime.startswith("text/") or mime in ("application/xhtml+xml",)):
         return f"Eso no es una página que pueda leer, patrón (es contenido tipo {mime})."
 
-    if mime == "text/plain":
+    # Solo el marcado pasa por el extractor, que se queda con lo que va dentro
+    # de <p>, <li>...: un text/markdown o un text/csv (texto sin etiquetas)
+    # salían enteros como "La página no tiene texto legible".
+    if mime not in _MARKUP_MIMES:
         text = "\n".join(" ".join(line.split()) for line in body.splitlines() if line.strip())
     else:
         # Con tope: de la página solo se conservan _MAX_PAGE_CHARS caracteres y

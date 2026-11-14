@@ -12,10 +12,10 @@ def _fake_playerctl(monkeypatch, metadata="Artista — Cancion\n", status="Playi
     imprime de él (con el "\\n" final real que imprime el binario)."""
     def fake_run(args):
         if "metadata" in args:
-            # music_now pide nombre, estado y pista en una sola línea
-            # (`-a metadata --format "{{playerName}}\t{{status}}\t..."`).
+            # music_now pide instancia, estado y pista en una sola línea
+            # (`-a metadata --format "{{playerInstance}}\t{{status}}\t..."`).
             formato = args[args.index("--format") + 1]
-            stdout = (formato.replace("{{playerName}}", "spotify")
+            stdout = (formato.replace("{{playerInstance}}", "spotify")
                       .replace("{{status}}", status.strip())
                       .replace("{{artist}} — {{title}}", metadata))
         else:

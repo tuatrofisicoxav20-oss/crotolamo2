@@ -44,13 +44,16 @@ _SIN_MINIATURAS = {"include_thumbnails": 0}
 _RECHAZOS = ("http_400", "http_422")
 
 
+def _alias() -> dict[str, Any]:
+    """La tabla [cameras.names] del toml; {} si falta o no es una tabla."""
+    names = get_settings().raw.get("cameras", {}).get("names", {})
+    return names if isinstance(names, dict) else {}
+
+
 def _resolve_camera(camera: str) -> str:
     """Alias amigable -> nombre real de Frigate; sin alias, el nombre va tal cual."""
-    names = get_settings().raw.get("cameras", {}).get("names", {})
-    if not isinstance(names, dict):
-        return camera.strip()
     key = normalize_key(camera)
-    for alias, real in names.items():
+    for alias, real in _alias().items():
         if normalize_key(alias) == key:
             return str(real)
     return camera.strip()
@@ -77,6 +80,72 @@ def _explica_fallo(error: str) -> str:
             "¿Andan vivas las cámaras?")
 
 
+def _camaras_de_frigate() -> set[str] | None:
+    """Los nombres de las cámaras de Frigate (las claves de "cameras" en
+    /api/config), o None si no se pudieron saber."""
+    ok, config = _frigate._frigate_get("/api/config")
+    camaras = config.get("cameras") if ok and isinstance(config, dict) else None
+    return {str(nombre) for nombre in camaras} if isinstance(camaras, dict) else None
+
+
+def _fichadas(reales: set[str], alias: dict[str, Any]) -> str:
+    """'entrada (front_door), patio': cada cámara con sus alias, si los tiene."""
+    partes = []
+    for real in sorted(reales):
+        suyos = [str(a) for a, r in alias.items() if str(r) == real]
+        partes.append(f"{'/'.join(suyos)} ({real})" if suyos else real)
+    return ", ".join(partes)
+
+
+def _camara_desconocida(camera: str, real: str) -> str | None:
+    """Con el filtro por cámara vacío: None si la cámara existe (y el vacío es
+    de verdad), o el mensaje para el patrón si no.
+
+    Frigate filtra por el nombre exacto y a uno que no existe le contesta []
+    igual que a una cámara tranquila. El LLM no ve [cameras.names] y adivina
+    ("puerta", "la entrada"), así que un nombre inventado salía como "ni un
+    alma" aunque la cámara de verdad tuviera gente: un falso "todo en orden"
+    en una tool de seguridad. La lista de cámaras se le pide a Frigate SOLO
+    aquí: el camino con eventos no paga la petición de más.
+    """
+    alias = _alias()
+    # Frigate parte el filtro por comas y compara exacto, sin quitar espacios.
+    pedidas = real.split(",")
+    camaras = _camaras_de_frigate()
+    if camaras is not None:
+        faltan = ", ".join(f"'{p}'" for p in pedidas if p not in camaras)
+        if not faltan:
+            return None
+        quien = faltan if real == camera.strip() else f"{faltan} (la que tengo para '{camera}')"
+        conocidas = _fichadas(camaras, alias)
+        lista = f" Las que tiene: {conocidas}." if conocidas else " No me reporta ninguna."
+        return f"Frigate no tiene ninguna cámara llamada {quien}, patrón.{lista}"
+    # Sin la lista de Frigate solo queda la tabla de alias: lo que está ahí se
+    # da por bueno. Lo demás puede ser una cámara sin alias (que va tal cual a
+    # propósito) o un invento: se dice la duda, no un "ni un alma".
+    en_tabla = {str(r) for r in alias.values()}
+    if all(p in en_tabla for p in pedidas):
+        return None
+    conocidas = _fichadas(en_tabla, alias)
+    lista = f" Las que tengo fichadas: {conocidas}." if conocidas else ""
+    return (f"Con el nombre '{camera}' no hay ningún evento, patrón, pero no sé si es una "
+            f"cámara: no la tengo fichada y Frigate no me dijo cuáles tiene.{lista}")
+
+
+def _cuando(start: float, hoy: tuple[int, ...]) -> str:
+    """'a las HH:MM' si `start` es de `hoy` (año, mes, día local); si no,
+    'el YYYY-MM-DD a las HH:MM'."""
+    local = time.localtime(start)
+    cuando = time.strftime("a las %H:%M", local)
+    # La ventana llega a una semana (_MAX_HOURS) y con solo la hora el evento
+    # de hoy y el de hace tres días se leían igual. El que no es de hoy lleva
+    # la fecha, en el mismo formato ISO del sello [ahora: ...] que ve el LLM,
+    # para que pueda compararlas.
+    if local[:3] != hoy:
+        cuando = time.strftime("el %Y-%m-%d ", local) + cuando
+    return cuando
+
+
 def _describe(event: dict[str, Any], hoy: tuple[int, ...]) -> str:
     """Una línea por evento. `hoy` es (año, mes, día) local de la consulta."""
     label = str(event.get("label", "algo"))
@@ -84,17 +153,7 @@ def _describe(event: dict[str, Any], hoy: tuple[int, ...]) -> str:
     camara = event.get("camera", "?")
     start = event.get("start_time")
     end = event.get("end_time")
-    if start:
-        local = time.localtime(start)
-        cuando = time.strftime("a las %H:%M", local)
-        # La ventana llega a una semana (_MAX_HOURS) y con solo la hora el
-        # evento de hoy y el de hace tres días se leían igual. El que no es de
-        # hoy lleva la fecha, en el mismo formato ISO del sello [ahora: ...]
-        # que ve el LLM, para que pueda compararlas.
-        if local[:3] != hoy:
-            cuando = time.strftime("el %Y-%m-%d ", local) + cuando
-    else:
-        cuando = "a las ??:??"
+    cuando = _cuando(start, hoy) if start else "a las ??:??"
     if start and end:
         duracion = f"{round(end - start)}s"
     else:
@@ -140,6 +199,9 @@ def camera_events(camera: str, hours: float = 6) -> str:
 
     donde = f"la cámara '{camera}'" if filtra else "las cámaras"
     if not data:
+        desconocida = _camara_desconocida(camera, params["camera"]) if filtra else None
+        if desconocida:
+            return desconocida
         return (f"Ni un alma, patrón: cero eventos en {donde} "
                 f"en las últimas {hours:g} horas.")
 
@@ -177,17 +239,22 @@ def camera_snapshot(camera: str) -> str:
     if not isinstance(data, list):
         return _explica_fallo("respuesta_rara")
     if not data:
-        return (f"La cámara '{camera}' no tiene ningún evento registrado, patrón. "
-                "No hay foto que enseñar.")
+        return _camara_desconocida(camera, real) or (
+            f"La cámara '{camera}' no tiene ningún evento registrado, patrón. "
+            "No hay foto que enseñar.")
 
     event = data[0]
     event_id = event.get("id")
     if not event_id:
         return _explica_fallo("respuesta_rara")
     label = _LABELS_ES.get(str(event.get("label", "")), str(event.get("label", "algo")))
+    # La consulta no lleva ventana: el "último" puede ser de hace días, y sin
+    # la hora el LLM lo contaba como de ahorita.
+    start = event.get("start_time")
+    cuando = f" {_cuando(start, time.localtime()[:3])}" if start else ""
     if event.get("has_snapshot") is False:
-        return (f"El último evento de la cámara '{camera}' fue de {label}, patrón, "
-                "pero Frigate no le guardó foto.")
+        return (f"El último evento de la cámara '{camera}' fue de {label}{cuando}, "
+                "patrón, pero Frigate no le guardó foto.")
     url = f"{_frigate.base_url()}/api/events/{event_id}/snapshot.jpg"
-    return (f"El último evento de la cámara '{camera}' fue de {label}, patrón. "
+    return (f"El último evento de la cámara '{camera}' fue de {label}{cuando}, patrón. "
             f"Aquí la foto: {url}")

@@ -23,6 +23,7 @@ Dentro de un server, las tools que la frase nombra van primero (`_named_first`).
 
 from __future__ import annotations
 
+import re
 import threading
 import unicodedata
 from typing import Any, Iterable
@@ -277,6 +278,12 @@ def _rotate_mcp_groups(ordered: list[_Scored]) -> None:
         ordered[pos] = entry
 
 
+# Frontera camelCase: minúscula/dígito -> mayúscula ("listIssues") y el final de
+# una sigla ("HTTPResponse" -> "HTTP Response"). Los nombres saneados del
+# bridge son [A-Za-z0-9_], así que basta ASCII.
+_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+
+
 def _named_first(tools: list[str], matched: list[str]) -> list[str]:
     """Las tools de un grupo MCP con las que la consulta NOMBRA primero.
 
@@ -293,7 +300,12 @@ def _named_first(tools: list[str], matched: list[str]) -> list[str]:
 
     def weight(name: str) -> int:
         spaced = _norm(name).replace("_", " ")  # "pull request" casa con pull_request
-        return sum(len(kw) for kw in matched if kw in spaced and _hits(spaced, kw))
+        # Muchos servers nombran en camelCase (listIssues): sin cortar ahí, "issues"
+        # no empieza palabra en "listissues" y la tool nombrada pesaba 0. Se SUMA a
+        # la forma de siempre (no la reemplaza): "listissues" tecleado sigue casando.
+        camel = _norm(_CAMEL_BOUNDARY.sub(" ", name)).replace("_", " ")
+        forms = (spaced, camel)
+        return sum(len(kw) for kw in matched if any(kw in f and _hits(f, kw) for f in forms))
 
     return sorted(tools, key=lambda name: -weight(name))
 

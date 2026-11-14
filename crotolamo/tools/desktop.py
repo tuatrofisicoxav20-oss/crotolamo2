@@ -84,6 +84,16 @@ def funny_line() -> str:
 _HTTP_SCHEME = re.compile(r"https?://", re.IGNORECASE)
 
 
+def _parece_dominio(text: str) -> bool:
+    """True si un texto SIN esquema es un sitio ("miblog.com", "reddit.com/r/x").
+
+    La regla es la de open_url (un punto y ningún espacio) y vive en un solo
+    sitio para que resolve_target no vuelva a discrepar: guardaba "miblog.com"
+    como búsqueda en Google y el atajo abría resultados en vez del sitio.
+    """
+    return "." in text and " " not in text
+
+
 def resolve_target(target: str) -> tuple[str, dict]:
     """Clasifica un destino genérico en (tipo, payload): url/app/folder/search.
 
@@ -107,6 +117,8 @@ def resolve_target(target: str) -> tuple[str, dict]:
         return "folder", {"value": key}
     if _HTTP_SCHEME.match(target):
         return "url", {"value": target}
+    if _parece_dominio(target):
+        return "url", {"value": "https://" + target}
     return "search", {"engine": "google", "query": target}
 
 
@@ -165,8 +177,12 @@ def run_detached(args: list[str]) -> None:
 
 
 # M3: el patrón usa Hyprland (Wayland), no GNOME. Detectamos el terminal instalado
-# en vez de asumir gnome-terminal. Orden: terminales de tiling primero.
-_TERMINALS = ("kitty", "foot", "alacritty", "wezterm", "gnome-terminal", "konsole", "xterm")
+# en vez de asumir gnome-terminal. Orden: terminales de tiling primero. ptyxis es
+# el de fábrica de Fedora desde la 41 (ya no trae gnome-terminal): sin él, en una
+# instalación limpia "abre terminal" y launch_project decían que no había ninguno.
+_TERMINALS = (
+    "kitty", "foot", "alacritty", "wezterm", "gnome-terminal", "ptyxis", "konsole", "xterm",
+)
 
 
 def _detect_terminal() -> list[str] | None:
@@ -220,9 +236,19 @@ def _config_apps() -> dict[str, list[str]]:
     apps: dict[str, list[str]] = {}
     for name, cmd in raw.items():
         if isinstance(cmd, str):
-            apps[normalize_key(name)] = cmd.split()
+            args = cmd.split()
         elif isinstance(cmd, list):
-            apps[normalize_key(name)] = [str(x) for x in cmd]
+            args = [str(x) for x in cmd]
+        else:
+            continue
+        # Una entrada vacía (terminal = "" o []) no es un comando: open_app la
+        # lanzaba tal cual, Popen([]) reventaba con IndexError (que no es
+        # OSError) y "abre terminal" moría aunque terminal_exec, con la MISMA
+        # config, caía a la autodetección. Vacía = como si no estuviera.
+        if not args:
+            log.debug("[apps].%s está vacía: la ignoro", name)
+            continue
+        apps[normalize_key(name)] = args
     return apps
 
 
@@ -331,7 +357,7 @@ def open_url(url: str) -> str:
         # recibe el lanzador no depende de que sepa leer "HTTPS://". La ruta y
         # la query sí distinguen mayúsculas y no se tocan.
         url = scheme.group().lower() + url[scheme.end():]
-    elif "." in url and " " not in url:
+    elif _parece_dominio(url):
         url = "https://" + url
     else:
         from urllib.parse import quote_plus
@@ -435,9 +461,17 @@ def send_hotkey(combo: str) -> str:
     try:
         subprocess.run(["ydotool", "key", *_HOTKEYS[key]], check=True,
                        capture_output=True, text=True, timeout=5)
-    except subprocess.CalledProcessError:
-        return ("Falló ydotool, patrón. ¿Está corriendo el demonio ydotoold? "
-                "(`systemctl --user start ydotoold`).")
-    except (OSError, subprocess.TimeoutExpired):
+    except subprocess.CalledProcessError as error:
+        # ydotool dice en su salida POR QUÉ falló (sin demonio, o un socket sin
+        # permiso cuando el demonio es de root): sin loguearla no quedaba nada
+        # con que distinguir un caso del otro.
+        salida = " ".join(f"{error.stdout or ''} {error.stderr or ''}".split())
+        log.warning("ydotool salió con %s: %s", error.returncode, salida or "(sin salida)")
+        # Sin `systemctl --user start ydotoold`: el paquete de Fedora no trae esa
+        # unidad de usuario, sino la de sistema ydotool.service.
+        return ("Falló ydotool, patrón. ¿Está corriendo el demonio ydotoold y puedo usar "
+                "su socket? En Fedora se arranca con `sudo systemctl enable --now ydotool`.")
+    except (OSError, subprocess.TimeoutExpired) as error:
+        log.warning("no pude ejecutar ydotool: %s", error)
         return "No pude enviar el atajo, patrón."
     return f"Envié {combo}, patrón."

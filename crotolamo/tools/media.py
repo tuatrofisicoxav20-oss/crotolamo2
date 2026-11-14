@@ -34,9 +34,14 @@ _ACTIONS: dict[str, list[str]] = {
 # está: es para lo que NO suena, y ahí decide playerctl como siempre.
 _SOBRE_LO_QUE_SUENA = frozenset({"pause", "play-pause", "next", "previous", "stop"})
 
-# Una línea por reproductor: nombre, estado y pista. Separa el tabulador, que
-# ni el nombre ni el estado llevan; la pista va al final por si lo trae.
-_LISTADO = "{{playerName}}\t{{status}}\t{{artist}} — {{title}}"
+# Una línea por reproductor: instancia, estado y pista. Separa el tabulador, que
+# ni la instancia ni el estado llevan; la pista va al final por si lo trae.
+# La INSTANCIA y no el nombre: `-p chromium` casa con toda "chromium.<algo>" y
+# playerctl manda la orden a la primera. Con dos navegadores Chromium (o una app
+# Electron), dos VLC o dos mpv, y el primero en pausa, `pause` caía en el ya
+# pausado, la música seguía y la tool decía "Pausado". La instancia solo casa
+# consigo misma; para Spotify y compañía es el propio nombre.
+_LISTADO = "{{playerInstance}}\t{{status}}\t{{artist}} — {{title}}"
 
 
 def _player_arg(player: str | None = "") -> list[str]:
@@ -52,7 +57,7 @@ def _run(args: list[str]) -> subprocess.CompletedProcess:
 
 
 def _players() -> list[tuple[str, str, str]]:
-    """(nombre, estado en minúsculas, "artista — título") de cada reproductor
+    """(instancia, estado en minúsculas, "artista — título") de cada reproductor
     con pista, en el orden de playerctl. Lanza lo mismo que `_run`.
 
     Vale lo que haya en stdout aunque la salida no sea 0: playerctl sale con 1
@@ -131,7 +136,7 @@ def music_control(action: str, player: str = "") -> str:
         selector = _player_arg(player)
         if not selector and _ACTIONS[key][0] in _SOBRE_LO_QUE_SUENA:
             # "vacío = el activo": se pregunta quién suena y se le manda a él,
-            # con su nombre tal cual (`-p` distingue mayúsculas). Si no suena
+            # con su instancia tal cual (`-p` distingue mayúsculas). Si no suena
             # nadie, sin `-p`: lo que elija playerctl, como siempre. Dentro del
             # mismo try: si esta pregunta ya se colgó, la orden no va a ir mejor.
             sonando = _playing(_players())

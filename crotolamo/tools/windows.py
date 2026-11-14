@@ -9,8 +9,10 @@ pide confirmación (`safe=False`).
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
+from pathlib import Path
 from typing import Any
 
 from crotolamo.logging_setup import get_logger
@@ -25,8 +27,70 @@ _MAX_TITLE = 60
 _MAX_DETALLE = 200
 
 
+def _dir_instancias() -> Path:
+    """Donde cada Hyprland deja su carpeta <firma>/: el mismo sitio que mira hyprctl."""
+    return Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}") / "hypr"
+
+
+def _arranque(carpeta: Path) -> float | None:
+    """Cuándo arrancó la instancia de `carpeta` (mtime de su socket); None si no está viva.
+
+    Al cerrarse, Hyprland borra su `.socket.sock`; si se cae, el socket queda
+    pero el PID de la primera línea de `hyprland.lock` ya no existe (el mismo
+    filtro que `hyprctl instances`).
+    """
+    try:
+        arranque = (carpeta / ".socket.sock").stat().st_mtime
+    except OSError:
+        return None
+    try:
+        pid = int((carpeta / "hyprland.lock").read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        return arranque  # sin lock legible no hay cómo saberlo: que lo intente hyprctl
+    if pid > 0:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return None
+        except OSError:
+            pass  # existe pero no deja mandarle señales: está vivo
+    return arranque
+
+
+def _firma_viva() -> str | None:
+    """Firma para `hyprctl -i`, o None si basta con la del entorno (o no hay otra).
+
+    crotolamo.service arranca con default.target, antes de que Hyprland exista,
+    y el proceso se queda para siempre con el entorno con el que nació: sin
+    HYPRLAND_INSTANCE_SIGNATURE, o con la de un Hyprland que ya se cerró. Con
+    eso las tools de ventanas fallaban tras CADA login hasta reiniciar el
+    servicio a mano, con la instancia viva ahí mismo, en su carpeta.
+    """
+    base = _dir_instancias()
+    del_entorno = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    if del_entorno and _arranque(base / del_entorno) is not None:
+        return None
+    vivas: list[tuple[float, str]] = []
+    try:
+        carpetas = list(base.iterdir())
+    except OSError:
+        return None
+    for carpeta in carpetas:
+        # Sin '_' hyprctl leería `-i <nombre>` como NÚMERO de instancia, no como
+        # firma; las firmas de Hyprland siempre lo llevan (<hash>_<hora>_<azar>).
+        arranque = _arranque(carpeta) if "_" in carpeta.name else None
+        if arranque is not None:
+            vivas.append((arranque, carpeta.name))
+    if not vivas:
+        return None  # que hyprctl dé su queja de siempre
+    firma = max(vivas)[1]
+    log.debug("hyprctl va a la instancia %s (en el entorno: %s)", firma, del_entorno)
+    return firma
+
+
 def _run(args: list[str]) -> subprocess.CompletedProcess:
-    return run_cmd(["hyprctl", *args], timeout=5)
+    firma = _firma_viva()
+    return run_cmd(["hyprctl", *(["-i", firma] if firma else []), *args], timeout=5)
 
 
 def _detalle(*salidas: str | None) -> str:
@@ -97,9 +161,26 @@ def _pgrep(name: str) -> bool:
     return result.returncode == 0
 
 
-def _workspace_id(client: dict[str, Any]) -> Any:
+def _workspace_id(client: dict[str, Any]) -> int | str:
+    """El workspace de una ventana tal como se le dice al patrón.
+
+    Los especiales (scratchpad) tienen id negativo: "workspace -98" no le dice
+    nada al patrón ni existe para ir a él; el nombre de Hyprland
+    ("special:magic") sí.
+    """
     ws = client.get("workspace") or {}
-    return ws.get("id", "?") if isinstance(ws, dict) else "?"
+    if not isinstance(ws, dict):
+        return "?"
+    wid = ws.get("id", "?")
+    if not isinstance(wid, int):
+        return str(wid)
+    nombre = ws.get("name")
+    return str(nombre) if wid < 0 and nombre else wid
+
+
+def _orden_ws(ws: int | str) -> tuple[int, str]:
+    """Clave para ordenar workspaces: los numerados por número, los demás detrás."""
+    return (ws, "") if isinstance(ws, int) else (10**9, ws)
 
 
 def _truncate(text: str, limit: int = _MAX_TITLE) -> str:
@@ -152,11 +233,8 @@ def list_windows() -> str:
         return clients or _NO_HYPRCTL
     if not clients:
         return "No hay ni una ventana abierta, patrón. Escritorio zen total."
-    def _sort_key(c: dict[str, Any]) -> tuple[int, str]:
-        ws = _workspace_id(c)
-        return (ws, "") if isinstance(ws, int) else (10**9, str(ws))
-
-    lines = [f"workspace {_workspace_id(c)}: {_label(c)}" for c in sorted(clients, key=_sort_key)]
+    ordenadas = sorted(clients, key=lambda c: _orden_ws(_workspace_id(c)))
+    lines = [f"workspace {_workspace_id(c)}: {_label(c)}" for c in ordenadas]
     plural = "ventanas abiertas" if len(lines) != 1 else "ventana abierta"
     return f"Tienes {len(lines)} {plural}, patrón:\n" + "\n".join(lines)
 
@@ -175,7 +253,8 @@ def app_status(name: str) -> str:
         return clients or _NO_HYPRCTL
     matches = _match(clients, name)
     if matches:
-        workspaces = sorted({str(_workspace_id(c)) for c in matches})
+        # Mismo orden que list_windows: como texto, el 10 iba antes que el 2.
+        workspaces = [str(ws) for ws in sorted({_workspace_id(c) for c in matches}, key=_orden_ws)]
         ws_txt = f"el workspace {workspaces[0]}" if len(workspaces) == 1 else (
             "los workspaces " + ", ".join(workspaces)
         )

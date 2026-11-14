@@ -10,6 +10,7 @@ import re
 from difflib import SequenceMatcher
 from pathlib import Path
 
+from crotolamo.core.memoria import _clave_recuerdo
 from crotolamo.persistence import db
 
 
@@ -27,7 +28,15 @@ def _score(query: str, texto: str) -> float:
 def remember(texto: str, categoria: str = "general", db_path: Path | None = None) -> int:
     # `or ""`: la categoría es opcional y el modelo la manda a veces como `null`;
     # con None.strip() la tool reventaba y el hecho no se guardaba.
-    return db.add_fact(texto.strip(), (categoria or "").strip() or "general", db_path=db_path)
+    # Sin copias: "acuérdate que uso Fedora" dos veces (o el modelo volviendo a
+    # guardar un hecho que ya ve anclado) dejaba dos filas que viajaban en CADA
+    # request, ocupaban huecos de la ventana de facts_context y "olvida lo de
+    # Fedora" borraba una y dejaba la otra viva. La clave es la de la memoria
+    # semántica (Memoria._ya_guardado, `memoria migrar`): lo que allí es el mismo
+    # recuerdo, aquí también.
+    return db.add_fact_unique(
+        texto.strip(), (categoria or "").strip() or "general", _clave_recuerdo, db_path=db_path
+    )
 
 
 def recall(categoria: str | None = None, db_path: Path | None = None) -> list[dict]:

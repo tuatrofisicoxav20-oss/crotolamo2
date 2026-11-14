@@ -6,6 +6,7 @@ Todo read-only y sin bash generado por el LLM: cada tool corre lecturas fijas
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -72,10 +73,31 @@ def list_processes(limit: int = 8) -> str:
     return "Procesos que más comen, patrón:\n" + "\n".join([header, *rows])
 
 
+def _carga() -> str | None:
+    """La carga media de 1, 5 y 15 minutos, con los núcleos para darle escala."""
+    try:
+        # Lee /proc/loadavg: sin subproceso.
+        uno, cinco, quince = os.getloadavg()
+    except OSError:
+        return None
+    nucleos = os.cpu_count()
+    escala = f", con {nucleos} núcleos" if nucleos else ""
+    return (
+        f"Carga: {uno:.2f} el último minuto, {cinco:.2f} en 5 y {quince:.2f} en 15"
+        f"{escala}, patrón."
+    )
+
+
 @tool(parallel_safe=True)
 def system_status() -> str:
     """Resumen del estado del sistema: disco, RAM y carga."""
+    # La carga la promete la descripción (es lo que ve el LLM, y las preguntas
+    # de CPU caen aquí) y la daba C1; sin ella "¿qué tan cargada está la
+    # compu?" se contestaba con disco y RAM.
     parts = [disk_usage(), ram_usage()]
+    carga = _carga()
+    if carga:
+        parts.append(carga)
     try:
         uptime = Path("/proc/uptime").read_text().split()[0]
         secs = float(uptime)

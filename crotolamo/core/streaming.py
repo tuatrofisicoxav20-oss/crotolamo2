@@ -126,6 +126,15 @@ class LiveStreamer:
             raise TurnCancelled()
 
     def _emit(self, text: str) -> None:
+        if (text and not text[0].isspace() and not self.released
+                and getattr(self._on_token, "released", False) is True):
+            # Lo primero que suelta ESTA llamada y otra del turno ya habló (el
+            # preámbulo que "sentence" soltó antes del tool-call; lo sabe el
+            # Emitter del turno): salía pegado, "ahora mismo.Traes", el TTS no
+            # cortaba ahí y espeak leía el punto como la palabra "punto". "\n"
+            # corta frase tras el signo y en el shell es un salto de línea,
+            # como los avisos de error del agente. Un espacio inicial ya basta.
+            text = "\n" + text
         if text:
             self.released = True
         self._on_token(text)
