@@ -40,8 +40,13 @@ if [[ "$ROOT" == *[\$\`\"\'\\]* || "$ROOT" == *$'\n'* ]]; then
 fi
 
 if [ ! -x "$VENV_PY" ]; then
+  # Con el índice CPU de PyTorch, como la CI: silero-vad (extra [voice]) declara torch
+  # y, solo con PyPI, pip baja la build CUDA (~3 GB de torch + nvidia-* + triton) que
+  # en esta lap sin GPU no corre nunca. Con el índice queda torch+cpu y ningún nvidia-*.
   echo "!! No encuentro el venv: $VENV_PY"
-  echo "   Créalo:  cd \"$ROOT\" && python3 -m venv .venv && .venv/bin/pip install -e '.[voice]'"
+  echo "   Créalo:  cd \"$ROOT\" && python3 -m venv .venv && \\"
+  echo "              .venv/bin/pip install -e '.[voice]' \\"
+  echo "              --extra-index-url https://download.pytorch.org/whl/cpu"
   exit 1
 fi
 

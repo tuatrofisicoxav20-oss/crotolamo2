@@ -79,7 +79,17 @@ segundo lleva sufijo `_2`, `_3`... La descripción es la del server, recortada a
 ~300 caracteres, con el sufijo ` [MCP: <server>]` para que el modelo sepa de
 dónde viene. El `inputSchema` se respeta tal cual (anidados,
 `additionalProperties`...), solo se garantiza `type: object` + `properties` y
-se quita `$schema`.
+se quitan `$schema` y un `required` que no sea lista. Eso mientras quepa en
+`MCP_SCHEMA_CAP` = 4000 bytes (medido como lo serializa el transporte): hasta
+ahí llega byte a byte igual. El esquema viaja en CADA request mientras la tool
+esté a la vista, así que pasado el tope se adelgaza: fuera `examples`, `title`,
+`default` y `$comment` en todos los niveles (documentan, no validan; una
+*propiedad* llamada `title` es un argumento y se queda) y, si aún no cabe, las
+descripciones ANIDADAS se recortan a 120 caracteres + `…` (la de arriba del
+todo no: explica la tool entera). Si ni así cabe, va como quede. `type`,
+`properties`, `required`, `enum`, `additionalProperties`... nunca se tocan, y
+una línea `INFO` del log da el tamaño antes y después (`MCP: esquema de <tool>
+adelgazado de X a Y bytes (tope 4000)`).
 
 Por eso las tools MCP llevan `Tool.strict_args = False`: el agente **no filtra**
 sus kwargs a los de primer nivel de `properties` (ese filtro existe para los

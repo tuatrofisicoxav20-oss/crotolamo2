@@ -52,6 +52,10 @@ Esta validación mide justamente ese modelo con TU voz y TU ruido real. Por eso:
   activación con su score pico, el máximo del ruido, latido cada 30 s y un
   resumen final ya en el formato de esta bitácora. `--threshold 0.6` prueba un
   candidato sin tocar la config. `--verbose` imprime todo frame con score ≥ 0.05.
+  Para calibrar el umbral que usa de verdad el loop CONCURRENTE (`use_oww = true`):
+  `python scripts/wake_debug.py --como-produccion` (chunks de 512 muestras por el
+  re-encuadre de `feed()`, como el oído de ese loop; en openwakeword 0.4 sus scores
+  difieren de los frames de 1280 que mide el modo por defecto).
   (Además, el listener acepta `CROTOLAMO_WAKE_DEBUG=1` para imprimir scores
   dentro del flujo real — útil en §5.)
 - **Harness de STT**: `python scripts/stt_harness.py record --n 10 --dir stt_bench`

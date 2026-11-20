@@ -137,6 +137,13 @@ class MouthThread(threading.Thread):
         self.q = tts_queue
         self.state = state
         self.shutdown = shutdown
+        # La firma se mira UNA vez: el TTS real acepta should_abort (V4); los de
+        # mentira y el protocolo TextToSpeech, solo speak(text): la de siempre.
+        self._speak_cortable = _acepta(getattr(tts, "speak", None), "should_abort")
+
+    def _abortada(self, turn: int) -> bool:
+        """should_abort de una frase: su turno ya no es el vigente."""
+        return not self.state.is_current(turn)
 
     def run(self) -> None:
         timeout = _get_timeout(self.shutdown)
@@ -160,8 +167,14 @@ class MouthThread(threading.Thread):
             # "hablando".
             if not self.state.set_mode_if_current(item.turn_id, Mode.SPEAKING):
                 continue
+            # El corte va atado al turno de la frase (V4): un stop() del barge-in
+            # que cae entre el check de arriba y la toma del turno de voz en
+            # speak() se perdía, y la frase del turno abortado sonaba ENTERA
+            # encima de la orden nueva (que el oído, ya escuchando, grababa).
+            cortar = ({"should_abort": partial(self._abortada, item.turn_id)}
+                      if self._speak_cortable else {})
             try:
-                self.tts.speak(item.text)  # interrumpible (M3.1)
+                self.tts.speak(item.text, **cortar)  # interrumpible (M3.1)
             except Exception as error:  # noqa: BLE001 - una frase rota no mata la boca
                 # Sin guarda, la excepción mataba al Mouth (V2): el resto de la
                 # respuesta no sonaba y el loop se quedaba en "hablando".

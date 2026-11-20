@@ -26,8 +26,12 @@ if [[ -x "$ROOT/.venv/bin/python" ]]; then
     PY="$ROOT/.venv/bin/python"
 else
     PY="python3"
+    # El índice CPU de PyTorch (el de la CI) evita que silero-vad arrastre la build CUDA
+    # de torch: ~3 GB de nvidia-*/triton que sin GPU no corren nunca.
     echo "⚠  No hay .venv; uso python3 del sistema."
-    echo "   Para un entorno aislado: python3 -m venv .venv && .venv/bin/pip install -e '.[dev,voice]'"
+    echo "   Para un entorno aislado: python3 -m venv .venv && \\"
+    echo "       .venv/bin/pip install -e '.[dev,voice]' \\"
+    echo "       --extra-index-url https://download.pytorch.org/whl/cpu"
     echo
 fi
 

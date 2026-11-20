@@ -646,7 +646,8 @@ def _run_simple_loop(
         Ese texto se tiraba igual (tras el wake se vuelve a mirar el flag), así
         que no cambia ninguna decisión. Publica la pausa como esa comprobación.
         Con sesión también decide si se sigue esperando el wake en ella (on_idle
-        del difuso, should_stop de openWakeWord)."""
+        del difuso, should_stop de openWakeWord). Y cierra la ventana de followup,
+        que es una orden sin wake."""
         if read_control_enabled():
             return True
         hud_state.set_enabled(False)
@@ -845,13 +846,24 @@ def _run_simple_loop(
 
                     if cfg.followup_s <= 0:
                         break
-                    # La ventana de followup es una orden nueva (sin wake): turno
-                    # nuevo y texto limpio, igual que tras un wake.
+                    # La ventana de followup es una orden nueva SIN wake, así que la
+                    # pausa del panel la bloquea como a un wake: el turno en curso
+                    # no se corta, pero no se abre otro. Sin esto, pausar mientras
+                    # Crotolamo pensaba o hablaba no paraba nada: la ventana se
+                    # abría, lo oído en el cuarto se ejecutaba y cada respuesta
+                    # abría otra (la pausa llegaba tras 6 s de silencio).
+                    if not escucha_activa():
+                        break
+                    # Turno nuevo y texto limpio, igual que tras un wake.
                     hud_state.new_turn(mode=Mode.LISTENING)
                     print("(sigo escuchando...)", flush=True)
                     command = wake.strip_wake_word(
                         listen_command(start_timeout_s=cfg.followup_s)
                     )
+                    # La pausa llegó con la ventana ya grabando: lo dicho en ella
+                    # tampoco se atiende (como el wake de la espera, ver arriba).
+                    if not escucha_activa():
+                        break
             finally:
                 if ducker is not None:
                     ducker.restore()

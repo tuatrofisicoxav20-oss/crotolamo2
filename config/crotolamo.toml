@@ -377,7 +377,9 @@ archivos      = ["nautilus"]
 [voice]
 # I3: 'base' es casi igual que 'small' en español y mucho más rápido en CPU.
 whisper_model      = "base"
-# Modelo barato solo para detectar la palabra de activación (wake).
+# Modelo barato solo para detectar la palabra de activación (wake). Solo se carga con
+# el wake DIFUSO: [wake].use_oww = false, o openWakeWord no disponible (no importa o
+# su modelo no carga). Con openWakeWord nadie lo usa y no ocupa RAM.
 wake_whisper_model = "tiny"
 piper_voice        = "es_MX-ald-medium.onnx"
 # Memoria de Piper (el arena de ONNX Runtime). Antes se quedaba, mientras viviera el
@@ -435,7 +437,9 @@ audio_session = false
 # 4... hasta 30 s) y avisa una vez por mensaje distinto. En una terminal no se rinde
 # nunca. 0 = no rendirse nunca, tampoco como servicio.
 mic_give_up_s = 90
-# VAD (M2, de GLaDOS): 'silero' (neuronal) o 'energy' (fallback sin modelo).
+# VAD (M2, de GLaDOS): 'silero' (neuronal) o 'energy' (fallback sin modelo). Solo el
+# loop simple; el concurrente (use_oww = true) usa Silero siempre (energía solo si
+# Silero no carga), así que con él cambiar esto no cambia nada.
 vad_backend          = "silero"
 vad_threshold        = 0.8
 # Histéresis del VAD (contra "se corta a media frase"). vad_threshold es el umbral
@@ -614,7 +618,8 @@ threshold = 0.72
 # abajo), NO con "crotolamo" (ese nombre solo lo busca el difuso). OJO:
 # varias claves de [voice] solo aplican al modo simple: ack, stream_speak (el
 # concurrente tiene la suya: stream_speak_concurrent), smart_endpoint/endpoint_*,
-# followup_s, wake_silence_ms/wake_max_seconds.
+# followup_s, wake_silence_ms/wake_max_seconds, vad_backend (el oído concurrente
+# usa Silero siempre).
 use_oww = true
 # M1: wake word dedicado con openWakeWord. 'crotolamo' no tiene modelo pre-entrenado,
 # así que se usa un modelo PUENTE soportado hasta entrenar uno propio.

@@ -15,6 +15,8 @@ Tres zonas por ruta (M6):
 
 from __future__ import annotations
 
+import json
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -154,8 +156,10 @@ def _is_relative(path: Path) -> bool:
 
 def _iter_strings(
     value: Any, key: str, depth: int = 0, too_deep: list[str] | None = None,
-) -> Iterator[tuple[str, str, int]]:
-    """Recorre un argumento (posiblemente anidado) y suelta (nombre, string, nivel).
+    top: str = "",
+) -> Iterator[tuple[str, str, int, str]]:
+    """Recorre un argumento (posiblemente anidado) y suelta (nombre, string,
+    nivel, argumento de primer nivel del que cuelga).
 
     Cada string lleva como "nombre" la clave del dict más cercano que lo contiene
     (los elementos de una lista heredan la clave de la lista): así una lista bajo
@@ -167,17 +171,154 @@ def _iter_strings(
         # También el vacío: bajo un nombre de ruta, "" es la carpeta base
         # (Path("") == "."), y saltárselo dejaba a list_dir(path="") listar el
         # CWD sin pasar por las zonas.
-        yield key, value, depth
+        yield key, value, depth, top
     elif depth >= _MAX_DEPTH:
         if too_deep is not None:
             too_deep.append(key)
         return
     elif isinstance(value, dict):
         for sub_key, sub_value in value.items():
-            yield from _iter_strings(sub_value, str(sub_key), depth + 1, too_deep)
+            yield from _iter_strings(
+                sub_value, str(sub_key), depth + 1, too_deep, top if depth else str(sub_key),
+            )
     elif isinstance(value, (list, tuple)):
         for item in value:
-            yield from _iter_strings(item, key, depth + 1, too_deep)
+            yield from _iter_strings(item, key, depth + 1, too_deep, top)
+
+
+# La pregunta de una tool destructiva dice QUÉ va a tocar (ver _destructive_question):
+# hasta 2 rutas, o hasta 3 argumentos de 60 caracteres. Es lo que se oye por
+# voz antes de decir "sí": lo justo para distinguir una nota de ~/.bashrc, la
+# ventana o el comando, sin leer en voz alta un documento entero.
+_SHOWN_TARGETS = 2
+_SHOWN_ARGS = 3
+_SHOWN_CHARS = 60
+# Una ruta se recorta por en medio y con más margen: el principio dice la zona
+# (~/...) y el final, el archivo; cortarle la cola escondería justo el nombre.
+_SHOWN_PATH_CHARS = 100
+
+# Controles C0 y DEL. En la pregunta van escapados ("\n"): un salto de línea en
+# un argumento partía lo que imprime el shell y podía esconder lo que sigue.
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _visible(text: str, limit: int, middle: bool = False) -> str:
+    """`text` legible en una sola línea y recortado a unos `limit` caracteres."""
+    text = _CONTROL_RE.sub(lambda m: repr(m.group())[1:-1], text)
+    if len(text) <= limit:
+        return text
+    if middle:
+        head = limit // 3
+        return text[:head] + "…" + text[len(text) - (limit - head - 1):]
+    return text[:limit] + "…"
+
+
+def _homes() -> list[Path]:
+    """El home tal cual y resuelto (en Silverblue /home es un enlace a
+    /var/home): una ruta se nombra con ~ si cae en cualquiera de los dos."""
+    try:
+        home = Path.home()
+        real = home.resolve()
+    except (OSError, RuntimeError, KeyError, ValueError):
+        return []
+    return [home] if real == home else [home, real]
+
+
+def _with_tilde(path: Path, homes: list[Path]) -> str:
+    for home in homes:
+        try:
+            rel = path.relative_to(home)
+        except ValueError:
+            continue
+        return f"~/{rel}" if rel.parts else "~"
+    return str(path)
+
+
+def _target_name(candidate: Path, outside: bool, homes: list[Path]) -> str:
+    """Cómo se nombra una ruta en la pregunta de una tool destructiva.
+
+    Se nombra la que de verdad se toca, con enlaces y '..' resueltos (la misma
+    que clasificó path_inside_roots): "~/Documentos/../.bashrc" es ~/.bashrc.
+    Si la escrita apunta a otro sitio por un enlace, van las dos: write_file
+    escribe en el destino y delete_file/move_file quitan o mueven el enlace, y
+    "~/Documentos/link" a secas sonaría a zona libre aunque lleve a ~/.ssh.
+    """
+    notes = ["fuera de la zona libre"] if outside else []
+    try:
+        expanded = candidate.expanduser()
+        written = _with_tilde(Path(os.path.abspath(expanded)), homes)
+        real = _with_tilde(expanded.resolve(), homes)
+    except (OSError, RuntimeError, ValueError):
+        written = real = str(candidate)
+    if written != real:
+        notes.insert(0, f"que apunta a '{_visible(real, _SHOWN_PATH_CHARS, middle=True)}'")
+    name = f"'{_visible(written, _SHOWN_PATH_CHARS, middle=True)}'"
+    return name + (f" ({', '.join(notes)})" if notes else "")
+
+
+def _argument_summary(arguments: dict, skip: set[str], with_text: bool) -> str:
+    """Los argumentos que no se nombraron como ruta, recortados: "name=opera",
+    "command=rm -rf ...". El texto libre (content= de write_file) no se lee:
+    es lo que se escribe, no dónde. Solo si no hay otra cosa que decir
+    (`with_text`, sin rutas ni otros argumentos) se lee también: la consulta de
+    una tool MCP de SQL va en query="DROP TABLE ...", y callarla dejaba la
+    pregunta otra vez a ciegas."""
+    if not isinstance(arguments, dict):
+        return ""
+    items = [(str(k), v) for k, v in arguments.items() if str(k) not in skip]
+    shown = [(k, v) for k, v in items if k.lower() not in _CONTENT_ARG_NAMES]
+    if not shown and with_text:
+        shown = items
+    parts = []
+    for key, value in shown[:_SHOWN_ARGS]:
+        if isinstance(value, str):
+            text = value
+        else:
+            try:
+                text = json.dumps(value, ensure_ascii=False, default=str)
+            except (TypeError, ValueError):
+                text = str(value)
+        parts.append(f"{_visible(key, _SHOWN_CHARS)}={_visible(text, _SHOWN_CHARS)}")
+    if len(shown) > _SHOWN_ARGS:
+        parts.append("…")
+    return ", ".join(parts)
+
+
+def _destructive_question(
+    tool_name: str, arguments: dict, targets: list[tuple[Path, bool]],
+    named: set[str], too_deep: list[str],
+) -> str:
+    """La pregunta de una tool no-safe: la acción, sobre qué rutas (las de
+    fuera de la zona libre primero, marcadas) y con qué argumentos.
+
+    Era una sola frase para todo ("La acción 'write_file' puede ser
+    destructiva"), y es lo único que oye, lee o se le avisa al patrón antes de
+    decidir: una nota de ~/Documentos y ~/.bashrc pedían el mismo "sí".
+    """
+    # Una ruta repetida (dos formas del mismo valor, la misma en dos
+    # argumentos) se nombra una vez; las de fuera de la zona libre, delante.
+    unique: dict[str, tuple[Path, bool]] = {}
+    for candidate, outside in targets:
+        unique.setdefault(str(candidate), (candidate, outside))
+    ordered = sorted(unique.values(), key=lambda t: not t[1])
+    homes = _homes() if ordered else []
+    names = [_target_name(c, outside, homes) for c, outside in ordered[:_SHOWN_TARGETS]]
+    if len(ordered) > _SHOWN_TARGETS:
+        names.append(f"{len(ordered) - _SHOWN_TARGETS} más")
+    sobre = ""
+    if names:
+        sobre = " sobre " + (
+            names[0] if len(names) == 1 else ", ".join(names[:-1]) + " y " + names[-1]
+        )
+    summary = _argument_summary(arguments, named, with_text=not ordered)
+    con = f" con {summary}" if summary else ""
+    ojo = ""
+    if too_deep:
+        ojo = (
+            f" Ojo: hay argumentos anidados más de {_MAX_DEPTH} niveles "
+            f"({_visible(too_deep[0] or 'raíz', _SHOWN_CHARS)}) que no puedo revisar."
+        )
+    return f"La acción '{tool_name}'{sobre}{con} puede ser destructiva, patrón.{ojo} ¿La confirmo?"
 
 
 @dataclass
@@ -242,6 +383,11 @@ class Guard:
         #    {"ruta": "/etc/passwd"}} merece el mismo corral que una de primer nivel.
         confirm_reason = ""
         too_deep: list[str] = []
+        # Lo que la llamada toca (ruta, ¿fuera de la zona libre?) y los
+        # argumentos de primer nivel de los que sale: la pregunta de una tool
+        # destructiva nombra lo primero y resume el resto (paso 2).
+        targets: list[tuple[Path, bool]] = []
+        named: set[str] = set()
         # Una ruta relativa se clasifica donde la va a abrir quien la recibe
         # (T10). Un server MCP (strict_args=False) la resuelve contra su
         # directorio de trabajo: el `cwd` de su config si lo tiene (el bridge
@@ -255,7 +401,7 @@ class Guard:
         native = getattr(tool, "strict_args", True)
         server_cwd = None if native else getattr(tool, "path_base", None)
         server_base = Path(server_cwd) if server_cwd else None
-        for arg_name, value, depth in _iter_strings(arguments, "", 0, too_deep):
+        for arg_name, value, depth, top in _iter_strings(arguments, "", 0, too_deep):
             name = arg_name.lower()
             # La exención de contenido solo aplica al argumento de PRIMER nivel
             # (content="..." de write_file): un string escondido en una lista o
@@ -287,9 +433,12 @@ class Guard:
                     # nombra) la que él va a abrir.
                     candidate = server_base / candidate
                     shown = str(candidate)
+                named.add(top)
                 if self._path_inside_allowed(candidate):
+                    targets.append((candidate, False))
                     continue
                 if self._path_inside_confirm(candidate):
+                    targets.append((candidate, True))
                     if not confirm_reason:
                         confirm_reason = f"fuera de la zona libre: {shown}. ¿Lo hago?"
                     continue
@@ -308,10 +457,13 @@ class Guard:
             )
 
         # 2) Tools marcadas como no-safe piden confirmación explícita SIEMPRE,
-        #    sin importar en qué zona caigan sus rutas.
+        #    sin importar en qué zona caigan sus rutas. La pregunta nombra lo que
+        #    tocan y lleva el aviso de zona (o el de anidado) que el paso 1 ya
+        #    sabía: con una frase genérica, el "sí" a una nota valía igual para
+        #    pisar ~/.bashrc o sacar la llave de ~/.ssh a la zona libre.
         if not tool.safe:
             return Decision.confirm(
-                f"La acción '{tool.name}' puede ser destructiva, patrón. ¿La confirmo?"
+                _destructive_question(tool.name, arguments, targets, named, too_deep)
             )
 
         # 3) Rutas en la zona de confirmación: se puede, pero preguntando.

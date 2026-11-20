@@ -16,7 +16,11 @@ authors = [{ name = "Emiliano / Caos Orbital" }]
 dependencies = []
 
 [project.optional-dependencies]
-# Voz (Fase 5). Se instala con: pip install -e ".[voice]"
+# Voz (Fase 5). Se instala con el índice CPU de PyTorch, igual que en la CI:
+#   pip install -e ".[voice]" --extra-index-url https://download.pytorch.org/whl/cpu
+# silero-vad declara torch como dependencia dura y, solo con PyPI, pip resuelve la
+# build CUDA (~3 GB de torch + nvidia-* + triton) que en la lap sin GPU no corre
+# nunca; con el índice queda torch+cpu. El camino normal ni importa torch (abajo).
 # crotolamo/voice/runtime.py carga los modelos sin los wrappers del vendor y se apoya
 # en detalles internos de estos paquetes; si una versión los cambia, cae SOLA al
 # camino de siempre (más RAM, mismo resultado):

@@ -85,7 +85,7 @@ def _entry(path: str) -> Path:
     cual, sin seguirlo si es un enlace simbólico.
 
     Borrar y mover actúan sobre lo que nombró el patrón. Con _resolve, "borra el
-    acceso directo" borraba el archivo al que apuntaba (el guard pregunta sin
+    acceso directo" borraba el archivo al que apuntaba (el guard preguntaba sin
     decir ruta) y dejaba el enlace roto, que luego ya no se podía borrar ("No
     existe"); mover un enlace se llevaba el archivo real. unlink() y rename() no
     siguen el último nombre y la carpeta va resuelta una sola vez, igual que en
