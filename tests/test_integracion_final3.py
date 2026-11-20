@@ -188,7 +188,12 @@ def entrada(prompt=""):
         return next(entradas)
     except StopIteration:
         print("en el prompt", flush=True)
-        time.sleep(60)  # el patrón no escribe nada más: cierra la ventana
+        # El patrón no escribe nada más: cierra la ventana. En tramos y no un
+        # sleep(60): la señal que llega entre el último chequeo del intérprete y la
+        # syscall del sleep la apunta el manejador C, pero el sleep ya no despierta
+        # y el test agotaba sus 20 s (mismo hueco que signal.pause()).
+        for _ in range(1200):
+            time.sleep(0.05)
 
 
 builtins.input = entrada

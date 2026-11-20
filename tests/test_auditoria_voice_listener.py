@@ -649,7 +649,7 @@ def test_idle_final_tiene_el_mismo_esquema_que_las_publicaciones(tmp_path, monke
 # Hijo real con los manejadores de verdad: un ducker falso deja constancia de la
 # restauración y la compuerta del HUD arranca en "speaking" (a media respuesta).
 _HIJO_SENALES = r"""
-import signal, sys
+import signal, sys, time
 from pathlib import Path
 from interfaces import listener
 
@@ -672,7 +672,11 @@ gate.publish({"mode": "speaking", "turn_id": 3, "text": "", "enabled": True,
 listener._ACTIVE_HUD_GATE = gate
 listener._install_signal_handlers()
 print("listo", flush=True)
-signal.pause()
+# En tramos y no signal.pause(): la señal que llega entre el último chequeo del
+# intérprete y la syscall pause() la apunta el manejador C, pero pause() ya no
+# despierta (1 de 3000 bajo carga: el hijo no salía y el test agotaba sus 15 s).
+while True:
+    time.sleep(0.05)
 """
 
 

@@ -73,7 +73,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if command == "shell":
         from interfaces.shell import run_shell
-        return run_shell(rest)
+        # proceso_entero: al volver, este proceso sale; lo que queda de la salida
+        # (atexit) sigue bajo los manejadores de señal del shell (ver run_shell).
+        return run_shell(rest, proceso_entero=True)
 
     if command == "doctor":
         run_doctor = _cargar_doctor()

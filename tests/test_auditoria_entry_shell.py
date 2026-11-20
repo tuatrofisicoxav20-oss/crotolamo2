@@ -377,6 +377,7 @@ def test_shell_como_script_respeta_sus_argumentos_y_configura_el_logging(
     INFO ("motor: ...") se perdían y los WARNING salían sin formato."""
     import builtins
     import runpy
+    import signal
     from pathlib import Path
 
     from crotolamo.core import engine, hooks
@@ -412,8 +413,17 @@ def test_shell_como_script_respeta_sus_argumentos_y_configura_el_logging(
     monkeypatch.setattr(builtins, "input", lambda prompt="": next(entradas))
 
     script = Path(__file__).resolve().parents[1] / "interfaces" / "shell.py"
-    with pytest.raises(SystemExit) as fin:
-        runpy.run_path(str(script), run_name="__main__")
+    # El script es el proceso entero: al volver run_shell deja puestos sus manejadores
+    # de SIGTERM/SIGHUP para lo que falta de salida (atexit). Aquí corre DENTRO de
+    # pytest, que sigue: se le devuelven los suyos.
+    senales = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP)}
+    try:
+        with pytest.raises(SystemExit) as fin:
+            runpy.run_path(str(script), run_name="__main__")
+    finally:
+        for sig, previo in senales.items():
+            if signal.getsignal(sig) is not previo:
+                signal.signal(sig, previo)
     assert fin.value.code == 0
     out = capsys.readouterr().out
     assert "Crotolamo Shell (streaming)." in out

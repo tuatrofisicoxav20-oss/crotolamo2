@@ -349,13 +349,24 @@ class StdioMCPClient:
         # Un escritor atascado (server que no lee) retiene stdin hasta su plazo:
         # sin EOF posible, directos al SIGTERM; al morir el server el escritor
         # ve EPIPE y suelta stdin, que se cierra al final.
-        stdin_closed = self._close_stdin(_EOF_GRACE_S)
-        # Antes el SIGTERM salía microsegundos después del EOF: la limpieza
-        # que la spec le deja hacer al server moría a medias en cada cierre.
-        if not (stdin_closed and self._wait_exit(proc, _EOF_GRACE_S)):
-            if not self._stop_process(proc, signal.SIGTERM, timeout=SIGTERM_GRACE_S):
-                log.debug("MCP '%s': no terminó con SIGTERM; SIGKILL", self.name)
-                self._stop_process(proc, signal.SIGKILL, timeout=2.0)
+        try:
+            stdin_closed = self._close_stdin(_EOF_GRACE_S)
+            # Antes el SIGTERM salía microsegundos después del EOF: la limpieza
+            # que la spec le deja hacer al server moría a medias en cada cierre.
+            if not (stdin_closed and self._wait_exit(proc, _EOF_GRACE_S)):
+                if not self._stop_process(proc, signal.SIGTERM, timeout=SIGTERM_GRACE_S):
+                    log.debug("MCP '%s': no terminó con SIGTERM; SIGKILL", self.name)
+                    self._stop_process(proc, signal.SIGKILL, timeout=2.0)
+        except BaseException:
+            # Ctrl-C o SystemExit (el SIGTERM/SIGHUP del shell) A MEDIO cierre: este
+            # close() ya no se puede repetir (_closed) y quien lo llamó suelta al
+            # cliente (_retire, _abandon), así que close_all(), en atexit, no lo ve.
+            # El server (colgado: por eso se le retiraba) sobrevivía a Crotolamo sin
+            # que hubiera salido ni el SIGTERM. Quien corta se va: SIGKILL al grupo,
+            # sin esperar, con el mismo criterio que _stop_process.
+            if proc.poll() is None or any(t.is_alive() for t in self._pipe_threads()):
+                self._signal_group(proc, signal.SIGKILL)
+            raise
         if not stdin_closed:
             self._close_stdin(_EOF_GRACE_S)
         for thread, pipe in ((self._reader, proc.stdout), (self._stderr_thread, proc.stderr)):

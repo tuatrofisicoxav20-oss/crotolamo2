@@ -419,7 +419,7 @@ def _terminal_colgada() -> bool:
     return False
 
 
-def run_shell(argv: list[str] | None = None) -> int:
+def run_shell(argv: list[str] | None = None, *, proceso_entero: bool = False) -> int:
     # SIGTERM y SIGHUP -> SystemExit, la salida normal del intérprete. Su acción
     # por defecto mataba el proceso en el acto, sin atexit: la extracción del turno
     # recién dicho se cortaba a medias y un server MCP que no sale al ver el EOF
@@ -447,7 +447,13 @@ def run_shell(argv: list[str] | None = None) -> int:
         # sino el fin de la entrada: sale por su camino de EOF (y el "apagado" ya
         # no se puede escribir: EIO). El SIGHUP viene detrás, cuando muere el líder
         # de la sesión (el bash de launch.sh): se da por llegado.
-        if previos and not senal and _terminal_colgada():
+        # proceso_entero: quien llama sale del proceso nada más volver (python -m
+        # crotolamo shell, este archivo como script). La salida NO ha terminado al
+        # volver: el vaciado de la Memoria (hasta 5 s) y el cierre de los servers
+        # MCP corren después, en atexit, con "Crotolamo apagado, patrón." ya en
+        # pantalla, que es justo cuando el patrón cierra la ventana. Igual: se da
+        # la señal por llegada y los manejadores se quedan para lo que falta.
+        if previos and not senal and (proceso_entero or _terminal_colgada()):
             senal.append(signal.SIGHUP)
         # Al volver (o si el shell revienta), los de antes: quien llama run_shell
         # dentro de su proceso (los tests) no se queda con los nuestros. Tras una
@@ -521,4 +527,6 @@ if __name__ == "__main__":
     # crotolamo.__main__: run_shell() a secas ignoraba --stream, y sin
     # setup_logging los INFO se perdían y los WARNING salían sin formato.
     setup_logging()
-    raise SystemExit(run_shell(sys.argv[1:]))
+    # proceso_entero: al volver run_shell este proceso sale, y la salida (atexit)
+    # sigue bajo los manejadores del shell (ver run_shell).
+    raise SystemExit(run_shell(sys.argv[1:], proceso_entero=True))
