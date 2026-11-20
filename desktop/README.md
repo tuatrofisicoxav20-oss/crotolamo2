@@ -55,6 +55,16 @@ voz en `voices/` (lo normal del proyecto). Si el repo no está en
 `config/crotolamo.local.toml`. Para cambiar algo de un servicio sin que el
 instalador lo pise: `systemctl --user edit crotolamo.service`.
 
+Si falta el `.venv`, el instalador no instala nada y te imprime el comando para
+crearlo. Lleva el índice CPU de PyTorch, igual que el README principal y la CI:
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -e '.[voice]' --extra-index-url https://download.pytorch.org/whl/cpu
+```
+
+Sin ese índice, silero-vad (viene en la extra) arrastra la build CUDA de torch:
+~3 GB entre torch, nvidia-* y triton que una lap sin GPU no usa nunca.
+
 ## Uso
 
 - Abre **«Crotolamo»** desde Actividades, o:

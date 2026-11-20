@@ -158,9 +158,13 @@ class _SileroVad:
             arr = self._np.ascontiguousarray(chunk, dtype=self._np.float32)
             return float(self._model(arr, self.sample_rate))
         except (ImportError, ModuleNotFoundError) as exc:
+            # La pista no nombra torch y da el índice CPU de PyTorch (el de la CI):
+            # silero-vad ya lo declara y, solo con PyPI, pip baja la build CUDA
+            # (~3 GB) que una lap sin GPU no usa; aquí ni se importa (ver arriba).
             log.warning(
                 "silero-vad no disponible (%s); cayendo a VAD por energía. "
-                "Para mejor VAD: pip install silero-vad torch",
+                "Para mejor VAD: pip install silero-vad "
+                "--extra-index-url https://download.pytorch.org/whl/cpu",
                 exc,
             )
             self._fallback = True

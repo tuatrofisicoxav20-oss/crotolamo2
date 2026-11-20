@@ -843,9 +843,14 @@ def _silero_error() -> str | None:
 def _check_silero(ctx: _Ctx) -> list[Check]:
     error = _silero_error()
     if error:
+        # Sin `torch` en la pista y con el índice CPU de PyTorch (el de la CI y el
+        # de install.sh): silero-vad ya declara torch y, solo con PyPI, pip baja la
+        # build CUDA (~3 GB de nvidia-*/triton) que una lap sin GPU no usa nunca.
         return [Check("voz-silero", False,
                       "falta silero-vad (el modo concurrente usará VAD por energía como fallback)",
-                      "pip install silero-vad torch  (opcional, mejora la detección de voz)")]
+                      "pip install silero-vad --extra-index-url "
+                      "https://download.pytorch.org/whl/cpu"
+                      "  (opcional, mejora la detección de voz)")]
     return [Check("voz-silero", True, "silero-vad importable (VAD neuronal activo)")]
 
 

@@ -586,10 +586,11 @@ def _run_simple_loop(
     hablando, la guarda tras responder, la pausa del panel) se tira o se cierra.
 
     on_wake (el WakePreconnect del agente, ver _listen_with_warmer): se llama con
-    la 1ª voz de la orden que viene DETRÁS de un wake aceptado (no pegada al wake,
-    ni en la ventana de followup): el motor pre-conecta mientras el patrón la
-    dice. Un falso wake (el wake y silencio) no avisa. Debe volver al instante; su
-    dueño es quien lo pasa. None = nada, lo de siempre.
+    la 1ª voz de cada orden que se GRABA aparte: la que viene detrás de un wake
+    aceptado (no la pegada al wake) y la de cada ventana de followup. El motor
+    pre-conecta mientras el patrón la dice. Un falso wake (el wake y silencio) o
+    una ventana de followup que acaba en silencio no avisan. Debe volver al
+    instante; su dueño es quien lo pasa. None = nada, lo de siempre.
     """
     # Sin sesión, las grabaciones reciben exactamente los argumentos de siempre.
     fuente: dict[str, Any] = {} if mic is None else {"source": mic}
@@ -597,6 +598,7 @@ def _run_simple_loop(
     # sale con su 1ª voz: antes salía con el wake y cada falso wake abría con la
     # nube una conexión (TCP+TLS, vivo 30 s) que ninguna petición usaba. Mismo
     # criterio que el oído concurrente (EarThread). Sin aviso, nada cambia.
+    # Lo llevan la orden tras el wake y la de cada ventana de followup.
     voz_de_la_orden: dict[str, Any] = {} if on_wake is None else {
         "on_voice": partial(_avisar_wake, on_wake)}
 
@@ -610,7 +612,7 @@ def _run_simple_loop(
                        **aviso: Any) -> str:
         # min_audio_s: si nadie habló, NO se transcribe el silencio (Whisper
         # paddea a 30s; eso costaba ~1s de mic sordo por ventana vacía).
-        # aviso: voz_de_la_orden, solo en la orden tras el wake.
+        # aviso: voz_de_la_orden (la orden tras el wake y la del followup).
         if cfg.smart_endpoint:
             return stt.listen_smart(
                 silence_ms=cfg.silence_ms, start_timeout_s=start_timeout_s,
@@ -857,8 +859,16 @@ def _run_simple_loop(
                     # Turno nuevo y texto limpio, igual que tras un wake.
                     hud_state.new_turn(mode=Mode.LISTENING)
                     print("(sigo escuchando...)", flush=True)
+                    # El followup también pre-conecta con su 1ª voz. El keep-alive
+                    # de un stream solo se reutiliza 15 s tras su fin
+                    # (HTTPTransport._REUSE_MAX_IDLE_S) y con stream_release="final"
+                    # la respuesta entera se habla después: una de 8-13 s más esta
+                    # orden pasan de 15 s y el handshake con la nube se pagaba
+                    # dentro del turno. Precio: un handshake en segundo plano por
+                    # followup aunque el keep-alive siguiera valiendo, el mismo que
+                    # tras un wake. La ventana que acaba en silencio no abre nada.
                     command = wake.strip_wake_word(
-                        listen_command(start_timeout_s=cfg.followup_s)
+                        listen_command(start_timeout_s=cfg.followup_s, **voz_de_la_orden)
                     )
                     # La pausa llegó con la ventana ya grabando: lo dicho en ella
                     # tampoco se atiende (como el wake de la espera, ver arriba).

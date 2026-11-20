@@ -1573,7 +1573,8 @@ _OWW_FALTA = ("voz-oww", False,
 _SILERO_OK = ("voz-silero", True, "silero-vad importable (VAD neuronal activo)", "")
 _SILERO_FALTA = ("voz-silero", False,
                  "falta silero-vad (el modo concurrente usará VAD por energía como fallback)",
-                 "pip install silero-vad torch  (opcional, mejora la detección de voz)")
+                 "pip install silero-vad --extra-index-url https://download.pytorch.org/whl/cpu"
+                 "  (opcional, mejora la detección de voz)")
 
 
 def _resumen(checks) -> tuple:

@@ -35,8 +35,9 @@ Pasos 7-8 (parte A, el núcleo):
 Pasos 7-8 (parte B, el cableado de la voz):
 - El aviso del wake (WakePreconnect): el oído del loop concurrente avisa con la 1ª
   voz de cada orden (un falso wake sin voz no pre-conecta; el barge-in ya trae voz)
-  y el loop simple con la 1ª voz de la orden que viene detrás del wake (on_voice de
-  la grabación del STT); el motor pre-conecta mientras el patrón habla. Misma petición, misma respuesta, cero handshakes en el
+  y el loop simple con la 1ª voz de la orden que viene detrás del wake y con la de
+  cada ventana de followup (on_voice de la grabación del STT); el motor pre-conecta
+  mientras el patrón habla. Misma petición, misma respuesta, cero handshakes en el
   turno; un preconnect que falla o se cuelga no toca el turno.
 - [voice].barge_in_cancel (con --barge-in; apagada de fábrica): el BrainThread le da
   al agente un should_abort que sigue al turno; el turno interrumpido no hace ni una
@@ -1576,7 +1577,8 @@ def test_voz_un_falso_wake_no_preconecta_y_la_orden_sigue_sin_handshake(servidor
     assert (srv.peticiones, srv.conexiones) == (["/api/paas/v4/chat/completions"], 1)
 
 
-# El loop simple: el aviso va con la 1ª voz de la orden que viene DETRÁS del wake.
+# El loop simple: el aviso va con la 1ª voz de la orden que viene DETRÁS del wake
+# (y con la de cada ventana de followup, que es otra orden grabada aparte).
 
 class _OrdenQueAnota:
     """La orden (grabación y Whisper): anota cuándo se escucha y, como el STT real,
@@ -1663,8 +1665,12 @@ def test_loop_simple_preconecta_con_la_primera_voz_de_la_orden(monkeypatch, use_
 
 
 def test_loop_simple_el_aviso_solo_viaja_con_la_orden_tras_el_wake(monkeypatch):
-    """Un falso wake (orden vacía) no avisa; la ventana de followup no lleva el
-    aviso (no hubo wake); sin aviso, el STT recibe los argumentos de siempre."""
+    """El aviso viaja con cada grabación de una orden (la que sigue al wake y la de
+    cada ventana de followup) y solo sale con su 1ª voz: un falso wake (orden
+    vacía) y un followup que ya no dice nada no avisan. Antes el followup no lo
+    llevaba y, pasados los 15 s del keep-alive, su turno pagaba el handshake (ver
+    test_integracion_auditoria.py). Sin aviso, el STT recibe los argumentos de
+    siempre."""
     from types import SimpleNamespace
 
     from interfaces import listener
@@ -1679,17 +1685,19 @@ def test_loop_simple_el_aviso_solo_viaja_con_la_orden_tras_el_wake(monkeypatch):
         for con_aviso in (True, False):
             avisos: list[str] = []
             eventos: list[str] = []
-            # Falso wake; luego wake, orden y un followup que ya no dice nada.
-            stt = _OrdenQueAnota(eventos, oido=["", _ORDEN, ""])
+            # Falso wake; luego wake, orden, un followup con otra orden y uno que
+            # ya no dice nada.
+            stt = _OrdenQueAnota(eventos, oido=["", _ORDEN, "y ahora pausa", ""])
             wake = _WakeDeGuion(["wake", "wake"])
             extra = {"on_wake": lambda: avisos.append("aviso")} if con_aviso else {}
             assert listener._run_simple_loop(
                 agent=_FakeAgent(), stt=stt, wake_stt=wake, tts=_FakeTts(),
                 wake_detector=wake, use_oww=True, cfg=cfg, hud_state=SharedState(),
                 say=lambda texto: None, **extra) == 0
-            assert eventos == ["orden"] * 3
-            assert stt.avisos == [con_aviso, con_aviso, False], (smart, con_aviso)
-            assert avisos == (["aviso"] if con_aviso else [])
+            assert eventos == ["orden"] * 4
+            assert stt.avisos == [con_aviso] * 4, (smart, con_aviso)
+            # Uno por orden con voz (la del wake y la del followup), ni uno más.
+            assert avisos == (["aviso"] * 2 if con_aviso else [])
 
 
 def test_loop_simple_el_wake_preconecta_y_el_turno_hace_la_misma_peticion(servidor,

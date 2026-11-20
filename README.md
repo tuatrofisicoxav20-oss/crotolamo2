@@ -129,8 +129,11 @@ python -m crotolamo shell       # REPL de texto
 python -m crotolamo listen      # bucle de voz wake-word (requiere extra [voice])
 ```
 
-Para la voz: `pip install -e ".[voice]"` (faster-whisper, sounddevice, piper-tts) y
-un modelo Piper `.onnx` en `[paths].voces`.
+Para la voz: `pip install -e ".[voice]" --extra-index-url https://download.pytorch.org/whl/cpu`
+(faster-whisper, sounddevice, piper-tts) y un modelo Piper `.onnx` en `[paths].voces`.
+El índice es el de PyTorch para CPU, el mismo de la CI: silero-vad (viene en la extra)
+declara torch y, solo con PyPI, pip baja la build CUDA (~3 GB entre torch, nvidia-* y
+triton) que una lap sin GPU no usa nunca; con el índice CPU queda torch+cpu.
 
 ### Memoria semántica (mem0): que te conozca con el tiempo
 

@@ -9,7 +9,9 @@ from __future__ import annotations
 import builtins
 import http.client
 import logging
+import re
 import runpy
+import shlex
 import signal
 import socket
 import subprocess
@@ -1100,3 +1102,248 @@ def test_smoke_circular_no_arranca_el_hilo_de_presintesis(monkeypatch, tmp_path)
     assert smoke_voz.circular() == 0
     assert tts._presint_hilo is None
     assert [t.name for t in set(threading.enumerate()) - antes] == []
+
+
+# --- idx 0 (final-x7conexion-1): el followup del loop simple también pre-conecta -----
+# El aviso del wake (WakePreconnect) solo viajaba con la orden que sigue al wake. El
+# keep-alive de un stream se reutiliza hasta 15 s después de su fin
+# (HTTPTransport._REUSE_MAX_IDLE_S) y, con stream_release = "final" (fábrica), la
+# respuesta ENTERA se habla después de ese fin: una respuesta de 8-13 s más la orden
+# del followup pasan de 15 s y el handshake TCP+TLS con la nube se pagaba dentro del
+# turno. Ahora la grabación del followup lleva el mismo aviso y su 1ª voz pre-conecta.
+
+class _AgenteDeUnStream:
+    """Lo justo de un agente con motor de nube: el turno es UN chat_stream."""
+
+    def __init__(self, llm):
+        self.llm = llm
+        self.ordenes: list[str] = []
+
+    def handle_turn(self, command, on_token=None):
+        self.ordenes.append(command)
+        return self.llm.chat_stream([{"role": "user", "content": command}],
+                                    on_token=on_token).content
+
+
+class _OrdenesConReloj:
+    """STT falso que mueve el reloj del transporte. Por escucha, (segundos hasta la
+    1ª voz, texto): con voz llama a on_voice, como el STT real, espera a que la
+    pre-conexión acabe (el patrón tarda más en decir la orden que un handshake) y
+    suma lo que duran la orden, el silencio de corte y Whisper."""
+
+    _ORDEN_S = 2.0 + 0.6 + 1.7
+
+    def __init__(self, reloj, guion, aviso):
+        self.reloj = reloj
+        self.guion = list(guion)
+        self.aviso = aviso
+        self.avisos: list[bool] = []    # por escucha: ¿llegó con on_voice?
+
+    def listen_once(self, on_voice=None, **kwargs):
+        antes, texto = self.guion.pop(0)
+        self.avisos.append(on_voice is not None)
+        self.reloj["t"] += antes
+        if not texto:
+            return ""                   # nadie habló: la ventana venció
+        if on_voice is not None:
+            on_voice()
+        if self.aviso is not None:
+            self.aviso.join(5)
+        self.reloj["t"] += self._ORDEN_S
+        return texto
+
+    listen_smart = listen_once
+
+
+@pytest.mark.parametrize("respuesta_s, sin_aviso", [(10.5, 2), (1.5, 1)],
+                         ids=["respuesta_larga", "respuesta_corta"])
+def test_el_followup_preconecta_y_su_turno_no_paga_el_handshake(monkeypatch, respuesta_s,
+                                                                sin_aviso):
+    """Loop simple con GLMClient en streaming y sockets de verdad, el aviso que le
+    da _listen_with_warmer y el reloj del transporte a mano: una orden tras el wake,
+    un followup y una ventana que acaba en silencio.
+
+    respuesta_larga: la petición del followup sale 16.3 s después del fin del stream
+    anterior. El keep-alive ya no se reutiliza y antes conectaba el hilo del turno
+    ({"Preconnect": 1, "MainThread": 1}). respuesta_corta (7.3 s): el keep-alive
+    seguía valiendo y ahora se abre un repuesto igual, en segundo plano (el precio
+    que ya pagan las órdenes tras un wake). En los dos casos el turno no hace ningún
+    handshake, la ventana en silencio no abre nada y lo que se pide y se oye es lo
+    mismo que sin aviso."""
+    from crotolamo.core import engine
+    from crotolamo.voice.threads import WakePreconnect
+    from tests.test_perf_llm_turn_is_one_atomic_blocking_call import (
+        _cliente,
+        _conexiones_estables,
+        _contando_conexiones,
+        _Server,
+    )
+
+    monkeypatch.setattr(listener, "read_control_enabled", lambda *a, **k: True)
+    monkeypatch.setattr(listener, "time",
+                        SimpleNamespace(sleep=lambda s: None, time=time.time))
+    reloj = {"t": 1000.0}
+    monkeypatch.setattr(engine, "_reloj", lambda: reloj["t"])
+    cfg = listener.ListenerConfig(threshold=0.72, variants=["crotolamo"], followup_s=6.0,
+                                  ack="off", stream_speak=True, smart_endpoint=False)
+    # Hasta la 1ª voz del followup: la respuesta hablada (entera tras el fin del
+    # stream), la guarda tras responder y lo que el patrón tarda en reaccionar.
+    guion = [(1.0, "abre youtube"), (respuesta_s + 0.5 + 1.0, "y ahora pausa la música"),
+             (6.0, "")]
+
+    vistos = {}
+    for con_aviso in (False, True):
+        srv = _Server()
+        try:
+            client = _cliente("glm", srv)
+            por_hilo = _contando_conexiones(monkeypatch, client._transport)
+            agente = _AgenteDeUnStream(client)
+            aviso = WakePreconnect.del_agente(agente) if con_aviso else None
+            stt = _OrdenesConReloj(reloj, guion, aviso)
+            tts = _TtsDeTurno()
+            extra = {} if aviso is None else {"on_wake": aviso}
+            assert listener._run_simple_loop(
+                agent=agente, stt=stt, wake_stt=_WakeUnaVez(), tts=tts, wake_detector=None,
+                use_oww=False, cfg=cfg, hud_state=voice_state.SharedState(),
+                say=lambda texto: None, **extra) == 0
+            if aviso is not None:
+                aviso.join(5)
+            vistos[con_aviso] = (agente.ordenes, tts.spoken, list(srv.peticiones))
+            if con_aviso:
+                assert por_hilo == {"Preconnect": 2}
+                assert _conexiones_estables(srv) == 2
+            else:
+                assert por_hilo == {"MainThread": sin_aviso}
+            # El aviso viaja con las tres grabaciones; solo sale con las dos con voz.
+            assert stt.avisos == [con_aviso] * 3
+        finally:
+            srv.parar()
+
+    assert vistos[True] == vistos[False] == (
+        ["abre youtube", "y ahora pausa la música"], ["Hola, patrón."] * 2,
+        ["/api/paas/v4/chat/completions"] * 2)
+
+
+@pytest.mark.parametrize("followup_con_voz", [True, False], ids=["con_voz", "en_silencio"])
+def test_la_ventana_de_followup_en_silencio_no_abre_ninguna_conexion(monkeypatch,
+                                                                     followup_con_voz):
+    """Loop simple de fábrica (smart_endpoint, acuse con bip, followup de 6 s) con
+    el STT real sobre un micrófono de guion, el aviso de _listen_with_warmer y
+    GLMClient con sockets de verdad. El aviso del followup sale con su 1ª voz
+    (on_voice de la grabación), no al abrir la ventana: la que acaba en silencio no
+    abre nada (una conexión, la de la orden) y nada llega a Whisper. Con voz, la
+    misma grabación abre una más, en segundo plano."""
+    from crotolamo.voice import stt as stt_mod
+    from crotolamo.voice.threads import WakePreconnect
+    from tests.test_media_aware import _FakeTts as _TtsConBip
+    from tests.test_perf_llm_turn_is_one_atomic_blocking_call import (
+        _AgenteDeUnaLlamada,
+        _cliente,
+        _conexiones_estables,
+        _contando_conexiones,
+        _MicDeOrdenes,
+        _Server,
+        _SileroDeNivel,
+        _WakeDeGuion,
+    )
+
+    turnos = 2 if followup_con_voz else 1
+    # Un guion por grabación (un nivel por chunk de 32 ms); agotados, silencio.
+    monkeypatch.setattr(_MicDeOrdenes, "ordenes", [[0] * 3 + [1] * 15 for _ in range(turnos)])
+    monkeypatch.setattr(_MicDeOrdenes, "listo", None)
+    monkeypatch.setitem(sys.modules, "sounddevice",
+                        SimpleNamespace(InputStream=_MicDeOrdenes))
+    monkeypatch.setattr(stt_mod, "_voice_cfg", lambda: {"vad_backend": "silero"})
+    monkeypatch.setattr(stt_mod, "_silero_load_error", None)
+    monkeypatch.setattr(stt_mod, "_get_silero_vad", lambda **k: _SileroDeNivel())
+    monkeypatch.setattr(listener, "read_control_enabled", lambda *a, **k: True)
+    monkeypatch.setattr(listener, "time",
+                        SimpleNamespace(sleep=lambda s: None, time=time.time))
+    cfg = listener.ListenerConfig(threshold=0.72, variants=["crotolamo"], stream_speak=False)
+    assert (cfg.smart_endpoint, cfg.ack, cfg.followup_s) == (True, "beep", 6.0)  # fábrica
+
+    srv = _Server("entero")
+    try:
+        client = _cliente("glm", srv)
+        por_hilo = _contando_conexiones(monkeypatch, client._transport)
+        agente = _AgenteDeUnaLlamada(client)
+        aviso = WakePreconnect.del_agente(agente)
+        assert aviso is not None
+        textos = ["abre youtube", "y ahora pausa la música"]
+        stt = stt_mod.STT(model_size="fake")
+
+        def transcribir(audio, hotwords=None):
+            aviso.join(5)               # Whisper tarda más que un handshake
+            return textos.pop(0)
+
+        monkeypatch.setattr(stt, "transcribe", transcribir)
+        wake_stt = _WakeDeGuion(["crotolamo"])
+        tts = _TtsConBip()
+        assert listener._run_simple_loop(
+            agent=agente, stt=stt, wake_stt=wake_stt, tts=tts, wake_detector=wake_stt,
+            use_oww=False, cfg=cfg, hud_state=voice_state.SharedState(),
+            say=lambda texto: None, on_wake=aviso) == 0
+        aviso.join(5)
+
+        assert agente.ordenes == ["abre youtube", "y ahora pausa la música"][:turnos]
+        assert len(textos) == 2 - turnos            # la ventana en silencio: sin Whisper
+        assert por_hilo == {"Preconnect": turnos}   # el turno nunca conecta
+        assert _conexiones_estables(srv) == turnos
+        assert srv.peticiones == ["/api/paas/v4/chat/completions"] * turnos
+        assert tts.spoken == ["Hola, patrón."] * turnos
+    finally:
+        srv.parar()
+
+
+# --- idx 1 (final-x6paquete-1): las pistas de instalación de Silero no nombran torch --
+# silero-vad declara torch como dependencia dura y, solo con PyPI, pip resuelve la
+# build CUDA (~3 GB entre torch, nvidia-* y triton) que una lap sin GPU no usa nunca;
+# el código ni importa torch (voice/runtime.py corre el ONNX directo). install.sh,
+# launch.sh y pyproject ya dan el índice CPU de PyTorch, el de la CI; el doctor y el
+# aviso del oído seguían diciendo "pip install silero-vad torch".
+
+def _indice_cpu_de_la_ci() -> str:
+    """El índice con el que instala la CI (la instalación que sí se prueba)."""
+    (url,) = re.findall(r"--extra-index-url\s+(\S+)",
+                        (REPO / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
+    assert url.rstrip("/").endswith("/whl/cpu"), url
+    return url
+
+
+def _pip_install_de(pista: str) -> list[str]:
+    """Los argumentos del `pip install ...` que sugiere `pista`, como los recibiría
+    pip (lo que va entre paréntesis tras el comando es comentario para el patrón)."""
+    comando = pista.split("pip install ", 1)[1].split("  (", 1)[0]
+    return shlex.split(comando)
+
+
+def test_doctor_sin_silero_sugiere_instalarlo_con_el_indice_cpu(monkeypatch):
+    from scripts import crotolamo_doctor as doctor
+
+    monkeypatch.setitem(sys.modules, "silero_vad", None)
+    (check,) = doctor._check_silero(None)
+    assert check.ok is False
+    # Ni `torch` suelto (PyPI: la build CUDA) ni otro índice que el de la CI.
+    assert _pip_install_de(check.fix) == [
+        "silero-vad", "--extra-index-url", _indice_cpu_de_la_ci()]
+    assert check.fix.endswith("(opcional, mejora la detección de voz)")
+
+
+def test_el_aviso_del_oido_sin_silero_sugiere_instalarlo_con_el_indice_cpu(monkeypatch,
+                                                                            caplog):
+    pytest.importorskip("numpy")
+    from crotolamo.voice import stt as stt_mod
+    from crotolamo.voice.adapters import _SileroVad
+
+    def _sin_silero(**kwargs):
+        raise ModuleNotFoundError("No module named 'silero_vad'")
+
+    monkeypatch.setattr(stt_mod, "_get_silero_vad", _sin_silero)
+    vad = _SileroVad()
+    with caplog.at_level(logging.WARNING):
+        assert vad([0.5] * 512) == 1.0      # cae a energía y sigue oyendo
+        assert vad([0.0] * 512) == 0.0
+    avisos = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(avisos) == 1 and avisos[0].startswith("silero-vad no disponible")
+    assert _pip_install_de(avisos[0]) == [
+        "silero-vad", "--extra-index-url", _indice_cpu_de_la_ci()]
