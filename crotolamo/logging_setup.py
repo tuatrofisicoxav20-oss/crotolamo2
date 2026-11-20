@@ -41,10 +41,21 @@ def setup_logging(level: str | None = None) -> None:
     # sí es atributo de logging pero no un nivel (BASIC_FORMAT) llegaba tal cual
     # a basicConfig, que reventaba al arrancar.
     numeric = logging.getLevelNamesMapping().get(lvl)
+    nivel = logging.INFO if numeric is None else numeric
     logging.basicConfig(
-        level=logging.INFO if numeric is None else numeric,
+        level=nivel,
         format="%(asctime)s %(name)s %(levelname)s: %(message)s",
     )
+    # faster_whisper escribe en INFO «Processing audio with duration …» por CADA
+    # transcripción. Con el wake difuso y gente hablando (o la tele) son unas 12
+    # pasadas por minuto: cientos de líneas por hora en el journal, que crecen con el
+    # audio ambiente y no con lo que pasa (por lo mismo listener._log_heard bajó su
+    # línea por ventana a DEBUG). Sus avisos siguen saliendo, y con DEBUG se conserva
+    # todo: ahí sí se está diagnosticando. Solo con el raíz por debajo de WARNING:
+    # más arriba ya no salen, y fijarle WARNING al logger dejaría pasar sus avisos
+    # con el raíz en ERROR (el nivel propio de un logger manda sobre el heredado).
+    if logging.DEBUG < nivel < logging.WARNING:
+        logging.getLogger("faster_whisper").setLevel(logging.WARNING)
     _CONFIGURED = True
     if numeric is None:
         get_logger("logging").warning(

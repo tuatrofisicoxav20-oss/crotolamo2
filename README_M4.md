@@ -38,7 +38,18 @@ tool-call del LLM -> guard (rutas, recursivo) -> confirmación -> tools/call -> 
   porque el server no lee, no hay EOF posible: tras 1 s se pasa directo al
   SIGTERM. Peor caso ~6 s por server. El apagado por señal (`terminate_all()`)
   no espera a nadie: cierra stdin (si no hay un envío atascado) y manda SIGTERM
-  al grupo.
+  al grupo. Al final de ese apagado, tras el vaciado (acotado) de la Memoria y
+  justo antes del idle del HUD y del `os._exit`, el listener llama a
+  `kill_survivors()`: a lo que 2 s después de aquel SIGTERM siga vivo o
+  reteniendo las tuberías le manda SIGKILL al grupo. Es una sola gracia para
+  todos, contada desde el SIGTERM (no una por server; lo que tarde la Memoria ya
+  es gracia), y con servers que ya salieron no cuesta nada. Como servicio, esa
+  espera se recorta para no pasar de los 8 s desde que empezó el apagado (solo
+  ocurre si reponer la música ya gastó segundos): la unidad da
+  `TimeoutStopSec=10` y detrás aún va el idle; desde una terminal no hay plazo
+  y va la gracia entera. Antes, a un server que ignorase el SIGTERM solo lo
+  mataba el cgroup de systemd, pasado `TimeoutStopSec`; lanzado desde una
+  terminal, nadie.
 
 ## Configuración
 

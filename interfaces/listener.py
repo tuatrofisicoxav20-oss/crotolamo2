@@ -346,6 +346,15 @@ _ACTIVE_DUCKER: Ducker | None = None
 # MediaMonitor vivo: su `playerctl --follow` es un hijo de larga vida que
 # os._exit no cerraría. Ver _graceful_exit.
 _ACTIVE_MEDIA: MediaMonitor | None = None
+# Como servicio, segundos desde que entra _graceful_exit en que deja de esperar
+# a los servers MCP que ignoran el SIGTERM y los mata sin más. La unidad da
+# TimeoutStopSec=10: pasado eso systemd mata al listener, sin idle final. Con
+# esto, esperarlos (hasta 2 s) no puede ser lo que lo pase de ahí: detrás solo
+# queda el idle (1 s si la compuerta del HUD está tomada). Solo recorta algo si
+# reponer la música ya gastó segundos (playerctl agota 2 s por reproductor con
+# el D-Bus colgado; medido con cuatro: 8 s, y 10 s con la gracia entera); lo
+# normal es llegar al remate en milisegundos.
+_SHUTDOWN_KILL_BY_S = 8.0
 
 
 def _restore_media_best_effort() -> None:
@@ -382,7 +391,16 @@ def _graceful_exit(signum, _frame) -> None:
     El idle va AL FINAL, pegado a os._exit: los demás hilos siguen corriendo
     mientras se restaura la música y se cierran los servers MCP, y lo que
     publicaran en ese rato pisaba un idle escrito antes.
+
+    A los servers MCP va el SIGTERM ANTES de vaciar la Memoria y el SIGKILL (al
+    que siga vivo) DESPUÉS: su gracia de 2 s cuenta desde el SIGTERM, así que
+    corre a la vez que el vaciado (hasta 2,5 s) y no se suma a él. Con el idle
+    (1 s si la compuerta está tomada), lo que el manejador espera tras ese
+    SIGTERM son 3,5 s en el peor caso (medido), bajo el TimeoutStopSec=10 de la
+    unidad. Lo que sí puede acercarlo a ese tope es lo de ANTES, reponer la
+    música: por eso, como servicio, la gracia se recorta con _SHUTDOWN_KILL_BY_S.
     """
+    started = _monotonic()
     try:
         print("Crotolamo apagado, patrón.", flush=True)
     except Exception:  # noqa: BLE001
@@ -395,6 +413,12 @@ def _graceful_exit(signum, _frame) -> None:
     _restore_media_best_effort()
     _terminate_mcp_best_effort()
     _flush_memoria_best_effort()
+    # El tope, solo como servicio (INVOCATION_ID lo pone systemd): es su
+    # TimeoutStopSec el que hay que cumplir, y ahí el stop ya mandó SIGTERM a
+    # todo el cgroup al empezar, así que a quien el tope le recorte la gracia
+    # lleva segundos ignorándolo. Desde una terminal no hay plazo: la gracia entera.
+    in_service = bool(os.environ.get("INVOCATION_ID"))
+    _kill_mcp_survivors_best_effort(started + _SHUTDOWN_KILL_BY_S if in_service else None)
     _final_idle_best_effort()
     os._exit(0)
 
@@ -417,7 +441,14 @@ def _flush_memoria_best_effort(timeout_s: float = 2.0) -> None:
         memoria = getattr(modulo, "_MEMORIA", None)
         if memoria is None:
             return
-        hilo = threading.Thread(target=memoria.flush, kwargs={"timeout_s": timeout_s},
+        # El vaciado DE SALIDA, no un flush() a secas: con el hilo de extracción
+        # en su pausa (tres fallos seguidos, 120 s), flush() esperaba aquí sus
+        # 2 s detrás de él y lo encolado durante la pausa se perdía sin
+        # intentarse. El de salida la corta, como hace atexit en el shell, y con
+        # el mismo plazo de aquí (sin él esperaría los 5 s de atexit). Un doble
+        # que no lo tenga (tests) sigue con flush().
+        vaciar = getattr(memoria, "_vaciar_al_salir", None) or memoria.flush
+        hilo = threading.Thread(target=vaciar, kwargs={"timeout_s": timeout_s},
                                 name="MemoriaFlush", daemon=True)
         hilo.start()
         hilo.join(timeout=timeout_s + 0.5)
@@ -433,6 +464,33 @@ def _terminate_mcp_best_effort() -> None:
         from crotolamo.mcp import bridge
 
         bridge.terminate_all()
+    except Exception:  # noqa: BLE001 — nunca propagar desde aquí
+        pass
+
+
+def _kill_mcp_survivors_best_effort(deadline: float | None = None) -> None:
+    """La otra mitad de _terminate_mcp_best_effort, que no espera ni escala: un
+    server MCP que ignora el SIGTERM (el nieto de un wrapper, uno colgado)
+    sobrevivía al os._exit en su propia sesión; con systemd lo mataba el cgroup
+    al cabo del TimeoutStopSec entero, y lanzado desde una terminal, nadie. Aquí,
+    con la Memoria ya vaciada (ese rato cuenta como gracia), se le manda SIGKILL.
+    Con servers bien hechos vuelve en milisegundos.
+
+    `deadline` (reloj monotónico): pasado ese instante ya no se espera a nadie,
+    se mata y se sigue (ver _SHUTDOWN_KILL_BY_S). Sin él, la gracia entera.
+
+    Sin importar nada: si el bridge no se pudo importar al mandar el SIGTERM, no
+    hay a quién rematar."""
+    try:
+        bridge = sys.modules.get("crotolamo.mcp.bridge")
+        if bridge is None:
+            return
+        grace_s = bridge.SIGTERM_GRACE_S
+        if deadline is not None:
+            # La gracia de kill_survivors cuenta desde el SIGTERM, que fue antes
+            # de ahora: con min() la espera acaba, como tarde, en `deadline`.
+            grace_s = min(grace_s, max(0.0, deadline - _monotonic()))
+        bridge.kill_survivors(grace_s=grace_s)
     except Exception:  # noqa: BLE001 — nunca propagar desde aquí
         pass
 

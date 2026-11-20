@@ -1239,6 +1239,7 @@ def test_la_config_de_fabrica_documenta_stop_on_repeated_failure_apagado():
 # colgada no dejaba salir nunca. Ahora son DaemonPool (core/turn.py).
 
 import os  # noqa: E402
+import signal  # noqa: E402
 import subprocess  # noqa: E402
 import sys  # noqa: E402
 from pathlib import Path  # noqa: E402
@@ -1293,6 +1294,10 @@ for n in ("lee_a", "lee_b"):
 agent = ToolAgent(LLM(), Conversation("S"), registry=reg, guard=Guard(),
                   pre_hooks=[], post_hooks=[])
 if MODO == "ctrlc":
+    # Con la suite lanzada en segundo plano (`pytest &`, nohup) este proceso hereda
+    # SIGINT en SIG_IGN y CPython no instala su manejador: el SIGINT de abajo se
+    # ignoraría. El caso mide la salida por Ctrl-C, no cómo se lanzó pytest.
+    signal.signal(signal.SIGINT, signal.default_int_handler)
     principal = threading.main_thread().ident
 
     def esperando_el_lote():
@@ -1344,6 +1349,21 @@ def test_la_salida_no_espera_a_las_tools_de_un_lote_en_paralelo(modo):
     tardaba la tool) en vez de 0.6 s. En serie la salida nunca esperó a la tool."""
     transcurrido, salida = _correr_y_medir(_SALIDA_CON_LOTE, modo)
     assert "lote en paralelo: 2" in salida          # las dos corrían a la vez al salir
+    assert transcurrido < 4.0, transcurrido         # las tools tardan 6 s
+
+
+def test_el_caso_ctrlc_no_depende_de_como_se_lanzo_pytest():
+    """Como trabajo en segundo plano de un shell no interactivo (`pytest &`, nohup,
+    un Makefile que la lanza con &) la suite corre con SIGINT en SIG_IGN, y el hijo
+    lo hereda: CPython no instala entonces su manejador, el SIGINT que el hijo se
+    manda se ignora, el turno corre sus 6 s y no imprime nada. El caso fallaba
+    siempre así, con pinta de regresión de la salida del lote en paralelo."""
+    previo = signal.signal(signal.SIGINT, signal.SIG_IGN)      # se hereda al hijo
+    try:
+        transcurrido, salida = _correr_y_medir(_SALIDA_CON_LOTE, "ctrlc")
+    finally:
+        signal.signal(signal.SIGINT, previo)
+    assert "lote en paralelo: 2" in salida
     assert transcurrido < 4.0, transcurrido         # las tools tardan 6 s
 
 

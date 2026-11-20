@@ -25,6 +25,12 @@ Environment=PYTHONUNBUFFERED=1
 ExecStart=%h/Documentos/crotolamo2/.venv/bin/python -m crotolamo listen $CROTOLAMO_LISTEN_ARGS
 # El listener captura SIGTERM (el stop por defecto de systemd) y sale al instante
 # con os._exit(0): apagado limpio, sin volcado de memoria de onnxruntime/portaudio.
+# "Al instante" son milisegundos salvo que espere algo, siempre acotado: la
+# extracción de memoria del último turno y un server MCP que ignora el SIGTERM
+# (medido: 3,5 s el peor caso de los dos juntos, con el idle final), y antes de
+# eso reponer la música si el D-Bus está colgado (2 s por reproductor). Si
+# cambias este valor, revisa _SHUTDOWN_KILL_BY_S en interfaces/listener.py, que
+# cuenta con estos 10 s.
 TimeoutStopSec=10
 Restart=on-failure
 RestartSec=3

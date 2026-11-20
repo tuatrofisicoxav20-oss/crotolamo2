@@ -8,7 +8,10 @@ Comandos del shell:
 
 from __future__ import annotations
 
+import errno
 import math
+import signal
+import termios
 import threading
 from typing import TYPE_CHECKING, Any, Callable, cast
 
@@ -384,7 +387,78 @@ def _show_history(conversation: Conversation) -> None:
         print(f"  {tag}: {content}")
 
 
+def _instalar_senales(manejador: Callable[[int, Any], None]) -> dict[int, Any]:
+    """Pone `manejador` a SIGTERM y a SIGHUP (cerrar la ventana de la terminal) y
+    devuelve los manejadores que había, para reponerlos.
+
+    No se pisa un SIGHUP que llega ignorado (`nohup`: es pedir sobrevivir al cierre
+    de la terminal; el listener hace lo mismo) ni un manejador puesto desde C
+    (getsignal da None y no habría cómo reponerlo). Fuera del hilo principal
+    signal.signal lanza ValueError: ahí el shell corre sin manejadores, como antes.
+    """
+    previos: dict[int, Any] = {}
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            previo = signal.getsignal(sig)
+            if previo is None or (sig == signal.SIGHUP and previo is signal.SIG_IGN):
+                continue
+            signal.signal(sig, manejador)
+        except (ValueError, OSError):
+            continue
+        previos[sig] = previo
+    return previos
+
+
+def _terminal_colgada() -> bool:
+    """¿Se cerró la terminal de la que lee el shell? Un tty colgado contesta EIO a
+    todo; uno vivo contesta, y lo que no es un tty (una tubería, /dev/null) da ENOTTY."""
+    try:
+        termios.tcgetattr(0)
+    except termios.error as error:
+        return bool(error.args) and error.args[0] == errno.EIO
+    return False
+
+
 def run_shell(argv: list[str] | None = None) -> int:
+    # SIGTERM y SIGHUP -> SystemExit, la salida normal del intérprete. Su acción
+    # por defecto mataba el proceso en el acto, sin atexit: la extracción del turno
+    # recién dicho se cortaba a medias y un server MCP que no sale al ver el EOF
+    # (corren en su propia sesión: el SIGHUP de la terminal no les llega) quedaba
+    # huérfano. Con SystemExit corren los atexit de siempre (bridge.close_all, el
+    # vaciado de la Memoria, el resumen de compaction), todos acotados.
+    senal: list[int] = []  # la que pidió salir, si llegó alguna
+
+    def salir(signum: int, _frame: object) -> None:
+        # Una vez. Cerrar la terminal puede mandar DOS SIGHUP con décimas de
+        # milisegundo entre ellos (medido con un pty: al trabajo en primer plano de
+        # un bash interactivo le llega el que bash reenvía y luego el del kernel, al
+        # morir el líder de la sesión): el segundo llega con la salida ya en marcha,
+        # y lanzar otra vez SystemExit ahí cortaba el atexit que estuviera corriendo.
+        if senal:
+            return
+        senal.append(signum)
+        raise SystemExit(128 + signum)
+
+    previos = _instalar_senales(salir)
+    try:
+        return _run_shell(argv)
+    finally:
+        # Con la ventana cerrada lo primero que ve el shell no suele ser el SIGHUP
+        # sino el fin de la entrada: sale por su camino de EOF (y el "apagado" ya
+        # no se puede escribir: EIO). El SIGHUP viene detrás, cuando muere el líder
+        # de la sesión (el bash de launch.sh): se da por llegado.
+        if previos and not senal and _terminal_colgada():
+            senal.append(signal.SIGHUP)
+        # Al volver (o si el shell revienta), los de antes: quien llama run_shell
+        # dentro de su proceso (los tests) no se queda con los nuestros. Tras una
+        # señal NO: el proceso se está yendo, y con la acción por defecto repuesta
+        # ese SIGHUP rezagado lo mataba en pleno atexit.
+        if not senal:
+            for sig, previo in previos.items():
+                signal.signal(sig, previo)
+
+
+def _run_shell(argv: list[str] | None = None) -> int:
     from crotolamo.core.agent import ToolAgent
 
     argv = argv or []
