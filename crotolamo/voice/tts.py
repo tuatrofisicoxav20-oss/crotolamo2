@@ -106,14 +106,72 @@ def _cierra_frase(text: str, start: int, end: int) -> bool:
     return True
 
 
-def _split(text: str, *, final: bool) -> tuple[list[str], str]:
+class _Lista:
+    """Lo que la segmentación recuerda de UNA respuesta para saber si un "NN." al
+    principio de una línea es de verdad un marcador de lista numerada.
+
+    `_cierra_frase` solo ve la línea: para ella todo "NN." que la abre es un
+    marcador y no corta. Sin más evidencia, una respuesta que empezaba por su
+    número ("42. ¿Algo más, patrón?") llegaba entera a speak() y limpiar_para_voz
+    le quitaba el "42. " como viñeta: el patrón no oía la respuesta. Hay lista si
+    el número es el 1 que la abre o si la respuesta ya abrió una (`abierta`: ahí
+    la numeración puede saltar); si no, es un número suelto, cierra frase y se
+    dice, como ya pasaba a media línea ("¿Cuántos? 5. Cinco."). Un "1." suelto
+    sigue pasando por lista: no se distingue de la de un solo elemento.
+
+    `inicio_linea`: el texto que se segmenta empieza en un principio de línea de
+    verdad (el de la respuesta, o tras un corte que se llevó un salto de línea).
+    En streaming el buffer se reinicia tras cada corte y su posición 0 pasaba
+    por principio de línea: cualquier frase que empezara por un número lo perdía.
+    """
+
+    __slots__ = ("abierta", "inicio_linea")
+
+    def __init__(self) -> None:
+        self.abierta = False
+        self.inicio_linea = True
+
+    def cierra(self, text: str, start: int, end: int) -> bool:
+        """`_cierra_frase` con esta memoria; anota la lista que abre un "1."."""
+        if _cierra_frase(text, start, end):
+            return True
+        linea = text.rfind("\n", 0, start) + 1
+        if not _MARCADOR_LISTA.fullmatch(text, linea, start):
+            return False  # no cierra por otra regla (abreviatura, decimal)
+        if end < len(text) and text[end].isdigit():
+            return False  # "40. 5" al principio de la línea: decimal partido
+        if linea == 0 and not self.inicio_linea:
+            return True  # el buffer empieza a media línea: no hay marcador
+        if not self.abierta and int(text[linea:start - 1]) != 1:
+            return True  # número suelto: sin lista a la vista, se dice
+        self.abierta = True
+        return False
+
+
+def _abre_linea(text: str, desde: int, hasta: int) -> bool:
+    """¿Lo que sigue a text[:hasta] empieza una línea? Sí, si en text[desde:hasta]
+    hay un salto de línea y tras el último solo queda sangría."""
+    salto = text.rfind("\n", desde, hasta)
+    return salto >= 0 and not text[salto + 1:hasta].strip(" \t")
+
+
+def _split(text: str, *, final: bool, lista: _Lista | None = None) -> tuple[list[str], str]:
     """Divide en (frases_cerradas, resto).
 
     Con final=False (streaming) un '.' seguido solo de espacios al final del
     buffer se queda en el resto: sin ver el siguiente carácter no se puede
     distinguir un fin de frase de un decimal/abreviatura a medias. Por lo
     mismo, dentro de un bloque ``` aún abierto no se corta: puede cerrarse.
+
+    `lista`: la memoria de la respuesta (ver _Lista). Sin ella, `text` es una
+    respuesta entera. Quien segmenta por trozos (SentenceFeeder) pasa siempre
+    la misma: al volver queda como la necesita el RESTO, que es lo que se
+    vuelve a segmentar con el trozo siguiente.
     """
+    if lista is None:
+        lista = _Lista()
+    # La memoria tal como está en el último corte: lo que ve el resto.
+    abierta, inicio_linea = lista.abierta, lista.inicio_linea
     pieces: list[str] = []
     start = 0
     # Cercas ``` vistas antes del candidato: con un número impar está DENTRO de
@@ -140,10 +198,14 @@ def _split(text: str, *, final: bool) -> tuple[list[str], str]:
         visto = hasta
         if cercas % 2:
             continue  # dentro de un bloque de código
-        if not _cierra_frase(text, m.start(), m.end()):
+        if not lista.cierra(text, m.start(), m.end()):
             continue
         pieces.append(text[start:m.start()])
         start = m.end()
+        abierta = lista.abierta
+        # Desde el carácter anterior al candidato: el salto puede ser ese.
+        inicio_linea = _abre_linea(text, m.start() - 1, m.end())
+    lista.abierta, lista.inicio_linea = abierta, inicio_linea
     return [p.strip() for p in pieces if p.strip()], text[start:]
 
 
@@ -186,6 +248,9 @@ class SentenceFeeder:
         # Con un bloque ``` abierto en el buffer: desde dónde buscar su cerca de
         # cierre (None: fuera de bloque).
         self._cierre_desde: int | None = None
+        # Lo que el buffer, que se reinicia tras cada corte, ya no puede ver de
+        # la respuesta: si empieza una línea y si hay una lista numerada abierta.
+        self._lista = _Lista()
 
     def feed(self, token: str) -> None:
         self._buffer += token
@@ -199,7 +264,7 @@ class SentenceFeeder:
                 self._cierre_desde = max(self._cierre_desde,
                                          len(self._buffer) - len(_CERCA) + 1)
                 return
-        pieces, self._buffer = _split(self._buffer, final=False)
+        pieces, self._buffer = _split(self._buffer, final=False, lista=self._lista)
         self._cierre_desde = _fin_cerca_abierta(self._buffer)
         for piece in pieces:
             self.fed += 1
@@ -212,13 +277,21 @@ class SentenceFeeder:
         cayó dentro del bloque) sale aquí, como la cola de siempre, pero en sus
         frases de siempre (_split con final=True): el aviso del LLM caído queda
         en frase aparte y no pegado al código. Sin esa cerca, igual que antes.
+
+        También vale A MEDIA respuesta (StreamSpeaker.drain, antes de la pregunta
+        de confirmación de una tool): lo que llegue después se segmenta como
+        continuación, así que la memoria de línea se queda como la dejó la cola.
         """
         pieces: list[str] = []
         tail = self._buffer
         self._buffer = ""
         if self._cierre_desde is not None:
             self._cierre_desde = None
-            pieces, tail = _split(tail, final=True)
+            pieces, tail = _split(tail, final=True, lista=self._lista)
+        if tail[tail.rfind("\n") + 1:].strip(" \t"):
+            self._lista.inicio_linea = False  # la cola acaba a media línea
+        elif "\n" in tail:
+            self._lista.inicio_linea = True
         tail = tail.strip()
         if tail:
             pieces.append(tail)
@@ -246,13 +319,19 @@ class _AvisoEnFraseAparte:
         self._retenido: str | None = None
 
     def __call__(self, token: str) -> None:
-        retenido, self._retenido = self._retenido, None
-        if retenido is not None:
-            self._feed(retenido)
+        self.soltar()
         if token.startswith("\n"):
             self._retenido = token
         else:
             self._feed(token)
+
+    def soltar(self) -> None:
+        """Lo retenido pasa YA, tal cual, como lo haría el token siguiente. Para
+        quien necesita que lo dicho hasta aquí se hable antes de seguir (la
+        pregunta de confirmación de una tool, a media respuesta)."""
+        retenido, self._retenido = self._retenido, None
+        if retenido is not None:
+            self._feed(retenido)
 
     def cerrar(self, reply: str) -> None:
         """Fin del turno: suelta lo retenido, como frase aparte si era el aviso."""
@@ -720,7 +799,8 @@ class StreamSpeaker:
         # prepare() no lo necesita).
         self._prepare = getattr(tts, "prepare", None)
         self._spoke = False
-        self._q: queue.Queue[str | None] = queue.Queue()
+        # Frases por hablar; None = fin (finish); un Event = marca de paso (drain).
+        self._q: queue.Queue[str | threading.Event | None] = queue.Queue()
         # finish() se rindió (C6): el hilo no habla ni una frase más de la cola.
         self._cancelled = threading.Event()
         # Cuándo tomó el hilo su última frase: el plazo de finish() se mide
@@ -737,6 +817,9 @@ class StreamSpeaker:
             self._avance = time.monotonic()
             if sentence is None or self._cancelled.is_set():
                 return
+            if isinstance(sentence, threading.Event):
+                sentence.set()  # drain(): todo lo encolado antes ya se dijo
+                continue
             if not self._spoke:
                 self._spoke = True
                 if self._on_first is not None:
@@ -762,6 +845,31 @@ class StreamSpeaker:
         if self._prepare is not None:
             self._prepare(sentence)
         self._q.put(sentence)
+
+    def drain(self, timeout_s: float = 120.0) -> bool:
+        """Lo ya soltado se dice ENTERO antes de volver; la respuesta puede seguir.
+
+        Para quien va a hablar o a escuchar a media respuesta desde el hilo del
+        turno (la pregunta de confirmación de una tool, con un preámbulo ya
+        soltado por stream_release="sentence"): speak() solo espera a la frase
+        que suena, así que la pregunta se colaba por delante de las frases en
+        cola (y de la última, retenida en la segmentación) y el resto del
+        preámbulo sonaba sobre la ventana de la respuesta. Devuelve False si no
+        pudo esperar: el hilo ya terminó, o el TTS lleva `timeout_s` sin tomar
+        otra frase (el mismo plazo por frase de finish(), que es quien corta).
+        """
+        self._feeder.flush()
+        if self._cancelled.is_set() or not self._thread.is_alive():
+            return False
+        marca = threading.Event()
+        self._q.put(marca)
+        inicio = time.monotonic()
+        while not marca.is_set():
+            restante = max(self._avance, inicio) + timeout_s - time.monotonic()
+            if restante <= 0:
+                return False
+            marca.wait(restante)
+        return True
 
     def finish(self, timeout_s: float = 120.0) -> bool:
         """Habla lo que quede en el buffer, espera la cola y devuelve si habló.

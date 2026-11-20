@@ -199,14 +199,19 @@ class VoiceLoop:
         # El oído es el ÚNICO lector del micrófono: stop() lo espera antes de
         # cerrar el stream (ver stop()).
         self._ear = ear
+        # El Cerebro, a la vista de quien habla desde DENTRO de un turno (el aviso
+        # de una tool delicada, listener._make_notice_say): sabe qué turno atiende
+        # (turno_en_curso) y qué le tiene ya encolado a la Boca.
+        self.brain = BrainThread(agent, self.cmd_q, self.tts_q, self.state, self.shutdown,
+                                 stream=stream_speak, tts=tts,
+                                 cancel_on_barge_in=cancel_on_barge_in)
         self.threads = [
             ear,
             # Sin la clave, este loop sesga con los nombres de la tabla y el
             # simple no (ListenerConfig.hotwords): diferencia de hoy, decisión K.
             SttThread(stt, self.stt_q, self.cmd_q, self.state, self.shutdown,
                       hotwords=vcfg.get("hotwords", DEFAULTS.hotwords_concurrent)),
-            BrainThread(agent, self.cmd_q, self.tts_q, self.state, self.shutdown,
-                        stream=stream_speak, tts=tts, cancel_on_barge_in=cancel_on_barge_in),
+            self.brain,
             MouthThread(tts, self.tts_q, self.state, self.shutdown),
         ]
         for hilo in self.threads:

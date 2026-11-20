@@ -160,12 +160,15 @@ def test_stream_speaker_no_parte_abreviaturas():
 
 def _ref_stream_speaker(tokens: list[str]) -> list[str]:
     """Copia LITERAL de StreamSpeaker.feed/finish antes del paso (la referencia de
-    "mismas frases en el mismo orden")."""
+    "mismas frases en el mismo orden"), con la memoria de lista de la respuesta
+    (revisión final x1voz): sin ella, el buffer que se reinicia tras cada corte
+    tomaba por viñeta el número que abre una frase a media línea."""
     buffer = ""
     frases: list[str] = []
+    lista = tts_mod._Lista()
     for token in tokens:
         buffer += token
-        pieces, buffer = tts_mod._split(buffer, final=False)
+        pieces, buffer = tts_mod._split(buffer, final=False, lista=lista)
         frases.extend(pieces)
     tail = buffer.strip()
     if tail:

@@ -1007,9 +1007,9 @@ def test_el_feeder_no_resegmenta_un_bloque_largo_en_cada_token(monkeypatch):
     escaneado: list[int] = []
     original = tts._split
 
-    def contado(text, *, final):
+    def contado(text, *, final, lista=None):
         escaneado.append(len(text))
-        return original(text, final=final)
+        return original(text, final=final, lista=lista)
 
     monkeypatch.setattr(tts, "_split", contado)
     frases: list[str] = []
@@ -1026,16 +1026,18 @@ _PIEZAS_CON_CERCAS = ["```", "```python\n", "``", "`", "````", "Hola", "x", "Dr"
 
 
 def _feeder_de_referencia(trozos: list[str]) -> list[str]:
-    """SentenceFeeder sin atajos: el buffer entero por `_split` en cada trozo."""
+    """SentenceFeeder sin atajos: el buffer entero por `_split` en cada trozo
+    (con la memoria de lista de la respuesta, que el buffer reiniciado no ve)."""
     from crotolamo.voice import tts
 
     buffer, frases = "", []
+    lista = tts._Lista()
     for trozo in trozos:
         buffer += trozo
-        piezas, buffer = tts._split(buffer, final=False)
+        piezas, buffer = tts._split(buffer, final=False, lista=lista)
         frases += piezas
     if buffer.count(tts._CERCA) % 2:
-        piezas, buffer = tts._split(buffer, final=True)
+        piezas, buffer = tts._split(buffer, final=True, lista=lista)
         frases += piezas
     if buffer.strip():
         frases.append(buffer.strip())

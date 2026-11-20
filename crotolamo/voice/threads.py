@@ -35,6 +35,15 @@ STOP = object()  # sentinel: apagado (lo mete en cada cola el Wakeable de VoiceL
 # una optimización; uno colgado en el DNS muere con el proceso.
 _PRECONNECT_JOIN_S = 0.5
 
+# Lo más que el Cerebro espera a que la Boca tome OTRA frase de las que el turno
+# ya le encoló (ver BrainThread.hablar_lo_encolado). Plazo por frase, el mismo de
+# StreamSpeaker.finish: una cola que avanza se espera entera; solo el audio
+# trabado lo agota, y entonces quien esperaba habla igual.
+_ESPERA_BOCA_S = 120.0
+# Cada cuánto mira esa espera si la cola avanzó, si el turno sigue vigente o si
+# llegó el apagado.
+_ESPERA_BOCA_SONDEO_S = 0.2
+
 
 class WakePreconnect:
     """El aviso de "empieza una orden" (wake o barge-in): pre-conecta el motor del
@@ -160,6 +169,11 @@ class MouthThread(threading.Thread):
                 # poner IDLE pisaba el LISTENING de un barge-in recién llegado.
                 self.state.compare_and_set_mode(Mode.SPEAKING, Mode.IDLE)
                 continue
+            if isinstance(item, threading.Event):
+                # Marca de paso del Cerebro (hablar_lo_encolado): lo encolado
+                # antes que ella ya se dijo, o se descartó.
+                item.set()
+                continue
             assert isinstance(item, Utterance)
             # Descarta frases de turnos abortados (barge-in o comando nuevo).
             # Turno y SPEAKING de una vez (V5): un barge-in entre los dos
@@ -227,6 +241,52 @@ class BrainThread(threading.Thread):
             log.info("barge_in_cancel: el agente no acepta should_abort; un turno "
                      "interrumpido termina como siempre")
         self._prepare = getattr(tts, "prepare", None)
+        # El turno de la orden que el agente atiende AHORA (None: ninguna). Lo lee
+        # el aviso de una tool delicada (listener._make_notice_say), que se dice
+        # desde DENTRO de handle_turn: de fábrica un turno interrumpido termina en
+        # silencio, y para cuando pide su tool el turno vigente ya puede ser el de
+        # la orden nueva. Atado a state.turn_id, el aviso viejo sonaba sobre ella.
+        self.turno_en_curso: int | None = None
+        # Con stream, la segmentación del turno en curso (ver hablar_lo_encolado).
+        self._en_vivo: tuple[_AvisoEnFraseAparte, SentenceFeeder] | None = None
+
+    def hablar_lo_encolado(self) -> bool:
+        """Espera a que la Boca diga lo que el turno en curso YA soltó; devuelve
+        si quien llama puede hablar.
+
+        Para quien habla desde DENTRO de handle_turn, por fuera de la cola (el
+        aviso de una tool delicada). Con stream y un preámbulo ya soltado
+        (stream_release="sentence") la Boca aún tiene frases de este turno en
+        cola y la segmentación retiene la última: el aviso solo esperaba a la
+        que sonaba, se colaba a media explicación y el resto sonaba después.
+        Sin stream, antes del final del turno no hay nada encolado: vuelve ya.
+
+        False: la espera se soltó porque el turno dejó de ser el vigente (un
+        barge-in tiró la cola) o por el apagado; ya no hay nada que decir. Si la
+        Boca lleva _ESPERA_BOCA_S sin tomar otra frase (audio trabado), True:
+        quien esperaba habla igual.
+        """
+        turn, en_vivo = self.turno_en_curso, self._en_vivo
+        if turn is None or en_vivo is None:
+            return True
+        on_token, feeder = en_vivo
+        on_token.soltar()
+        feeder.flush()
+        if not feeder.fed:
+            return True
+        marca = threading.Event()
+        self.tts_q.put(marca)
+        en_cola = self.tts_q.qsize()
+        fin = time.monotonic() + _ESPERA_BOCA_S
+        while not marca.wait(_ESPERA_BOCA_SONDEO_S):
+            if self.shutdown.is_set() or not self.state.is_current(turn):
+                return False
+            quedan = self.tts_q.qsize()
+            if quedan != en_cola:  # la Boca avanza: el plazo vuelve a contar
+                en_cola, fin = quedan, time.monotonic() + _ESPERA_BOCA_S
+            elif time.monotonic() >= fin:
+                break
+        return True
 
     def _encolar(self, sentence: str, turn: int) -> None:
         if self._prepare is not None:
@@ -263,12 +323,14 @@ class BrainThread(threading.Thread):
             # cancel_on_barge_in: el turno se corta en cuanto un barge-in lo
             # invalida (ver la nota de la clase). Sin ella, la llamada de siempre.
             cortar = {"should_abort": partial(self._abortado, turn)} if self._cancelable else {}
+            self.turno_en_curso = turn
             try:
                 if self.stream:
                     feeder = SentenceFeeder(partial(self._encolar_si_vigente, turn))
                     # El aviso de un LLM que se cae a media respuesta, en frase
                     # aparte (lo mismo que el loop simple).
                     on_token = _AvisoEnFraseAparte(feeder.feed)
+                    self._en_vivo = (on_token, feeder)
                     reply = self.agent.handle_turn(command, on_token=on_token, **cortar)
                 elif cortar:
                     reply = self.agent.handle_turn(command, on_token=_callar, **cortar)
@@ -281,6 +343,9 @@ class BrainThread(threading.Thread):
                 # PEGADO en "pensando" para siempre.
                 reply = "Se me trabaron los cables, patrón. Vuelve a intentarlo."
                 roto = True
+            finally:
+                self.turno_en_curso = None
+                self._en_vivo = None
             hablado = False
             if feeder is not None and on_token is not None:
                 # Fin del streaming: lo retenido y la cola que no cerró frase.
@@ -675,6 +740,15 @@ class EarThread(threading.Thread):
                 self._finish_command()
 
         elif mode in (Mode.THINKING, Mode.SPEAKING):
+            # Escucha pausada desde el panel: el turno en curso no se corta, pero
+            # tampoco abre otro (la misma regla que el wake de arriba y que el
+            # followup del loop simple). El barge-in era la única forma de
+            # empezar una orden SIN wake estando en pausa: la voz del cuarto
+            # cortaba la respuesta, se transcribía, iba al LLM y se contestaba.
+            # La racha se rompe: al reanudar, lo oído antes de la pausa no cuenta.
+            if not self.state.is_enabled():
+                self._barge_run = 0
+                return
             if self.allow_barge_in and self._is_patron_voice(chunk, mode):
                 self.tts.stop()            # corta el audio YA
                 _drain_queue(self.tts_q)   # tira las frases viejas

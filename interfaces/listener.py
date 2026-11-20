@@ -549,6 +549,27 @@ def _log_heard(heard: str, threshold: float, variants: Any, activated: bool) -> 
                  score, threshold, head, "ACTIVA" if activated else "no")
 
 
+@dataclass
+class _TurnoSimple:
+    """Lo que voice_confirm necesita del loop simple, que se arma DESPUÉS que él
+    (build_agent recibe el confirm_fn antes de que el loop exista).
+
+    estado: el SharedState del loop, lo que ve el HUD (None hasta que se crea).
+    hablar_pendiente: con stream_speak, dice ENTERO lo que el turno en curso ya
+    soltó por on_token (ver _hablar_pendiente); None fuera de un turno así.
+    """
+
+    estado: SharedState | None = None
+    hablar_pendiente: Callable[[], None] | None = None
+
+
+def _hablar_pendiente(on_token: _AvisoEnFraseAparte, speaker: StreamSpeaker) -> None:
+    """Lo que el turno ya soltó por on_token se habla entero antes de volver: lo
+    que on_token retenía, la frase a medio cerrar y la cola del StreamSpeaker."""
+    on_token.soltar()
+    speaker.drain()
+
+
 def _run_simple_loop(
     agent: Any,
     stt: STT,
@@ -564,6 +585,7 @@ def _run_simple_loop(
     pregate: _PreFiltro | None = None,
     mic: MicSession | None = None,
     on_wake: Callable[[], None] | None = None,
+    turno: _TurnoSimple | None = None,
 ) -> int:
     """Bucle secuencial clásico (--simple o sin openWakeWord): espera el wake,
     graba la orden, la atiende y vuelve a esperar. Extraído de run_listen para
@@ -591,6 +613,10 @@ def _run_simple_loop(
     pre-conecta mientras el patrón la dice. Un falso wake (el wake y silencio) o
     una ventana de followup que acaba en silencio no avisan. Debe volver al
     instante; su dueño es quien lo pasa. None = nada, lo de siempre.
+
+    turno (ver _TurnoSimple): el enlace con voice_confirm. En cada turno hablado
+    en streaming el loop deja ahí cómo decir lo ya soltado, para que la pregunta
+    de confirmación de una tool no se cuele por delante. None = nada.
     """
     # Sin sesión, las grabaciones reciben exactamente los argumentos de siempre.
     fuente: dict[str, Any] = {} if mic is None else {"source": mic}
@@ -813,6 +839,11 @@ def _run_simple_loop(
                             tts, on_first=lambda: hud_state.set_mode(Mode.SPEAKING)
                         )
                         on_token = _AvisoEnFraseAparte(speaker.feed)
+                        # Para voice_confirm, si este turno pide confirmar una
+                        # tool: lo ya soltado se dice antes que la pregunta.
+                        if turno is not None:
+                            turno.hablar_pendiente = partial(
+                                _hablar_pendiente, on_token, speaker)
                         try:
                             reply, roto = atender(command, on_token=on_token)
                             on_token.cerrar(reply)
@@ -824,6 +855,8 @@ def _run_simple_loop(
                             hud_state.set_text(reply)
                             print(reply, flush=True)
                         finally:
+                            if turno is not None:
+                                turno.hablar_pendiente = None
                             spoke = speaker.finish()
                         # roto: el aviso nunca pasó por el streamer; lo que este
                         # haya dicho es la respuesta cortada, así que va aparte.
@@ -928,6 +961,7 @@ def _make_notice_say(
     say: Callable[[str], None],
     tts: Any,
     get_state: Callable[[], SharedState | None],
+    get_brain: Callable[[], Any] | None = None,
 ) -> Callable[[str], None]:
     """say() del aviso de make_deny_with_notice en el loop CONCURRENTE (V9).
 
@@ -939,10 +973,14 @@ def _make_notice_say(
     terminar se vuelve a THINKING: el LLM sigue con el turno (solo si el SPEAKING
     lo puso el aviso; en streaming puede ser de la Boca, ver el finally).
 
-    Si el modo ya no es THINKING, un barge-in abrió otro turno (el patrón está
-    dictando la orden nueva) y lo del turno viejo se descarta, como su
-    respuesta: hablar encima metía el aviso en esa grabación. `get_state` da el
-    estado del VoiceLoop, que se arma DESPUÉS del agente; sin él, say() a secas.
+    El aviso es del turno que el Cerebro ATIENDE (`get_brain().turno_en_curso`),
+    no del vigente cuando se dice: tras un barge-in el turno viejo termina en
+    silencio y, si ya no es el vigente, lo suyo se descarta, como su respuesta.
+    Mirar el turno vigente solo lo descartaba mientras el patrón dictaba
+    (LISTENING): con la orden nueva ya cerrada (THINKING otra vez, esperando al
+    Cerebro) el aviso viejo sonaba entero sobre ella, con el HUD en "hablando".
+    `get_state` da el estado del VoiceLoop, que se arma DESPUÉS del agente; sin
+    él, say() a secas. Sin Cerebro a la vista, el turno vigente, como antes.
     """
 
     def _say(text: str) -> None:
@@ -950,13 +988,22 @@ def _make_notice_say(
         if state is None:
             say(text)
             return
-        turn = state.turn_id
-        cambio = state.compare_and_set_mode(Mode.THINKING, Mode.SPEAKING)
+        brain = get_brain() if get_brain is not None else None
+        turn = getattr(brain, "turno_en_curso", None)
+        if turn is None:
+            turn = state.turn_id
+        # [voice].stream_speak_concurrent: lo que este turno ya le mandó a la Boca
+        # se dice ANTES que el aviso, que si no se colaba a media explicación (el
+        # turno de voz solo lo pone detrás de la frase que suena). Si esa espera
+        # se suelta por un barge-in o por el apagado, ya no hay aviso que decir.
+        procede = state.is_current(turn) and (brain is None or brain.hablar_lo_encolado())
+        # Turno y modo: solo se pasa a SPEAKING el THINKING de ESTE turno.
+        cambio = procede and state.is_current(turn) and state.compare_and_set_mode(
+            Mode.THINKING, Mode.SPEAKING)
         if not cambio and not (
-                # [voice].stream_speak_concurrent: la Boca ya puede estar diciendo
-                # el principio de ESTE turno; el aviso suena detrás (turno de voz
-                # del TTS), no se tira.
-                state.get_mode() is Mode.SPEAKING and state.is_current(turn)):
+                # [voice].stream_speak_concurrent: la Boca ya dijo el principio de
+                # ESTE turno y el modo es suyo; el aviso suena detrás, no se tira.
+                procede and state.get_mode() is Mode.SPEAKING and state.is_current(turn)):
             log.info("aviso de un turno ya interrumpido, no lo digo: %s", text)
             return
         print(text, flush=True)
@@ -1378,30 +1425,55 @@ def _listen_with_warmer(settings: Any, cfg: ListenerConfig, tts: TTS, warmer: _W
     # abre más abajo, tras el saludo, y voice_confirm (que corre dentro de un
     # turno) escucha la respuesta en ella.
     sesion_mic: list[MicSession] = []
+    # Y lo demás que voice_confirm necesita de ese loop, que tampoco existe aún:
+    # su estado (el HUD) y lo que el turno en curso ya soltó a la voz.
+    turno_simple = _TurnoSimple()
 
     def voice_confirm(reason: str) -> bool:
-        say(reason + " Di 'confirmo' o 'cancela', patrón.")
-        fuente: dict[str, Any] = {}
-        if sesion_mic:
-            # La pregunta que acaba de sonar (y lo de antes) no es la respuesta:
-            # fuera, como con el stream que antes se abría aquí.
-            sesion_mic[0].flush()
-            fuente = {"source": sesion_mic[0]}
+        # stream_release="sentence": lo que el turno ya soltó se dice ENTERO antes
+        # de preguntar. say() solo espera a la frase que suena: la pregunta se
+        # colaba a media explicación y el resto del preámbulo sonaba con el
+        # micrófono de la respuesta abierto (en altavoces, una respuesta sucia,
+        # que vale "no"). De fábrica ("final") no hay nada soltado.
+        if turno_simple.hablar_pendiente is not None:
+            turno_simple.hablar_pendiente()
+        # El HUD acompaña, como con el aviso del loop concurrente (V9): "hablando"
+        # mientras suena la pregunta y "escuchando" mientras se graba la
+        # respuesta. Se quedaba en "pensando" todo el rato, con el patrón
+        # esperado al micrófono. Al acabar, el modo que traía el turno
+        # (THINKING, o SPEAKING si el streaming ya había empezado a hablar).
+        estado = turno_simple.estado
+        previo = None if estado is None else estado.get_mode()
         try:
-            # C5: la respuesta la transcribe el modelo de la ORDEN, no el 'tiny'
-            # del wake (solo para la palabra de activación): un mishear vale "no"
-            # (lo seguro) y el patrón tenía que repetir la orden entera. Mismas
-            # ventanas (respuesta de una palabra) y sin hotwords: no es un
-            # comando. min_audio_s: si nadie contestó, "" (un "no") sin pasar el
-            # silencio por Whisper.
-            answer = stt.listen_once(silence_ms=cfg.wake_silence_ms,
-                                     max_seconds=cfg.confirm_max_s,
-                                     min_audio_s=cfg.min_audio_s, **fuente)
-        except (VoiceUnavailable, MicFailed):
-            # Sin micrófono no hay "sí": lo seguro. El loop se entera del
-            # MicFailed en su siguiente escucha.
-            return False
-        return wake.confirmation_from_answer(answer)
+            if estado is not None:
+                estado.set_mode(Mode.SPEAKING)
+            say(reason + " Di 'confirmo' o 'cancela', patrón.")
+            fuente: dict[str, Any] = {}
+            if sesion_mic:
+                # La pregunta que acaba de sonar (y lo de antes) no es la respuesta:
+                # fuera, como con el stream que antes se abría aquí.
+                sesion_mic[0].flush()
+                fuente = {"source": sesion_mic[0]}
+            if estado is not None:
+                estado.set_mode(Mode.LISTENING)
+            try:
+                # C5: la respuesta la transcribe el modelo de la ORDEN, no el 'tiny'
+                # del wake (solo para la palabra de activación): un mishear vale "no"
+                # (lo seguro) y el patrón tenía que repetir la orden entera. Mismas
+                # ventanas (respuesta de una palabra) y sin hotwords: no es un
+                # comando. min_audio_s: si nadie contestó, "" (un "no") sin pasar el
+                # silencio por Whisper.
+                answer = stt.listen_once(silence_ms=cfg.wake_silence_ms,
+                                         max_seconds=cfg.confirm_max_s,
+                                         min_audio_s=cfg.min_audio_s, **fuente)
+            except (VoiceUnavailable, MicFailed):
+                # Sin micrófono no hay "sí": lo seguro. El loop se entera del
+                # MicFailed en su siguiente escucha.
+                return False
+            return wake.confirmation_from_answer(answer)
+        finally:
+            if estado is not None and previo is not None:
+                estado.set_mode(previo)
 
     # El modo (decidido arriba) va ANTES de build_agent porque el confirm_fn
     # depende de él: concurrente → deny_with_notice (el EarThread ya tiene el mic;
@@ -1410,7 +1482,8 @@ def _listen_with_warmer(settings: Any, cfg: ListenerConfig, tts: TTS, warmer: _W
     # que todavía no existe: se engancha al crearlo, más abajo.
     voice_loops: list[Any] = []
     notice_say = _make_notice_say(
-        say, tts, lambda: voice_loops[0].state if voice_loops else None
+        say, tts, lambda: voice_loops[0].state if voice_loops else None,
+        lambda: getattr(voice_loops[0], "brain", None) if voice_loops else None,
     )
     confirm_fn = make_deny_with_notice(notice_say) if concurrente else voice_confirm
     try:
@@ -1480,6 +1553,7 @@ def _listen_with_warmer(settings: Any, cfg: ListenerConfig, tts: TTS, warmer: _W
     # concurrente ya lo hacía). Reutilizamos SharedState para garantizar el MISMO
     # esquema JSON que el HUD espera.
     hud_state = SharedState(publisher=hud_gate.publish)
+    turno_simple.estado = hud_state
     # Estado inicial de la escucha desde el canal de control (default: activa).
     hud_state.set_enabled(read_control_enabled())
     # Publicar SIEMPRE el estado inicial: pisa un hud_state.json rancio de un
@@ -1508,7 +1582,7 @@ def _listen_with_warmer(settings: Any, cfg: ListenerConfig, tts: TTS, warmer: _W
             agent=agent, stt=stt, wake_stt=wake_stt, tts=tts,
             wake_detector=wake_detector, use_oww=use_oww, cfg=cfg,
             hud_state=hud_state, say=say, media=media, ducker=ducker, pregate=pregate,
-            **con_sesion,
+            turno=turno_simple, **con_sesion,
         )
     finally:
         if preconexion is not None:

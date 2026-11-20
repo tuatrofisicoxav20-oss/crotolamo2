@@ -11,9 +11,12 @@ propia idea de "ya se habló".
 from __future__ import annotations
 
 import re
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from crotolamo.logging_setup import get_logger
+
+if TYPE_CHECKING:  # solo el tipo: core no carga el paquete de voz al importarse
+    from crotolamo.voice.tts import _Lista
 
 log = get_logger("core.streaming")
 
@@ -174,6 +177,9 @@ class LiveStreamer:
         # de un bloque de código ningún candidato cierra frase).
         self._fences = 0
         self._fenced_to = 0
+        # La memoria de lista numerada de `_split` (voice/tts.py, `_Lista`), al
+        # día con los candidatos ya decididos. Se crea con la primera sonda.
+        self._lista: _Lista | None = None
 
     def _probe(self, chunk: str) -> str:
         """La regla de "sentence" sobre lo acumulado: "json" (pinta a tool-call:
@@ -210,10 +216,18 @@ class LiveStreamer:
         `_cierra_frase` solo mira hacia atrás y un carácter adelante, y la
         paridad de cercas ``` (dentro de un bloque de código no se corta) solo
         hacia atrás. Así cada token solo escanea lo nuevo y la cola aún indecisa.
+
+        La memoria de lista de `_split` (`_Lista`: "42. ¿Algo más?" empieza por
+        un número, no por una viñeta) va por el mismo camino: solo la cambia un
+        candidato tras un punto, y el indeciso del final, si es tras un punto,
+        aún no se evalúa. Cada candidato decidido pasa por ella una sola vez.
         """
         # Perezoso: core no carga el paquete de voz al importarse.
         from crotolamo.voice import tts
 
+        lista = self._lista
+        if lista is None:
+            lista = self._lista = tts._Lista()
         head, end = self._head, len(self._head)
         closed, cut = self._closed, self._cut
         fences, fenced_to = self._fences, self._fenced_to
@@ -230,7 +244,7 @@ class LiveStreamer:
                 floor = start
                 if head[start - 1] == ".":
                     break
-            if fences % 2 == 0 and tts._cierra_frase(head, start, stop):
+            if fences % 2 == 0 and lista.cierra(head, start, stop):
                 # `_split` descarta las piezas en blanco, pero la 1ª nunca lo
                 # está (`head` empieza sin espacio): cerrar una ya es "cerró".
                 closed, cut = True, stop
