@@ -284,6 +284,11 @@ def detector(monkeypatch):
     modelo = _OwwFalso()
     det._model = modelo  # type: ignore[assignment]
     det._np = np
+    # Nunca el sounddevice de la máquina: listen_for_wake lo importa también con
+    # source=, y al importarse inicializa PortAudio. Sin servidor de audio (el
+    # runner de GitHub) eso revienta; con él, el test tocaría el audio de verdad.
+    # con() lo cambia por el mundo que el test necesite.
+    monkeypatch.setitem(sys.modules, "sounddevice", types.ModuleType("sounddevice"))
 
     def _con(audio) -> _Mundo:
         mundo = _Mundo(audio)
