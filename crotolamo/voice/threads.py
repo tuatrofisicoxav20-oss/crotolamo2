@@ -748,6 +748,15 @@ class EarThread(threading.Thread):
             # La racha se rompe: al reanudar, lo oído antes de la pausa no cuenta.
             if not self.state.is_enabled():
                 self._barge_run = 0
+                # Y la memoria del detector, que en pausa ya no oye: la RNN del VAD
+                # se quedaba congelada en lo último oído (a media voz del cuarto) y
+                # al reanudar el silencio puntuaba alto unos chunks. _barge_frames
+                # no vacío = el detector oyó algo desde la última limpieza: se
+                # limpia UNA vez por pausa, no en cada chunk (~31 por segundo). Sin
+                # --barge-in el detector no oye nunca y aquí no hay nada que hacer.
+                if self._barge_frames:
+                    self._barge_frames.clear()
+                    self._reset_vad()
                 return
             if self.allow_barge_in and self._is_patron_voice(chunk, mode):
                 self.tts.stop()            # corta el audio YA

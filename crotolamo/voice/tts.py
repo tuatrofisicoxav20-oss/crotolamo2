@@ -204,7 +204,29 @@ def _split(text: str, *, final: bool, lista: _Lista | None = None) -> tuple[list
             continue  # dentro de un bloque de código
         if not lista.cierra(text, m.start(), m.end()):
             continue
-        pieces.append(text[start:m.start()])
+        corte = m.start()
+        # La pieza acaba en un "NN." que abre línea: `cierra` solo corta ahí si es
+        # un número suelto, que se dice (con lista a la vista es viñeta y no
+        # corta). Como un salto de línea suelto no corta, el número sonaba pegado
+        # al final de la línea anterior: "Te faltan estos:\n3. Reinicia\n4. Ir al
+        # banco a las 10\n5. ..." se oía "Te faltan estos: 3.", "Reinicia 4.", "Ir
+        # al banco a las 10 5.". Se corta también en ese salto: el número es su
+        # propia frase. Se decide con el mismo candidato, así que la línea
+        # anterior sale en el mismo momento que antes, no más tarde (y la sonda de
+        # "sentence" de core/streaming.py, que ya ve el corte de después del
+        # número, decide igual sin saber de este).
+        # Solo si al número le sigue algo. El que cierra la respuesta ("El total
+        # es\n42.") nunca pasó por viñeta y se dice con su línea, como siempre: con
+        # la respuesta entera ni siquiera hay candidato tras su punto, y lo que
+        # llega aquí con espacios de cola (el vaciado de un bloque ``` sin cerrar)
+        # tiene que cortar igual.
+        if corte - start >= 3 and text[corte - 1] == "." and text[corte - 2].isdigit():
+            salto = text.rfind("\n", start, corte)
+            if (salto >= 0 and m.end() < len(text)
+                    and _MARCADOR_LISTA.fullmatch(text, salto + 1, corte)):
+                pieces.append(text[start:salto])
+                start = salto + 1
+        pieces.append(text[start:corte])
         start = m.end()
         abierta = lista.abierta
         # Desde el carácter anterior al candidato: el salto puede ser ese.
