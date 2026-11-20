@@ -138,12 +138,16 @@ class _Lista:
         linea = text.rfind("\n", 0, start) + 1
         if not _MARCADOR_LISTA.fullmatch(text, linea, start):
             return False  # no cierra por otra regla (abreviatura, decimal)
-        if end < len(text) and text[end].isdigit():
-            return False  # "40. 5" al principio de la línea: decimal partido
+        # Que le siga una cifra ("40. 5": decimal partido, no corta) solo decide en
+        # un número SUELTO. Antes iba por delante de la lista: el "1." de "1. 2
+        # llamadas al banco" o "1. 9:00 reunión" no la abría, y cada marcador
+        # siguiente pasaba por número suelto, dicho y pegado al elemento anterior
+        # ("... 2 llamadas al banco 2.", "Comprar leche 3.").
+        suelto_corta = not (end < len(text) and text[end].isdigit())
         if linea == 0 and not self.inicio_linea:
-            return True  # el buffer empieza a media línea: no hay marcador
+            return suelto_corta  # el buffer empieza a media línea: no hay marcador
         if not self.abierta and int(text[linea:start - 1]) != 1:
-            return True  # número suelto: sin lista a la vista, se dice
+            return suelto_corta  # número suelto: sin lista a la vista, se dice
         self.abierta = True
         return False
 
