@@ -1,9 +1,15 @@
 # Auditoría y optimización de Crotolamo 2 — 2026-11-20
 
-Rama `audit-fixes`: 39 commits sobre `f316103` (el merge del PR #1, del
-2026-10-04) hasta `f460fc0`. **Los conteos de tests, commits y diff de este
-documento son a fecha del commit `f460fc0`; las cifras de los benches de la §3
-son las medidas al cerrar cada causa raíz y no se repitieron en `f460fc0`.**
+Rama `claude/optimistic-ride-iloitn` (así se llama en GitHub; `audit-fixes`
+fue solo su nombre de trabajo en el contenedor y no existe en el remoto): 44
+commits sobre `f316103` (el merge del PR #1, del 2026-10-04) hasta `b81e1c2`;
+uno de ellos, `601f02f`, es la primera versión de este informe. **Los conteos
+de tests, commits y diff de este documento son los del commit `b81e1c2`; las
+cifras de los benches de la §3 son las medidas al cerrar cada causa raíz y no
+se repitieron al final.** Detrás va un commit más, `4d0d7c9`, que solo
+corrige un test (§1): no cambia el producto ni el número de tests. El commit
+que trae esta versión del informe va detrás y solo toca `docs/`: su run de CI
+no consta aquí.
 
 Marcas: **[ARREGLADO]** lleva el commit que lo arregló; **[DECISIÓN]** cambia
 algo que oyes o ves y te toca a ti. "ON" / "OFF" = activo o apagado con la
@@ -18,11 +24,21 @@ significa eso y trae la lista de comprobaciones para tu máquina.
 
 ## 0. Resumen ejecutivo
 
+- **Qué validación tiene esto.** Nada se probó en tu laptop (§8). Y el CI de
+  GitHub salió en rojo en los siete primeros pushes del 20 de noviembre (de
+  `2f82ce6` a `601f02f`) sin correr un solo test, y no se miró hasta el
+  cierre: en esos commits "suite verde" fue solo la corrida local. No lo causó
+  la rama (el runner nuevo no puede importar `sounddevice` sin servidor de
+  audio), pero al arreglarlo (`4f64649`) el CI destapó un test de esta
+  auditoría que daba por hecho el orden de los archivos de una carpeta.
+  Corregido ese test (`4d0d7c9`), el run 59 es **verde**: el primero desde el
+  14 de noviembre y el único que valida el código final (§1).
 - **Tamaño del trabajo.** Primera pasada: 304 hallazgos; de ellos 198
   arreglados con test, 41 quedaron como decisión tuya y 39 pasaron a rediseño de
-  rendimiento. La revisión final del código ya corregido confirmó 96 defectos
-  más (todos arreglados). La suite pasó de 769 a 3808 tests y está en verde en
-  Python 3.11 y 3.12. Verde aquí no es "probado con micrófono" (§8).
+  rendimiento. La revisión final del código ya corregido confirmó 101 defectos
+  más (todos arreglados). La suite pasó de 769 a 3866 tests y pasa con
+  Python 3.11 y 3.12, aquí y, en el código final, en el CI de GitHub. Eso no
+  es "probado con micrófono" (§8).
 - **Seguridad.** La confirmación de una acción destructiva ahora dice QUÉ va a
   tocar (antes el mismo "sí" valía para una nota que para pisar `~/.bashrc`) y
   ya no toma por un sí una pregunta ("¿Se va a borrar todo?" ejecutaba). El
@@ -55,37 +71,41 @@ significa eso y trae la lista de comprobaciones para tu máquina.
   que oyes o no se pueden validar sin tu hardware: micrófono abierto por sesión
   (`audio_session`), hablar antes con GLM (`stream_release`: 1.7 → 0.6 s en el
   bench), pre-síntesis. Son 13 interruptores; cómo probarlos uno a uno, en §8.
-- **El propio trabajo metió regresiones y la revisión final las cazó.** Dos en
-  el wake difuso (tu modo) vivieron entre los commits `124ecf4` y `b09e63d`.
-  Siete efectos secundarios de la auditoría siguen abiertos como decisión tuya
-  (§4): `light_control` dice "prendí" con una entidad que no es luz (D40); con
-  el loop concurrente y sin micrófono, el servicio se reinicia cada ~5 s
-  saludando (D12); "muéstrame el estado del sistema" ya no enruta con el modelo
-  local (D29); con openWakeWord 0.6 el score sube a ~0.5 tras cada reinicio del
-  detector y un `oww_threshold` más bajo abre turnos fantasma (D16); la
-  confirmación por voz lee la ruta literal y la `~` no se oye (D1); el apagado
-  por señal, que la auditoría alargó hasta ~4 s y que con tres reproductores
-  colgados y la memoria activa pasa del tope del unit (D20); y la lista
-  numerada que no empieza en 1 (§7.1).
-- **Una decisión de producto se tomó por ti.** Un número al empezar una frase
-  ahora se dice ("42. ¿Algo más, patrón?" sonaba "¿Algo más, patrón?"). Precio:
-  una lista numerada que no empieza en 1 dice sus números, pegados al final del
-  elemento anterior ("Reinicia 4."); y en `f460fc0` también los dice una lista
-  que empieza en 1 si su primer elemento empieza por cifra (regresión arreglada
-  después, en `22e52d2`). Deshacerlo es chico (§7.1).
-- **Te quedan 49 decisiones numeradas** (§7.3-§7.9), más 13 interruptores
-  apagados que encender o no (§7.2), 36 preguntas menores (§7.10) y la de la
-  lista numerada (§7.1); casi todas pequeñas. Las que miraría primero, porque
-  tocan tu modo diario: las palabras que dejan una orden "a medias" (D6: 19 de
-  40 órdenes completas de prueba esperan 2.5 s de más), cómo dice una ruta la
-  confirmación por voz (D1) y el coste en reposo con la tele (D14). Y si usas
-  `[memoria]`: `olvidar_recuerdo` borra el recuerdo equivocado en 21 de 42
-  casos medidos (D22).
-- **Qué hacer primero en la laptop:** la lista de la §8 (doctor, smoke, diez
+- **El propio trabajo metió regresiones y la revisión las cazó.** Dos en el
+  wake difuso (tu modo) vivieron entre los commits `124ecf4` y `b09e63d`. Otra,
+  en las listas numeradas, la metió el arreglo de voz `2259ba2` y la cazó la
+  revisión posterior de ese commit (`22e52d2`, §11). Siete efectos secundarios
+  de la auditoría siguen abiertos como decisión tuya (§4): `light_control` dice
+  "prendí" con una entidad que no es luz (D40); con el loop concurrente y sin
+  micrófono, el servicio se reinicia cada ~5 s saludando (D12); "muéstrame el
+  estado del sistema" ya no enruta con el modelo local (D29); con openWakeWord
+  0.6 el score sube a ~0.5 tras cada reinicio del detector y un `oww_threshold`
+  más bajo abre turnos fantasma (D16); la confirmación por voz lee la ruta
+  literal y la `~` no se oye (D1); el apagado por señal, que la auditoría
+  alargó hasta ~4 s y que con tres reproductores colgados y la memoria activa
+  pasa del tope del unit (D20); y la lista numerada que no empieza en 1, que
+  ahora dice sus números (§7.1).
+- **Dos decisiones de producto se tomaron por ti.** Un número al empezar una
+  frase ahora se dice ("42. ¿Algo más, patrón?" sonaba "¿Algo más, patrón?").
+  Precio: una lista numerada que no empieza en 1 dice sus números. Y esos
+  números se dicen cada uno como frase corta aparte ("Reinicia el equipo",
+  "4.", "Ir al banco a las 10"), con unos 0.3 s más de audio por número. Las
+  listas que empiezan en 1 siguen sin decirlos. Deshacerlo es chico (§7.1).
+- **Te quedan 50 decisiones numeradas** (§7.3-§7.9), más 13 interruptores
+  apagados que encender o no (§7.2), 36 preguntas menores (§7.10) y la de los
+  números de las listas (§7.1); casi todas pequeñas. Las que miraría primero,
+  porque tocan tu modo diario: las palabras que dejan una orden "a medias" (D6:
+  19 de 40 órdenes completas de prueba esperan 2.5 s de más), cómo dice una
+  ruta la confirmación por voz (D1) y el coste en reposo con la tele (D14). Y
+  si usas `[memoria]`: `olvidar_recuerdo` borra el recuerdo equivocado en 21 de
+  42 casos medidos (D22).
+- **Qué hacer primero en la laptop:** la lista de la §8 (doctor, smoke, once
   pruebas de voz, apagado). Y revisa la libreta de hechos: si alguna vez le
   dictaste una contraseña, sigue ahí y ahora viaja en cada petición a la nube.
-- Los dos últimos bloques de commits (voz y apagado) tienen una revisión
-  adversarial posterior al arreglo; su resultado va en la §11.
+- **Dónde se paró.** Los dos últimos bloques de arreglos (voz y apagado)
+  tuvieron una revisión adversarial posterior; lo que confirmó está arreglado,
+  y lo que refutó (4 de 10 hallazgos) y dos residuos de gusto quedan como
+  están (§11, §7.1). Ahí se cerró: no se abrieron más rondas de revisión.
 
 ## 1. Cómo se hizo
 
@@ -125,10 +145,17 @@ entra apagado.
 unidades (47 de código y 7 transversales). Hay veredicto escrito para 1017
 funciones en 45 unidades (819 sin observaciones); de dos unidades (sse/streaming
 y tts) no se conserva la ficha función por función, sí sus veredictos y sus
-arreglos. Un escéptico por unidad intentó tumbar cada hallazgo: de 259
-veredictos, 147 refutados, 96 confirmados y 16 decisiones tuyas. Los 96
-confirmados están arreglados con test. Dos hallazgos bajos de una unidad se
-quedaron sin veredicto (§9).
+arreglos. Un escéptico por unidad intentó tumbar cada hallazgo.
+
+**Revisión de los últimos arreglos.** Dos unidades más, por commit y no por
+función: una revisión adversarial del commit de voz (`2259ba2`) y otra de los
+dos de apagado (`09aeedb` y `f460fc0`), cada una hecha por alguien que no los
+escribió y con su escéptico (§11).
+
+Entre las 56 unidades: 269 veredictos, de ellos 151 refutados, 101
+confirmados y 17 decisiones tuyas (una, la del número de lista pegado, se
+aplicó después: §7.1). Los 101 confirmados están arreglados con test. Dos
+hallazgos bajos de una unidad se quedaron sin veredicto (§9).
 
 **Revisiones transversales.** Siete: la voz de punta a punta (los dos loops
 con audio simulado, comparados con el árbol anterior a la auditoría), config ↔
@@ -139,16 +166,59 @@ reposo, empaquetado e instalación, y las conexiones a la nube.
 la cuenta, que cortó lo que estaba corriendo; las revisiones que se perdieron
 así (tres transversales y un arreglador) se repitieron desde cero.
 
-**Tests.** `pytest --collect-only -q`: 769 en `f316103` y 3808 en `f460fc0`
-(mismo número con Python 3.11 y 3.12); de 49 a 119 archivos de test. En
-`f460fc0`: 3806 pasan y 2 se saltan en los dos intérpretes; ruff y mypy
-limpios. El diff: 186 archivos, +64840 / −1804 líneas, de las que +14598 /
-−1628 son código (76 archivos `.py` y `.sh`) y +49683 son tests (97
-archivos).
+**Tests.** `pytest --collect-only -q`: 769 en `f316103` y 3866 en `b81e1c2`
+(mismo número con Python 3.11 y 3.12); de 49 a 121 archivos de test. En
+`b81e1c2`, aquí: 3864 pasan y 2 se saltan en los dos intérpretes; ruff y mypy
+limpios. El diff, sin contar este informe: 188 archivos, +65890 / −1804
+líneas, de las que +14656 / −1630 son código (76 archivos `.py` y `.sh`) y
++50675 son tests (99 archivos).
 
-**Lo último.** Los commits `2259ba2` (voz), `09aeedb` y `f460fc0` (apagado)
-tienen una revisión adversarial posterior al arreglo. Su resultado está en la
-§11 "Adenda".
+**El CI de GitHub estuvo en rojo y no se miró.** Los siete primeros pushes del
+20 de noviembre (runs 51 a 57: `2f82ce6`, `6ac95b2`, `09aeedb`, `2259ba2`,
+`f460fc0`, `22e52d2` y `601f02f`) fallaron en los dos jobs, y quien coordinó
+no lo vio hasta el cierre. El último verde era el run 50 (`0c6d1d9`, del 14 de
+noviembre). Causa, comprobada en los logs de los 14 jobs de esos runs:
+`ubuntu-latest` pasó a la imagen ubuntu-26.04, cuyo PortAudio trae la API de
+PulseAudio y no inicializa sin servidor de audio. Ahí `import sounddevice`
+revienta, y `tests/test_tts_stop.py` (anterior a la auditoría) lo importaba al
+cargarse: error de colección, y pytest paraba en 4 a 8 s sin correr ningún
+test. No lo causó ningún commit de la rama. La consecuencia sí es de este
+trabajo: en esos siete commits, cada "suite verde" de los mensajes de commit
+fue solo la corrida local. De ellos el CI solo validó ruff y mypy (pasaron en
+los 14 jobs); no corrió ni un test. Se arregló en dos archivos de test
+(`4f64649`), sin tocar el producto: con un doble de `sounddevice` que falla
+igual al importarse, aquí pasó de 1 error de colección y 0 tests a 3864 que
+pasan.
+
+Con eso, el run 58 (`b81e1c2`) corrió la suite entera por primera vez desde el
+run 50 y salió rojo otra vez: 3862 pasan, 1 falla y 3 se saltan, en los dos
+jobs. Fallaba `test_find_in_project_recorta_una_linea_kilometrica`, un test de
+esta auditoría (`075187c`) que daba por hecho el orden en que `grep -r` recorre
+una carpeta. Ese orden lo pone el sistema de archivos: en la imagen vieja del
+runner y en este contenedor salía de una forma; en ubuntu-26.04, al revés.
+`find_in_project` hace lo mismo en los dos sitios; lo que estaba mal era el
+test. Lo corrige `4d0d7c9`, que solo toca ese test; antes de subirlo, la suite
+entera pasó con un doble de `grep` que devuelve los archivos al revés: ningún
+otro test tenía esa suposición.
+
+El run 59 (`4d0d7c9`) es **verde** en los dos jobs: ruff, mypy y pytest, con
+3863 que pasan y 3 que se saltan en Python 3.12 y en 3.11. Es el primer verde
+desde el run 50 y la única vez que el CI ha corrido la suite entera sobre el
+código final. Simular aquí el fallo del runner no bastó para predecir el CI:
+el segundo fallo solo lo enseñó el runner de verdad. El juez es el CI, no la
+corrida local.
+
+**Cierre.** Los commits `2259ba2` (voz), `09aeedb` y `f460fc0` (apagado)
+tuvieron una revisión adversarial posterior al arreglo: lo que confirmó está
+arreglado (`22e52d2`, `3993c47`), la decisión que planteó se aplicó
+(`b81e1c2`), y cuatro hallazgos refutados y dos residuos de gusto quedan
+como están (§11, §7.1). A media revisión preguntaste si lo que se estaba
+haciendo estaba bien. La respuesta honesta fue "a medias": lo pedido estaba
+cumplido, y revisar los arreglos de los arreglos ya rendía cada vez menos. Se
+acordó no abrir rondas nuevas: terminar lo que estaba corriendo y cerrar. Así
+se hizo. Por eso los arreglos de `22e52d2` y `3993c47` y los cambios de tests
+de `4f64649` y `4d0d7c9` no tienen revisión propia posterior, y el de
+`b81e1c2` tiene una sola ronda, de dos verificadores (§11.4).
 
 ## 2. Lo más grave que estaba roto (y ya no)
 
@@ -177,7 +247,7 @@ Todo lo de esta sección está **[ARREGLADO]**, con test que fallaba antes.
   filtro de secretos dejaba pasar clave/NIP/PIN, contraseñas cortas y tokens
   tipo `AKIA…` o `ya29.…`. `fd8fe45`. Lo que ya estuviera guardado no se borra
   solo (§8, paso 11). El filtro sigue siendo una heurística con huecos
-  conocidos, comprobados en `f460fc0`: "mi contraseña es gato dos mil
+  conocidos, comprobados en `b81e1c2`: "mi contraseña es gato dos mil
   veinticuatro", "mi contraseña es gato 2024", "la contraseña del wifi es la
   casa azul" o un número de tarjeta con su CVV SÍ se guardan; y como ahora los
   hechos van anclados, lo que se cuele viaja en cada petición a la nube. No le
@@ -212,10 +282,12 @@ Todo lo de esta sección está **[ARREGLADO]**, con test que fallaba antes.
   cgroup de `crotolamo.service` y systemd lo mataba al reiniciar. `18fb058`
 - **La última extracción de memoria se perdía al salir**: al salir normal
   (`fd8fe45`, `4d2b642`) y al cerrar la ventana de `crotolamo shell` (en una
-  pty real: 0 de 8 la conservaban, ahora 24 de 24; `f460fc0`). Y, ya dentro de
-  la auditoría, al parar el servicio durante la pausa de extracción que ella
-  misma añadió (`bdb4e6b`): 2.0 s perdidos y nada extraído; ahora 0.001 s y
-  extraído (`f460fc0`; ver §4).
+  pty real: 0 de 8 la conservaban, ahora 24 de 24; `f460fc0`). Ese arreglo dejó
+  un caso fuera, que cazó la revisión posterior: cerrar la ventana justo
+  después de "salir" (SIGHUP 0.2 s tras el "apagado": extracción perdida;
+  ahora, guardada; `3993c47`, §11). Y, ya dentro de la auditoría, al parar el
+  servicio durante la pausa de extracción que ella misma añadió (`bdb4e6b`):
+  2.0 s perdidos y nada extraído; ahora 0.001 s y extraído (`f460fc0`; ver §4).
 - **El panel te borraba `listener.env`.** Cambiar el modo lo reescribía desde
   cero, sin escritura atómica. `e34cf9e`
 
@@ -389,9 +461,9 @@ aviso. `d082104`, `c892d1f`
 | Los cinco checks de voz del doctor | ~4 s | ~0.3 s | igual (en `d082104`) | ON |
 | Memoria que Piper retenía tras UNA respuesta larga | ~409 MB | ~7 MB | modelos reales | ON (`piper_arena_keep_phonemes = 256`) |
 
-El comando `crotolamo doctor` entero, cronometrado aquí en `f460fc0` (sin key,
+El comando `crotolamo doctor` entero, cronometrado aquí en `b81e1c2` (sin key,
 o sea sin la sonda a la nube): de ~3 s a menos de 1 s. Con la máquina
-tranquila, 0.4-0.5 s con tu `use_oww = false` y 0.5-0.9 s con la config de
+tranquila, 0.4-0.5 s con tu `use_oww = false` y 0.6-0.9 s con la config de
 fábrica, porque desde `27af075` el check voz-oww carga el modelo de wake para
 avisar si no carga.
 
@@ -537,7 +609,7 @@ orden. `bdb4e6b`
 Con tu config (memoria semántica apagada) lo único que te toca de esta causa
 es el primer renglón.
 
-## 4. Regresiones que el propio trabajo introdujo y la revisión final cazó
+## 4. Regresiones que el propio trabajo introdujo y la revisión cazó
 
 Cada una se contrastó con el historial de git antes de llamarla regresión.
 
@@ -560,6 +632,11 @@ Cada una se contrastó con el historial de git antes de llamarla regresión.
 - **MCP.** El "cierre educado" de `6508165` abrió una ventana de 1-6 s en la
   que un server en retirada era invisible para el apagado por señal y
   sobrevivía a Crotolamo (antes eran microsegundos). Arreglado en `0354cea`.
+  Quedaba un borde de esa misma espera, que la auditoría ensanchó pero no
+  inventó: si un Ctrl-C (o, desde `f460fc0`, el SIGTERM o SIGHUP del shell)
+  cortaba el cierre de un server colgado, nadie lo remataba y sobrevivía. Lo
+  cazó la revisión posterior del apagado; arreglado en `3993c47`. El Ctrl-C
+  durante la salida del shell es otro camino y sigue dejándolo vivo (§9).
 - **Apagado.** La pausa de 120 s de la extracción (nueva en `bdb4e6b`) hacía
   que parar el servicio en ese rato esperara 2 s en balde y perdiera lo
   encolado. Arreglado en `f460fc0`.
@@ -572,15 +649,32 @@ Cada una se contrastó con el historial de git antes de llamarla regresión.
 - **Lista numerada cuyo primer elemento empieza por cifra.** "1. 2 llamadas al
   banco / 2. Comprar leche / 3. Ir al gimnasio" pasó a decir sus números,
   pegados al elemento anterior ("2 llamadas al banco 2.", "Comprar leche 3.");
-  antes sonaba sin números. Regresión de `2259ba2`, cazada por la revisión
-  posterior de ese commit. Ojo: sigue presente en `f460fc0`; el arreglo es el
-  commit siguiente, `22e52d2` (§11).
+  antes sonaba sin números. Regresión de `2259ba2`, un arreglo de esta misma
+  auditoría; la cazó la revisión posterior de ese commit y vivió hasta
+  `22e52d2`. Medido contra el padre de `2259ba2`: de 8000 listas generadas
+  que empiezan en 1 diferían 2771; ahora 0 (§11). La misma revisión midió
+  que el precio declarado de `2259ba2` (la lista que no empieza en 1 dice sus
+  números) sonaba peor de lo declarado: pegados a la línea anterior ("Ir al
+  banco a las 10 5."). Desde `b81e1c2` cada número es su propia frase (§7.1).
+- **Barge-in tras una pausa del panel** (loop concurrente con `--barge-in`).
+  El arreglo de `2259ba2` dejó al detector sin oír durante la pausa y nada lo
+  limpiaba al reanudar: el silencio puntuaba alto unos chunks. Con los
+  umbrales de fábrica no llegó a abrir un turno falso (0 de 24). Limpiado en
+  `b81e1c2` (§11).
 - **Docs.** `README_M4` siguió diciendo que el esquema de una tool MCP pasa
   intacto cuando ya se recorta por encima de 4000 bytes. `2f82ce6`
 - **Tests y CI.** El CI estuvo en rojo en `d082104`: un test nuevo construía su
   referencia con la firma de openWakeWord 0.4 y la CI de Python 3.11 instala la
-  0.6 (`2fa637e`, solo el test). Y el test nuevo del SIGKILL de MCP fallaba 1 de
-  cada ~15 bajo carga por una carrera del test, no del código (`09aeedb`).
+  0.6 (`2fa637e`, solo el test). El test nuevo del SIGKILL de MCP fallaba 1 de
+  cada ~15 bajo carga por una carrera del test, no del código (`09aeedb`). Lo
+  mismo el test nuevo de señales del listener: 1 cuelgue en 3000 corridas
+  bajo carga, por una carrera del test. Los del shell tenían el mismo hueco,
+  demostrado a propósito con gdb y nunca visto en una corrida (40 de 40 bajo
+  carga). Los dos, en `3993c47`. Y un test nuevo de `find_in_project`
+  (`075187c`) daba por hecho el orden en que `grep` recorre una carpeta:
+  pasaba aquí y falló en el runner nuevo de GitHub, la primera vez que el CI
+  volvió a correr la suite (`4d0d7c9`). El rojo del CI del 20 de noviembre
+  por `sounddevice` no está en esta lista: no lo causó la rama (§1).
 - **Dos mensajes de commit dijeron más de lo que hicieron.** `b4ac3fe` dice que
   quita `_play_interruptible` y no lo quitó (lo quitó `b09e63d`); `a9a762d` dice
   que `stt_harness` ya no suelta traceback sin micrófono y solo le cambió las
@@ -612,10 +706,10 @@ Cada una se contrastó con el historial de git antes de llamarla regresión.
   server MCP ignora el SIGTERM, recortados como servicio para no pasar de 8 s).
   Con tres reproductores atenuados, el D-Bus colgado y la memoria activa, pasa
   de 7 s a 11 s y supera el `TimeoutStopSec=10` del unit. → D20
-- Una lista numerada que no empieza en 1 dice sus números, pegados al final
-  del elemento anterior ("Reinicia 4.", "Ir al banco a las 10 5."). Antes los
-  callaba. Viene de `2259ba2`, como precio declarado de no perder un número
-  que es la respuesta. → §7.1
+- Una lista numerada que no empieza en 1 dice sus números, cada uno como
+  frase corta aparte ("Reinicia el equipo", "4.", "Ir al banco a las 10").
+  Antes los callaba. Viene de `2259ba2`, como precio declarado de no perder un
+  número que es la respuesta. → §7.1
 - Costes asumidos, no errores: retirar un server MCP colgado, o uno que falla
   al arrancar, tarda 1 s más por el cierre educado; y tu loop simple tiene un
   hilo nuevo que mira `control.json` tres veces por segundo (§3.6).
@@ -627,6 +721,12 @@ la pausa del panel que no cortaba la ventana de seguimiento del loop simple
 abría una orden con la escucha en pausa y el HUD en "pensando" durante la
 confirmación (`2259ba2`); las líneas de `faster_whisper` en el diario
 (`f460fc0`).
+
+**Un caso que un arreglo de la auditoría dejó sin cubrir** (tampoco es
+regresión: antes de la auditoría la última extracción ya se perdía al salir,
+§2): cerrar la ventana de `crotolamo shell` justo después de "salir".
+`f460fc0` cubrió el cierre con el shell en el prompt; este lo midió y lo
+cerró la revisión posterior del apagado (`3993c47`, §11).
 
 ## 5. Lo que vas a notar al usarlo
 
@@ -642,10 +742,11 @@ Con la config de fábrica más tu `use_oww = false` (loop simple, wake difuso).
   condicional, cuenta como no. El sí tiene que ir al principio: "sí" o
   "confirmo" valen; "claro que sí", que antes valía, ahora obliga a repetir.
 - Un número al principio de una frase se dice. Una lista numerada que empieza
-  en 1 sigue sin leer sus números, salvo en `f460fc0` si su primer elemento
-  empieza por cifra ("1. 2 llamadas al banco": arreglado después, en
-  `22e52d2`). Una que no empieza en 1 ahora sí los lee, pegados al final del
-  elemento anterior cuando las líneas no acaban en punto ("Reinicia 4.") (§7.1).
+  en 1 sigue sin leer sus números. Una que no empieza en 1 ahora sí los lee,
+  cada uno como frase corta aparte: "Te faltan estos:", "3.", "Reinicia el
+  equipo", "4."… (unos 0.3 s más de audio por número). Con un número en
+  negrita ("**3.** Reinicia") suena pegado a la línea anterior, igual que
+  antes de la auditoría (§7.1).
 - Un bloque de código ya no se lee línea a línea. Si la respuesta es solo
   código, no se oye nada (D4).
 - Si el LLM falla, lo oyes. Si la nube se corta a media respuesta sin haber
@@ -719,13 +820,18 @@ Con la config de fábrica más tu `use_oww = false` (loop simple, wake difuso).
 - Un server MCP que ignora el SIGTERM ya no sobrevive al listener: recibe
   SIGKILL 2 s después. Como servicio esa espera se recorta para no pasar de
   8 s desde que empezó el apagado (`TimeoutStopSec=10`). `09aeedb`, `f460fc0`
+- En `crotolamo shell`, cerrar la ventana justo después de "salir" ya no
+  corta la salida: el shell ignora ese cierre hasta terminar de guardar y de
+  cerrar los servers MCP (la salida tiene tope). Solo se nota con `[memoria]`
+  o MCP activos. `3993c47`
 - Parar el servicio puede tardar algo más que antes, y con varios
   reproductores atenuados y el D-Bus colgado puede pasar del tope (D20).
 
 ## 6. Claves nuevas de config
 
-De `git diff f316103..f460fc0 -- config/crotolamo.toml`. "Sin clave" = va
-comentada y rige el valor por defecto del código.
+De `git diff f316103..b81e1c2 -- config/crotolamo.toml`. "Sin clave" = va
+comentada y rige el valor por defecto del código. Los arreglos del cierre
+(§11) no añadieron ni cambiaron ninguna clave.
 
 | Clave | De fábrica | Qué hace | Ganancia medida | Riesgo / por qué va así |
 |---|---|---|---|---|
@@ -756,39 +862,63 @@ comentada y rige el valor por defecto del código.
 ## 7. [DECISIÓN] Lo que te toca decidir
 
 Cada una: la pregunta, las opciones, qué pasa hoy y qué haría yo. Están
-contrastadas con el código en `f460fc0`; las que se resolvieron después van al
-final (§7.11).
+contrastadas con el código en `b81e1c2`; las que se resolvieron por el camino
+van al final (§7.11).
 
-### 7.1 La que ya se tomó por ti (y la pregunta que dejó)
+### 7.1 Las dos que ya se tomaron por ti (y lo que queda)
 
 **El número al empezar una frase.** Estaba planteada como decisión con tres
 opciones: (a) quitar siempre el marcador "N.", (b) quitarlo solo si hay
 indicios de lista, (c) no quitarlo nunca. La revisión de voz de punta a punta
 la confirmó como defecto (la palabra que se perdía era la respuesta) y se
-aplicó la **(b)** en `2259ba2`. Hoy (en `f460fc0`): "42. ¿Algo más, patrón?"
-suena "42." y luego "¿Algo más, patrón?". "1. Abre… 2. Cierra…" sigue sin leer
-números, salvo si el primer elemento empieza por cifra: "1. 2 llamadas al banco
-/ 2. Comprar leche / 3. Ir al gimnasio" suena "2 llamadas al banco 2.",
-"Comprar leche 3.", "Ir al gimnasio". Eso es una regresión de `2259ba2` que
-sigue en `f460fc0`; la arregla el commit siguiente, `22e52d2` (§11). Si
-prefieres (a) o (c), es un cambio pequeño en `crotolamo/voice/tts.py`
-(`_Lista`).
+aplicó la **(b)** en `2259ba2`. Hoy: "42. ¿Algo más, patrón?" suena "42." y
+luego "¿Algo más, patrón?"; "1. Abre… 2. Cierra…" sigue sin leer números,
+empiece como empiece cada elemento. La (b) no lo salva todo: un número se
+pierde todavía si es un "1." que abre la respuesta ("1. ¿Algo más, patrón?")
+o si abre una línea después de una lista que empezó en 1 ("…En total son /
+42. ¿Algo más?" suena "En total son ¿Algo más?"). En la medición de la
+revisión de `2259ba2`, de 27000 respuestas generadas perdían un número 4259
+antes del arreglo y 800 después, todas de esas dos formas. Si prefieres (a)
+o (c), es un cambio pequeño en `crotolamo/voice/tts.py` (`_Lista`).
 
-**Y la pregunta nueva que dejó: la lista que no empieza en 1.** Una lista
-retomada en "3. …", una cuenta atrás o un "1." escrito dentro de la línea de
-entrada dicen ahora sus números, y cuando las líneas no acaban en punto (lo
-normal en un LLM) los dicen PEGADOS al final del elemento anterior: "Te faltan
-estos: 3.", "Reinicia 4.", "Ir al banco a las 10 5.", "Comprar pan". Antes de
-`2259ba2` se callaban. La planteó la revisión posterior de ese commit (§11).
-Opciones: (A) dejarlo; (B) decir cada número como frase propia, cortando
-también en el salto de línea que precede a un número suelto ("Ir al banco a
-las 10", "5.", "Comprar pan"): no se pierde ninguno y nada queda pegado, al
-precio de más pausas cortas; (C) volver a callarlos cuando la forma es de
-lista (la línea anterior acaba en ":" o siguen números consecutivos), y
-entonces una respuesta numérica escrita con esa misma forma se vuelve a perder.
-Hoy: (A).
-Recomiendo (B), después de oírla: es la que mantiene lo que buscaba `2259ba2`
-sin frases que acaban en un número ajeno.
+**El número suelto que abre una línea.** El precio de lo anterior: una lista
+que no empieza en 1 (retomada en "3. …", o con el "1." escrito dentro de la
+línea de entrada) dice sus números; antes de la auditoría los callaba. Entre
+`2259ba2` y `b81e1c2` además los decía PEGADOS al final de la línea anterior:
+"Te faltan estos: 3.", "Reinicia el equipo 4.", "Ir al banco a las 10 5.". La
+revisión posterior de `2259ba2` lo planteó como decisión tuya (dejarlo, decir
+cada número como frase propia, o volver a callarlos cuando la forma es de
+lista) y se aplicó la segunda en `b81e1c2`. Hoy se oye "Te faltan estos:",
+"3.", "Reinicia el equipo", "4.", "Ir al banco a las 10", "5.", "Comprar
+pan": ningún número se pierde ni se pega, al precio de más pausas cortas.
+Con Piper real son unos 0.3 s más de audio por número (una lista de tres
+pasó de 8.61 a 9.53 s). Nadie lo ha oído en un altavoz: se midió lo que se
+le pide a Piper. Deshacerlo son unas líneas de `_split`, en el mismo archivo.
+
+**Lo que queda es de gusto.** La persona ya le pide al modelo no usar listas
+ni negritas; todo esto es para cuando no obedece.
+
+1. **¿Se dicen los números de una lista que no empieza en 1?** Hoy sí. La
+   alternativa es volver a callarlos cuando la forma es de lista (la línea
+   anterior acaba en ":" o siguen números consecutivos); entonces una
+   respuesta numérica escrita con esa misma forma se vuelve a perder. Yo lo
+   dejaría como está hasta oírlo.
+2. **Listas medio numeradas.** En una lista que no empieza en 1, el elemento
+   que empieza por cifra calla su número y los demás lo dicen: "Tu agenda: /
+   2. 9:00 reunión con el equipo / 3. 11:30 dentista / 4. Comida con Ana"
+   suena "Tu agenda: 9:00 reunión con el equipo 11:30 dentista", "4.",
+   "Comida con Ana". Y un número solo en su línea, seguido de otra línea
+   numerada, sigue pegado a la anterior ("Te faltan estos: 3."). No es
+   regresión de `b81e1c2` (entre `2259ba2` y `b81e1c2` sonaba igual o peor:
+   "…11:30 dentista 4."). Frente a antes de la auditoría sí cambia: esa
+   agenda sonaba entera y sin números, y ahora suelta un "4." solo. Es parte
+   del precio de `2259ba2`. Arreglarlo toca la regla del decimal partido
+   ("40. 5 GB"), que se dejó fuera a propósito. Yo no lo tocaría.
+3. **Números en negrita.** "**3.** Reinicia" no cuenta como marcador de
+   lista: suena pegado a la línea anterior ("Ir al banco a las 10 5."),
+   también en listas que empiezan en 1 ("Pasos: 1.", "Abre Spotify 2.").
+   Igual que antes de la auditoría. Es un formato que los modelos de chat
+   usan; si lo oyes, este sí lo arreglaría.
 
 ### 7.2 Los interruptores apagados
 
@@ -827,7 +957,7 @@ empiece por un sí; (B) la regla actual más una lista corta de veto ("qué va",
 "a ver", "espera"); (C) dejarla.
 Hoy ya es bastante estricta: una pregunta, un "va a", un "si" condicional o
 un sí que no esté entre las dos primeras palabras cuentan como no (comprobado
-en `f460fc0`: "claro que sí" ya no confirma; "sí", "sí claro" y "confirmo",
+en `b81e1c2`: "claro que sí" ya no confirma; "sí", "sí claro" y "confirmo",
 sí). Queda un sí falso: "¡Qué va!", que aquí es un no, confirma por su "va".
 Recomiendo (B) con ese veto: lo demás ya falla hacia el lado seguro. La lista
 de palabras de duda es vocabulario tuyo.
@@ -883,7 +1013,8 @@ Opciones: (a) sí: cada línea, su frase con pausa; (b) no, pero convertirlo en
 una coma; (c) dejarlo y corregir los comentarios del código que dicen lo
 contrario.
 Hoy: un salto de línea solo corta si viene tras puntuación, si deja una línea
-en blanco o si la línea siguiente lleva sangría.
+en blanco, si la línea siguiente lleva sangría o, desde `b81e1c2`, si la
+línea siguiente abre con un número suelto (§7.1).
 Recomiendo (c): con (a), una prosa que el modelo parte a mitad de frase sonaría
 a trozos, y eso no se puede juzgar sin oírlo.
 
@@ -926,9 +1057,9 @@ Opciones: (a) espera creciente en el unit (`RestartSteps=` +
 `audio_session`; (d) aparte: no hablar el saludo en un reinicio automático.
 Hoy: bucle sin fin; el límite por defecto de systemd no llega a saltar. Un
 disparador realista: `input_device = "crotolamo_aec_source"` sin el módulo AEC
-cargado. Lo mismo pasa si el listener falla al arrancar por otra causa, y
-el panel lo pinta como "Arrancando… cargando modelos de voz" con el botón
-principal deshabilitado: desde ahí no se puede parar el bucle.
+cargado. Lo mismo pasa si el listener falla al arrancar por otra causa (D50
+es una), y el panel lo pinta como "Arrancando… cargando modelos de voz" con
+el botón principal deshabilitado: desde ahí no se puede parar el bucle.
 Recomiendo (a) + (d): un micrófono que vuelve se recupera solo y la laptop no
 habla cada cinco segundos.
 
@@ -1001,8 +1132,8 @@ peor caso medido es de 11.05 s y pasa los 10 s del unit: tres reproductores,
 todos los candados tomados y el vaciado de la memoria atascado en su tope de
 2.5 s, o sea con `[memoria]` activa. Con la memoria apagada, como va de
 fábrica, ese mismo caso midió 8.55 s (9.05 s si además hay un server MCP que
-ignora el SIGTERM). Esto es así con o sin el último cambio (el remate de
-`f460fc0`), pero NO es anterior a la auditoría: con el código de `f316103` la
+ignora el SIGTERM). Esto es así con o sin el remate de los servers MCP
+(`f460fc0`), pero NO es anterior a la auditoría: con el código de `f316103` la
 reposición de esos tres reproductores tarda 7.0 s (medido sobre su
 `emergency_restore`; el resto de aquel apagado no esperaba a nada) y cabía.
 Los ~4 s de más los añadió la auditoría al apagado por señal: el candado del
@@ -1101,7 +1232,7 @@ Recomiendo (a) + (c), y añadir "estado del sistema" como frase clave para
 recuperar la que rompió la auditoría.
 Segunda pregunta, la de los turnos de continuación: con el modelo local, un
 turno que no casa ninguna palabra clave ("sí", "hazlo otra vez", "el segundo")
-va sin tools aunque continúe la orden anterior (comprobado en `f460fc0`: las
+va sin tools aunque continúe la orden anterior (comprobado en `b81e1c2`: las
 tres frases enrutan a cero tools).
 Opciones: (A) dejarlo: la charla sigue rápida y hay que repetir la orden
 entera; (B) heredar una vez las tools del turno anterior: el "gracias" tras
@@ -1239,7 +1370,9 @@ decir en `.gitignore`, con excepciones `!`, qué se versiona a propósito.
 **D47. El CI corre dos veces por cada push a una rama con PR.**
 Opciones: (a) `push` solo en main; (b) saltar el duplicado con un `if`; (c)
 `concurrency` con cancelación; (d) dejarlo.
-Hoy: dos corridas por push (unos 3.7 minutos de runner de más cada vez).
+Hoy: esta rama no tiene PR abierto y cada push lanza una sola corrida (runs
+51 a 59: una por push). Con un PR abierto serían dos, y cada corrida son dos
+jobs de 5 a 6 minutos en el runner nuevo (run 59: 5 min 06 s y 6 min 11 s).
 Recomiendo (c): todas las ramas conservan su CI y lo superado se cancela.
 
 **D48. `scripts/verify_phase.py` está huérfano** (dice "Fase N: verde"
@@ -1251,6 +1384,25 @@ Opciones: (a) dejarlo; (b) raíz en WARNING y el nivel configurado solo para
 `crotolamo`; (c) como b más una clave para las librerías.
 Hoy: (a), con `faster_whisper` ya callado aparte.
 Recomiendo (a): el ruido conocido ya se quitó.
+
+**D50. Sin servidor de audio al arrancar, el modo de fábrica muere con
+traceback.**
+Lo destapó el rojo del CI (§1) y ya existía antes de la auditoría (medido en
+`f316103` y en `b81e1c2` con el mismo doble de `sounddevice`). Si el
+PortAudio de la máquina trae la API de PulseAudio y al arrancar no hay
+servidor de audio, `import sounddevice` lanza `PortAudioError`;
+`WakeWordDetector.available()` solo atrapa `ImportError` y `OSError`. Con
+`use_oww = true`, `crotolamo listen` muere ahí y, como servicio, systemd lo
+reinicia hasta que hay audio (la familia de D12).
+Opciones: (A) dejarlo: reinicia hasta que hay audio y entonces elige bien el
+modo; (B) que `available()` lo tolere: el loop simple reintenta dentro del
+proceso (medido en una copia: a 1, 2, 4, 8 y 16 s), pero el modo de fábrica
+se quedaría en loop simple aunque el audio vuelva.
+Hoy: (A). Con tu `use_oww = false` no te toca: `available()` ni se llama y
+el loop simple ya reintenta así (comprobado en `b81e1c2` con el mismo doble:
+no muere y reintenta a 1, 2, 4 y 8 s). No se sabe si el PortAudio de tu
+Fedora trae esa API.
+Recomiendo (A), y mirar en la laptop qué APIs trae tu PortAudio (§8, paso 3).
 
 ### 7.10 Menores
 
@@ -1302,8 +1454,9 @@ como texto (`0354cea`); el micrófono que se cerraba con el oído dentro de
 `read()` (`269196e`); el diario con todo lo oído en INFO (`27af075`); Ptyxis y
 los atajos a un dominio pelado (`0354cea`); el Whisper `tiny` que se cargaba
 en loop simple + openWakeWord solo para la confirmación (ya no se carga; la
-confirmación usa el modelo de órdenes, `91f1394` y `27af075`); y borrar
-`_play_interruptible` (`b09e63d`).
+confirmación usa el modelo de órdenes, `91f1394` y `27af075`); borrar
+`_play_interruptible` (`b09e63d`); y el número de lista que sonaba pegado a
+la línea anterior (`b81e1c2`, §7.1).
 
 Dos que cambiaron de forma pero siguen siendo tuyas: los atajos del local sin
 internet y el streaming retenido con GLM ya no son preguntas abiertas de
@@ -1316,7 +1469,7 @@ diseño; son las claves apagadas `fallback_shortcuts` y `stream_release` de la
 
 | Área | Con qué se ejercitó | Lo que no se sabe |
 |---|---|---|
-| Micrófono y altavoz | `sounddevice` falso con audio guionizado; Whisper, Silero, openWakeWord y Piper reales sobre voz sintética y ruido generado | Umbrales con tu voz y tu cuarto; eco; AEC; qué hace PortAudio al suspender, al reiniciar PipeWire o al desenchufar; cortes con `tts_presynth`; un barge-in de verdad |
+| Micrófono y altavoz | `sounddevice` falso con audio guionizado; Whisper, Silero, openWakeWord y Piper reales sobre voz sintética y ruido generado | Umbrales con tu voz y tu cuarto; eco; AEC; qué hace PortAudio al suspender, al reiniciar PipeWire o al desenchufar, y si el de tu Fedora trae la API de PulseAudio (D50); cortes con `tts_presynth`; un barge-in de verdad; cómo suena un número de lista dicho como frase aparte (§7.1) |
 | Pantalla (HUD y panel) | Un `gi` falso; alguna comprobación suelta con la libgtk real bajo xvfb | Nunca se abrió el HUD ni el panel. El escenario del HUD del bench no pudo ni importar Pango |
 | MPRIS | El `playerctl` 2.4.1 real contra reproductores MPRIS falsos en un bus D-Bus privado; en el bench y en los tests, un `playerctl` falso que imita su formato | `playerctl --follow` con Spotify o un navegador reales (y va ON) |
 | systemd | Nada corrió bajo `systemd --user` | `Type=exec`, los `EnvironmentFile`, el scope de las apps abiertas por voz, los tiempos reales de apagado, el bucle de reinicio |
@@ -1325,16 +1478,16 @@ diseño; son las claves apagadas `fallback_shortcuts` y `stream_release` de la
 | mem0 | Un módulo `mem0` falso; solo el cálculo de scores se rehízo con las ruedas reales de fastembed y mem0 | Todo el camino real: Chroma, embeddings, extracción, RAM e hilos |
 | Hyprland, ydotool, flatpak, Home Assistant, Frigate | Ejecutables y servidores falsos | Todo en vivo |
 | Tu Python | La suite corre en 3.11 (openwakeword 0.6) y 3.12 (0.4) | Cuál usa tu `.venv`. Tu `ci.yml` dice que la laptop corre 3.11; si es así pip te instala openWakeWord 0.6: te aplica D16 y de las cifras de CPU valen las de 0.6. Confírmalo en el paso 1 |
+| CI de GitHub | Los dos jobs (Python 3.11 y 3.12) en ubuntu-26.04 | Verde solo en el run 59 (`4d0d7c9`). Los siete anteriores salieron en rojo sin correr un test y nadie los miró; el octavo, en rojo por un test de esta auditoría. Ningún commit intermedio del 20 de noviembre tiene una suite verde en el CI (ruff y mypy sí pasaron): solo la corrida local (§1) |
 
-Dos notas más. Los tiempos de apagado de la §2 y de D20 se midieron con
-procesos sueltos y señales reales, no con `systemctl stop`. Y un test falló una
-sola vez bajo carga y no se pudo reproducir
-(`test_sighup_apaga_limpio_como_sigterm`); lo que se sepa de él va en la §11.
+Una nota más: los tiempos de apagado de la §2 y de D20 se midieron con
+procesos sueltos y señales reales, no con `systemctl stop`.
 
 ### Lista de comprobación en la laptop
 
-En orden, con la rama ya en la laptop. Cada paso dice qué resultado es "ok".
-Los comandos van desde la raíz del repo.
+En orden, con la rama ya en la laptop
+(`git fetch origin && git checkout claude/optimistic-ride-iloitn`). Cada paso
+dice qué resultado es "ok". Los comandos van desde la raíz del repo.
 
 1. **Instalar lo nuevo.** Reescribe los units con la ruta real, recarga systemd
    y, con `--start`, reinicia el servicio (sin `--start` el instalador no
@@ -1356,15 +1509,23 @@ Los comandos van desde la raíz del repo.
    .venv/bin/python -m pytest -q
    ```
 
-   Ok: ningún `failed`, y `3808 passed` si la voz de Piper está en
+   Ok: ningún `failed`, y `3866 passed` si la voz de Piper está en
    `~/Documentos/crotolamo2/voices/` (el `[paths].voces` de fábrica; los tests
-   no miran tu `crotolamo.local.toml`). Aquí salió `3806 passed, 2 skipped`
+   no miran tu `crotolamo.local.toml`). Aquí salió `3864 passed, 2 skipped`
    solo porque el contenedor no tiene esa voz: los dos saltados la piden, y
-   con ella presente corren y pasan (comprobado: 3808 de 3808). Algún test más
-   se salta si a tu máquina le falta otra cosa (por ejemplo, el Whisper `tiny`
-   sin descargar en la caché de Hugging Face: 1 saltado); `pytest -q -rs` dice
-   cuál y por qué. Si `.venv` no tiene pytest:
-   `.venv/bin/pip install -e '.[dev]'`.
+   con ella a mano corren y pasan (comprobado dándosela con
+   `CROTOLAMO_TEST_PIPER_VOICE`: 3866 de 3866). Algún test más se salta si a
+   tu máquina le falta otra cosa (por ejemplo, el Whisper `tiny` sin
+   descargar en la caché de Hugging Face: 1 saltado; en el runner de GitHub
+   se saltan 3); `pytest -q -rs` dice cuál y por qué. Si `.venv` no tiene
+   pytest: `.venv/bin/pip install -e '.[dev]'`.
+
+   Si falla `test_find_in_project_recorta_una_linea_kilometrica`, a tu copia
+   le falta el commit `4d0d7c9` (§1): el fallo es del test, no del producto.
+
+   Correr la suite no abre el micrófono ni hace sonar nada: de los 3866
+   tests, uno solo llega al `sounddevice` de verdad, y lo único que hace es
+   importarlo y llamar a `stop()`.
 
 3. **Doctor.** Con `launch.sh`, no con `python -m crotolamo doctor` a secas
    (D43).
@@ -1375,7 +1536,18 @@ Los comandos van desde la raíz del repo.
 
    Ok: todos los REQUERIDOS en verde y `salida: 0`. Esperado y real: el aviso
    de `musica-caduca` (la fecha del toml es 2026-11-29) y el rojo opcional de
-   `spotify` (D44).
+   `spotify` (D44). Mira también el check opcional `portaudio`: si sale en
+   rojo con `PulseAudio_Initialize: Can't connect to server`, tu PortAudio es
+   de los de D50. Un verde no lo descarta: con el servidor de audio arriba
+   sale verde tenga o no esa API. Para saberlo:
+
+   ```
+   .venv/bin/python -c "import sounddevice as sd; print([a['name'] for a in sd.query_hostapis()])"
+   ```
+
+   Si la lista trae `PulseAudio`, tu PortAudio es de los de D50. Aquí, con
+   PortAudio 19.6.0, da `['ALSA', 'OSS']`; no se pudo correr contra uno que
+   la traiga (el nombre está leído en el código de PortAudio).
 
 4. **Smoke.** Primero sin micrófono, luego con él.
 
@@ -1416,13 +1588,25 @@ Los comandos van desde la raíz del repo.
    que quede unos 190 MB por debajo de lo que marcaba antes con tu misma
    config, y que tras una respuesta larga no se quede 400 MB arriba.
 
-7. **Diez pruebas de voz** (cada una ata un arreglo o una regresión):
+7. **Once pruebas de voz** (cada una ata un arreglo o una regresión):
    - "Crotolamo, pon música" de corrido → la ejecuta sin pedirla otra vez.
    - "Buenos días, crotolamo, pon las noticias" → la ejecuta.
    - "Crotolamo" … pausa de 2 s … la orden → la oye entera.
    - En la ventana de seguimiento: "¿cómo me llamo?" → contesta.
    - "¿Y por qué?" → contesta sin la espera de 2.5 s.
    - "¿Cuánto es seis por siete?" → se oye "42".
+   - Los números de una lista, sin depender de lo que conteste el modelo
+     (solo usa el altavoz):
+
+     ```
+     .venv/bin/python -c "from crotolamo.settings import get_settings as g; \
+     from crotolamo.voice.tts import TTS; t = TTS.from_settings(g()); \
+     t.speak_sentences('Faltan estos:\n3. Reinicia\n4. Ir al banco a las 10\n5. Pan')"
+     ```
+
+     → se oyen el 3, el 4 y el 5, cada uno como frase corta aparte y ninguno
+     pegado al final de la línea anterior. Si las pausas te estorban, es el
+     punto 1 de la §7.1.
    - "Dame un ejemplo en Python de leer un archivo" → no lee el código.
    - "Borra el archivo prueba.txt de Documentos" → la pregunta nombra la ruta;
      responde "¿se va a borrar todo?" → cancela; repite y di "confirmo" → borra.
@@ -1440,6 +1624,12 @@ Los comandos van desde la raíz del repo.
 
    Ok: menos de 10 s, la música vuelve a su volumen, el HUD queda en reposo y
    el diario no dice `stop-sigterm timed out`.
+
+   Solo si usas `[memoria]` o MCP: en `./launch.sh shell` dile algo que
+   valga recordar, escribe `salir` y cierra la ventana en cuanto veas
+   "Crotolamo apagado, patrón.". Ok: no queda vivo ningún proceso de tus
+   servers MCP (`pgrep -af` con su nombre) y en la sesión siguiente se
+   acuerda de lo que le dijiste.
 
 9. **Apps que sobreviven.** Abre algo por voz y reinicia el servicio.
 
@@ -1534,7 +1724,12 @@ Los comandos van desde la raíz del repo.
       de cero.
     - Solo loop concurrente: `stream_speak_concurrent`, `barge_in_cancel` (con
       `--barge-in` y audífonos) y `oww_exact_frames` (recalibra antes el umbral
-      con el paso 12).
+      con el paso 12). Y, con `--barge-in`, una comprobación en torno al
+      arreglo de `b81e1c2`: pausa "Escuchar por voz" a media respuesta larga
+      y reanúdala antes de que acabe, con el cuarto en silencio; no debe
+      cortarse la respuesta ni abrirse un turno solo. Con los umbrales de
+      fábrica tampoco pasaba antes del arreglo (0 de 24 aquí): sirve para ver
+      que nada se rompió, no para ver el arreglo.
     - `[voice] whisper_cpu_threads`: déjala en 0 salvo que midas que Whisper y
       Piper se estorban.
 
@@ -1603,12 +1798,21 @@ Los comandos van desde la raíz del repo.
   `hud_state.json` que no es UTF-8, `0354cea`). El otro sigue: el HUD se fía
   del pid que publicó el estado; tras un apagón, si otro proceso reutiliza ese
   pid, podría enseñar un HABLANDO viejo hasta que el listener nuevo publique.
-- **Límites del shell tras el arreglo del cierre de ventana** (`f460fc0`): (a)
-  si sales con "salir" y cierras la ventana durante la espera de salida (hasta
-  5 s), todavía mata; (b) tras salir por señal, SIGTERM y SIGHUP se ignoran
-  hasta que el proceso termina (Ctrl-C y SIGKILL siguen valiendo); (c) al
-  cerrar la terminal el proceso acaba con una traza que nadie ve y código 1,
-  pero la limpieza corre.
+- **El decimal partido al principio de una línea**: "40. 5 GB libres" se oye
+  "5 GB libres". Idéntico antes de la auditoría. No hay evidencia de que el
+  cerebro escriba un decimal con un espacio (la persona le pide los números
+  en palabras) y los remedios rompen otro caso: unirlo convertiría "12. 3
+  son de tu jefe" en "12.3 son…" (§11).
+- **Límites del shell tras los arreglos del cierre de ventana** (`f460fc0` y
+  `3993c47`): (a) desde que el shell empieza a salir ("salir", Ctrl-D o una
+  señal), SIGTERM y SIGHUP se ignoran hasta que el proceso termina (la salida
+  tiene tope; Ctrl-C y SIGKILL siguen valiendo); (b) al cerrar la terminal el
+  proceso acaba con una traza que nadie ve y código 1, pero la limpieza
+  corre; (c) un Ctrl-C durante esa salida corta el paso en curso; si cae
+  mientras se cierran los servers MCP, el server queda vivo: medido en
+  `f460fc0` y otra vez en `b81e1c2` (4 de 4, con un server sordo al EOF y
+  con uno que ignora SIGTERM). El arreglo de `3993c47` no cubre este camino,
+  y el cierre en serie de antes tenía la misma debilidad.
 
 ## 10. Ideas de eficiencia (no implementadas)
 
@@ -1673,9 +1877,11 @@ ese tipo: cada pieza pasaba sus tests y lo que salía por el altavoz estaba mal,
 con la suite en verde.
 
 Qué existe: de esa revisión ya quedaron 34 tests en el repo
-(`tests/test_revision_final_x1voz.py`), sobre un arnés más chico. Falta la
-matriz completa de escenarios y la comparación de "lo que se oye" entre dos
-árboles.
+(`tests/test_revision_final_x1voz.py`), sobre un arnés más chico, y otros 42
+de la revisión posterior (`tests/test_revision_final_x8voz2.py`), que fijan
+lo que le llega a Piper por los dos loops. Falta la matriz completa de
+escenarios y la comparación de "lo que se oye" entre dos árboles: es
+justo lo que cazó la regresión de las listas (§11).
 
 Coste y riesgo: mantener el arnés, y unas respuestas de referencia que hay que
 actualizar a propósito cada vez que cambie lo que se dice.
@@ -1694,6 +1900,143 @@ Coste y riesgo: pocas líneas en `crotolamo/voice/media_aware.py`; corre dentro
 del apagado por señal, así que pide el mismo cuidado que el resto de ese
 camino.
 
-## 11. Adenda
+## 11. Adenda: la revisión de los últimos arreglos y el cierre
 
-(pendiente: la añade el cierre de la auditoría)
+Los dos últimos bloques de arreglos tuvieron una revisión adversarial
+posterior: alguien que no los escribió los comparó con el árbol anterior, y
+un escéptico intentó tumbar cada hallazgo. Entre las dos, 10 hallazgos: 5
+confirmados y arreglados, 4 refutados y 1 decisión tuya, que después se
+aplicó. Los commits de este cierre:
+
+| Commit | Qué lleva | Suite local (pasan, 3.12 y 3.11) |
+|---|---|---|
+| `22e52d2` | La regresión de las listas que empiezan en 1 (§11.1) | 3818 |
+| `601f02f` | La primera versión de este informe | — |
+| `3993c47` | Shell tras "salir", cierre cortado de un server MCP, carreras de tests (§11.2) | 3833 |
+| `4f64649` | Solo tests: la suite ya no toca el audio de la máquina (el CI, §1) | 3834 |
+| `b81e1c2` | El número suelto como frase propia; el VAD del barge-in (§11.1) | 3864 |
+| `4d0d7c9` | Solo un test: el que suponía el orden de una carpeta (el CI, §1) | 3864 |
+
+### 11.1 El commit de voz (`2259ba2`)
+
+Comparado con su padre, los dos árboles lado a lado: la segmentación en
+frases (27000 respuestas generadas por 7 caminos, 4000 listas con elementos
+que empiezan por cifra y 20000 textos adversariales), la confirmación en el
+loop simple, los avisos del loop concurrente, el barge-in en pausa y los
+tests (con el arreglo revertido fallan 28 de 34; los otros 6 son guardas
+declaradas). Cuatro hallazgos:
+
+- **Confirmado: una regresión de este mismo trabajo.** Una lista que empieza
+  en 1 y cuyo primer elemento empieza por cifra ("1. 2 llamadas al banco / 2.
+  Comprar leche…", o una agenda con horas) pasó a decir sus números, pegados
+  al elemento anterior: la comprobación del decimal partido iba por delante
+  de abrir la lista. **[ARREGLADO]** `22e52d2`: de 8000 listas generadas que
+  empiezan en 1 diferían del padre 2771; ahora 0, también en streaming.
+- **Decisión tuya, que se aplicó: el número suelto sonaba pegado** a la línea
+  anterior ("Ir al banco a las 10 5."). **[ARREGLADO]** `b81e1c2`: cada
+  número es su propia frase (§7.1). Lo comprobaron dos verificadores que no
+  lo escribieron: uno de punta a punta (el listener entero en cuatro modos)
+  y otro con un diferencial de 103263 respuestas generadas y 41 salidas por
+  respuesta (entera, en streaming y por los dos loops, hasta lo que se le
+  pide a Piper): ninguna palabra perdida, duplicada ni cambiada de orden; las
+  respuestas sin número suelto, idénticas byte a byte; la primera frase sale
+  en el mismo carácter que antes.
+- **Refutado: la confirmación abre el micrófono después de escribir el estado
+  del HUD**, y un disco atascado podría comerse el "confirmo". El orden es
+  real; el coste, 0.23 ms de mediana y 6.5 ms de máximo en 3000 escrituras.
+  Perder la respuesta pide un atasco de 0.3 a 0.7 s justo ahí. Al revisor le
+  pasó una vez: con el disco ocupado por un `find /` suyo midió 49, 50 y
+  190 ms en 3 de 18 corridas, y en una se perdió el "confirmo". El escéptico
+  solo vio atascos con la máquina a carga 13 sobre 4 CPU y los atribuyó a
+  esta máquina, no al código. El código ya hacía lo mismo antes de la
+  auditoría con el micrófono de la orden, y falla hacia el lado seguro:
+  acción denegada.
+- **Refutado: "40. 5 GB libres" se oye "5 GB libres".** Se reproduce y es
+  idéntico antes de la auditoría; se deja, con su razón, en la §9.
+
+Fuera de los hallazgos, el revisor anotó un efecto secundario del propio
+`2259ba2`: desde ese commit el detector del barge-in deja de oír durante la
+pausa del panel (antes seguía oyendo, que era el bug) y nada lo limpiaba al
+reanudar (loop concurrente con `--barge-in`; no es tu modo). **[ARREGLADO]**
+`b81e1c2`. Con el Silero real sobre audio sintético (voz de Piper y silencio
+generado; sin micrófono), al reanudar el silencio puntuaba 0.999, 0.986,
+0.927…; ahora 0.171 como mucho. Con los umbrales de fábrica no llegaba a
+abrir un turno falso (0 de 24 antes y después): es defensivo. Con un Silero
+de pruebas que guarda memoria y `barge_in_min_chunks = 40` sí lo abría, 3 de
+3; ahora 0 de 3. Precio: con voz (también de Piper) sonando justo al
+reanudar, el barge-in dispara de media un chunk (32 ms) más tarde.
+
+### 11.2 Los commits de apagado (`09aeedb` y `f460fc0`)
+
+Se revisó el cierre en paralelo de los servers MCP (1, 3 y 6 servers sordos
+al EOF salen en 1.0 s; antes de `09aeedb`, 1.0 / 3.0 / 6.0 s), el remate de
+los que ignoran SIGTERM, las señales del shell (en el prompt, a medio
+stream, en una tool MCP y en la confirmación), el vaciado de la memoria, el
+nivel de log, el tope del servicio y los tests (de 28 mutaciones del código
+de los dos commits, la suite caza 26). Seis hallazgos, ninguna decisión:
+
+- **Confirmado (medio): cerrar la ventana justo después de "salir" todavía
+  mataba la salida.** `f460fc0` cubrió el cierre con el shell en el prompt.
+  Tras "salir", el vaciado de la memoria (hasta 5 s) y el cierre de los
+  servers MCP corren con "Crotolamo apagado, patrón." ya en pantalla, y los
+  manejadores de señal ya se habían repuesto. Medido: SIGHUP 0.2 s después
+  del "apagado", rc=-1 y la extracción del último turno perdida; SIGTERM,
+  rc=-15; en una pty real, perdida 3 de 3. **[ARREGLADO]** `3993c47`, para
+  `python -m crotolamo shell` (lo que corre `launch.sh`) y para
+  `interfaces/shell.py` como script: rc=0 y extracción guardada.
+- **Confirmado (bajo): un cierre cortado dejaba vivo al server MCP.** Si un
+  Ctrl-C, o el SIGTERM o SIGHUP del shell, llegaba mientras se retiraba un
+  server colgado, el cierre se abandonaba y nadie lo seguía. Ahora quien
+  corta manda SIGKILL al grupo antes de irse. **[ARREGLADO]** `3993c47`. No
+  cubre el Ctrl-C durante la salida del shell (§9).
+- **Confirmados (bajos, solo tests): el fallo suelto de
+  `test_sighup_apaga_limpio_como_sigterm`** y el mismo hueco en los tests de
+  señales del shell. Carrera del test: su proceso hijo esperaba la señal en
+  una sola llamada bloqueante, y la que llega justo antes ya no la
+  despierta. El del listener: 1 cuelgue en 3000 corridas bajo carga;
+  esperando en tramos, 0 en 3000. Los del shell solo se colgaron a
+  propósito, con gdb (40 de 40 corridas bajo carga pasaron). El listener no
+  tenía la culpa. **[ARREGLADO]** `3993c47`, sin cambiar lo que comprueban.
+- **Refutado: `close_all()` puede volver con un retiro ajeno todavía
+  cerrando.** La carrera existe y el cierre en paralelo de `09aeedb` la
+  ensanchó (provocándola a propósito: 1 de 40, 4 de 40 y 3 de 60; antes, 0
+  de 40). Pero la ventana mide entre 90 y 285 µs, y pide que un retiro
+  coincida por azar con la salida y que ese server siga vivo e ignore el
+  EOF. Sin efecto medible con los llamadores reales.
+- **Refutado: dos mutaciones que la suite no caza** (que una segunda señal
+  reinicie la gracia del SIGKILL; que `kill_survivors` no vacíe su lista).
+  Ciertas, pero sin efecto que se note: el único llamador sale del proceso
+  justo después, y el retraso posible es de 0.2 ms en el caso real (dos
+  SIGHUP seguidos), con tope de 2 s.
+
+Visto y sin hallazgo. El cierre en paralelo arranca hilos durante la salida
+del intérprete, cosa que la documentación de Python da por prohibida desde
+3.12; en 3.12.3 y 3.13.18 arranca, y forzando el fallo cae al cierre en serie
+y cierra todo. No se pudo correr en Python 3.14. Y el tope de 8 s del apagado
+como servicio cuenta desde que arranca el manejador de Python, no desde el
+SIGTERM de systemd: con el hilo principal dentro de una llamada en C arrancó
+0.42 y 1.67 s tarde. Solo pesa en el loop simple y en el terreno de D20.
+
+### 11.3 El CI de GitHub
+
+Entra en este cierre por lo que tardó en mirarse: siete runs en rojo sin
+correr un solo test, un octavo (`b81e1c2`) en rojo por un test de esta
+auditoría que suponía el orden de los archivos de una carpeta, y verde solo
+en el noveno (run 59, `4d0d7c9`: 3863 pasan y 3 se saltan en Python 3.12 y
+3.11). El detalle está en la §1. Lo que deja: el juez es el CI, no la corrida
+local, y aquí se miró tarde.
+
+### 11.4 Dónde se paró
+
+Los arreglos de `3993c47` y los cambios de tests de `4f64649` y `4d0d7c9` no
+tienen otra revisión encima. El de `22e52d2` no tuvo revisión propia; el
+segundo verificador de `b81e1c2` comparó de paso 20280 respuestas con listas
+que empiezan en 1 contra el padre de `2259ba2`: dichas enteras suenan
+idénticas las 20280; en streaming solo difiere lo que `2259ba2` arregló a
+propósito y 10 casos de texto al azar. El de `b81e1c2` tuvo una ronda de dos
+verificadores: ninguna regresión, y cada uno dejó anotado un residuo de
+severidad baja, los dos anteriores al cambio (puntos 2 y 3 de la §7.1). El
+flujo iba a abrir una ronda de reparación para esos dos residuos; se paró
+antes de que tocara nada, con los archivos byte a byte iguales a los
+verificados. No se abrió ninguna ronda de revisión más. Lo que queda abierto
+es lo de la §7; lo que falta por validar, lo de la §8.
