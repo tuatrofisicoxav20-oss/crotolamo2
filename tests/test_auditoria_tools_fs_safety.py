@@ -1206,10 +1206,15 @@ def test_find_in_project_recorta_una_linea_kilometrica(proyecto):
     assert lines[0] == "Encontré «patron» en p, patrón:"
     # Sigue diciendo DÓNDE está la coincidencia y cuánto se dejó fuera...
     mostrada = "data.json:1:" + linea
-    assert lines[1] == mostrada[:projects._LINE_CAP]
-    assert lines[2] == f"...[recortado, {len(mostrada)} chars en total]"
+    recortada = [mostrada[:projects._LINE_CAP],
+                 f"...[recortado, {len(mostrada)} chars en total]"]
     # ...y la que cabía sale intacta.
-    assert lines[3:] == ["z.py:1:patron = 1"]
+    intacta = ["z.py:1:patron = 1"]
+    # Cuál de los dos archivos sale primero lo decide el sistema de archivos
+    # (`grep -r` los recorre en el orden del directorio), no find_in_project:
+    # este test daba por hecho "data.json antes que z.py" y en el runner
+    # ubuntu-26.04 de GitHub salen al revés.
+    assert lines[1:] in (recortada + intacta, intacta + recortada)
 
 
 def test_find_in_project_25_lineas_kilometricas_caben_en_el_tope(proyecto):
