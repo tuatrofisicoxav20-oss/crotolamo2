@@ -424,7 +424,12 @@ def test_close_escala_a_sigkill_si_el_nieto_sobrevive_al_sigterm(tmp_path):
         t0 = time.monotonic()
         client.close()
         assert time.monotonic() - t0 < 8.0
-        assert not vivo(pid), "el server real quedó huérfano"
+        # Con plazo, como los tests del handshake: close() vuelve en cuanto sus
+        # hilos ven EOF en las tuberías, y el kernel las cierra ANTES de dejar
+        # al nieto (ya con el SIGKILL dentro) como zombi. Mirado en ese hueco
+        # (ms, bajo carga) aún sale "R" y el test fallaba 1 de cada ~15. Sin el
+        # SIGKILL sigue fallando: el nieto duerme 60 s ignorando el SIGTERM.
+        assert esperar(lambda: not vivo(pid), plazo=3.0), "el server real quedó huérfano"
         assert client._reader is not None and not client._reader.is_alive()
         proc = client._proc
         assert proc is not None and proc.stdout is not None and proc.stderr is not None

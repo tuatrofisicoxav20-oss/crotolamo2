@@ -66,6 +66,10 @@ _MAX_LIST_PAGES = 100
 # ESPERAR a que el server salga solo). Un server bien hecho tarda milisegundos;
 # solo el que ignora el EOF paga este segundo de más al cerrarse.
 _EOF_GRACE_S = 1.0
+# Lo que se espera tras el SIGTERM antes del SIGKILL. La misma en close() y en
+# el apagado por señal (bridge.kill_survivors): un server lento pero bien hecho
+# no muere antes por un camino que por el otro.
+SIGTERM_GRACE_S = 2.0
 
 # Cola de stderr que se guarda para explicar una muerte SOLA: el server dice
 # por stderr por qué sale (falta un token, un módulo) y eso iba solo a DEBUG.
@@ -349,7 +353,7 @@ class StdioMCPClient:
         # Antes el SIGTERM salía microsegundos después del EOF: la limpieza
         # que la spec le deja hacer al server moría a medias en cada cierre.
         if not (stdin_closed and self._wait_exit(proc, _EOF_GRACE_S)):
-            if not self._stop_process(proc, signal.SIGTERM, timeout=2.0):
+            if not self._stop_process(proc, signal.SIGTERM, timeout=SIGTERM_GRACE_S):
                 log.debug("MCP '%s': no terminó con SIGTERM; SIGKILL", self.name)
                 self._stop_process(proc, signal.SIGKILL, timeout=2.0)
         if not stdin_closed:
@@ -376,6 +380,24 @@ class StdioMCPClient:
         # Sin esperar: con un escritor atascado se salta el EOF; el SIGTERM basta.
         self._close_stdin(0)
         self._signal_group(proc, signal.SIGTERM)
+
+    def kill_if_survives(self, deadline: float) -> bool:
+        """La otra mitad de terminate_now(): espera hasta `deadline`
+        (time.monotonic) a que el server salga y suelte las tuberías y, si
+        sigue ahí, SIGKILL al grupo, sin esperar más. True si hubo que matarlo.
+
+        terminate_now() no escala: el server que ignora el SIGTERM (o el nieto
+        de un wrapper, que es quien retiene las tuberías) sobrevivía al os._exit
+        del listener, en su propia sesión y sin nadie que lo recogiese. Mismo
+        criterio que close() (ver _wait_exit). Con el server ya muerto vuelve
+        en el acto; quien llama sale justo después, así que no se recoge nada."""
+        proc = self._proc
+        if proc is None:
+            return False
+        if self._wait_exit(proc, max(0.0, deadline - time.monotonic())):
+            return False
+        self._signal_group(proc, signal.SIGKILL)
+        return True
 
     def _close_stdin(self, timeout: float) -> bool:
         """Cierra stdin (EOF para el server) si ningún escritor lo usa en

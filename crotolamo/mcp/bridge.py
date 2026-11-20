@@ -39,6 +39,7 @@ DECISIONES, y por qué:
 from __future__ import annotations
 
 import atexit
+import functools
 import itertools
 import json
 import os
@@ -54,7 +55,13 @@ from typing import Any, Callable
 from crotolamo.core import router
 from crotolamo.core.tool_parsing import MCP_SOFT_ERROR_PREFIX
 from crotolamo.logging_setup import get_logger
-from crotolamo.mcp.client import MCPError, MCPTimeout, MCPTransportError, StdioMCPClient
+from crotolamo.mcp.client import (
+    SIGTERM_GRACE_S,
+    MCPError,
+    MCPTimeout,
+    MCPTransportError,
+    StdioMCPClient,
+)
 from crotolamo.tools.base import Registry, Tool, normalize_key, truncate_for_context
 
 log = get_logger("mcp.bridge")
@@ -486,6 +493,11 @@ _CLOSING_DONE = threading.Condition(_STATE_LOCK)
 # Tope de esa espera: close() ya está acotado (~6 s el peor caso); esto solo
 # cubre un hilo que dejó de avanzar, para que el atexit no se cuelgue por él.
 _CLOSING_WAIT_S = 10.0
+# Clientes a los que terminate_all() ya mandó el SIGTERM del apagado -> cuándo
+# (time.monotonic). Para kill_survivors(): no puede volver a buscarlos en
+# _STARTING, de donde su handshake (que el SIGTERM hace fallar) los saca al
+# momento, y la gracia cuenta desde la señal, no desde que se le llama.
+_TERMINATED: dict[StdioMCPClient, float] = {}
 _MARCA_ENV = "CROTOLAMO_MCP_LANZAMIENTO"
 _LANZAMIENTOS = itertools.count(1)
 _ATEXIT_REGISTERED = False
@@ -686,35 +698,42 @@ def _abandon(client: StdioMCPClient) -> None:
             _STARTING.discard(client)
 
 
-def _abandon_all(clients: list[StdioMCPClient]) -> None:
-    """_abandon de varios clientes A LA VEZ, esperando a todos. Cada close() de
-    un server que ignora el EOF tarda segundos (espera, SIGTERM, SIGKILL): uno
-    tras otro, un Ctrl+C con N handshakes en vuelo esperaba N cierres. La espera
-    está acotada porque close() lo está (~6 s el peor caso)."""
+def _a_la_vez(cierres: list[tuple[str, Callable[[], object]]]) -> None:
+    """Corre los cierres (nombre del server, función) A LA VEZ, uno por hilo, y
+    espera a todos. Cada close() de un server que ignora el EOF tarda segundos
+    (espera, SIGTERM, SIGKILL): uno tras otro, N servers eran N cierres. La
+    espera está acotada porque close() lo está (~6 s el peor caso)."""
 
-    def cerrar(client: StdioMCPClient) -> None:
+    def cerrar(name: str, cierre: Callable[[], object]) -> None:
         try:
-            _abandon(client)
+            cierre()
         except Exception as error:  # noqa: BLE001 — en su propio hilo: que quede en el log
-            log.warning("MCP '%s': no pude cerrarlo (%s)", client.name, error)
+            log.warning("MCP '%s': no pude cerrarlo (%s)", name, error)
 
     hilos: list[threading.Thread] = []
-    sin_hilo: list[StdioMCPClient] = []
-    for c in clients:
-        hilo = threading.Thread(target=cerrar, args=(c,), name=f"mcp-{c.name}-cierre", daemon=True)
+    sin_hilo: list[tuple[str, Callable[[], object]]] = []
+    for name, cierre in cierres:
+        hilo = threading.Thread(
+            target=cerrar, args=(name, cierre), name=f"mcp-{name}-cierre", daemon=True)
         try:
             hilo.start()
         except Exception as error:  # noqa: BLE001 — p.ej. "can't start new thread"
             # Sin hilo, se cierra aquí, en serie como antes. Si no, el error
             # tapaba el Ctrl+C (o el registro ya hecho) y el server seguía vivo.
-            log.debug("MCP '%s': cierre en serie (%s)", c.name, error)
-            sin_hilo.append(c)
+            log.debug("MCP '%s': cierre en serie (%s)", name, error)
+            sin_hilo.append((name, cierre))
             continue
         hilos.append(hilo)
-    for c in sin_hilo:
-        cerrar(c)
+    for name, cierre in sin_hilo:
+        cerrar(name, cierre)
     for hilo in hilos:
         hilo.join()
+
+
+def _abandon_all(clients: list[StdioMCPClient]) -> None:
+    """_abandon de varios clientes A LA VEZ, esperando a todos (ver _a_la_vez):
+    un Ctrl+C con N handshakes en vuelo esperaba N cierres."""
+    _a_la_vez([(c.name, functools.partial(_abandon, c)) for c in clients])
 
 
 # Estados de /proc/<pid>/stat de un proceso que ya murió (zombi, o saliendo).
@@ -1065,10 +1084,18 @@ def close_all() -> None:
         states = list(_STATE.values())
         starting = list(_STARTING)
         closing = set(_CLOSING)
-    for state in states:
-        unregister_server(state.registry, state.config.name)
-    for client in starting:
-        client.close()  # su handshake falla y _connect lo da por no arrancado
+    # A la vez, como los handshakes del arranque: en serie, "salir" con N
+    # servers que no salen al ver el EOF esperaba N veces la gracia (1 s cada
+    # uno; hasta ~5 s si además se resisten al SIGTERM) en vez de una. Un
+    # cierre que falla queda avisado y no deja a los demás sin cerrar.
+    cierres: list[tuple[str, Callable[[], object]]] = [
+        (state.config.name,
+         functools.partial(unregister_server, state.registry, state.config.name))
+        for state in states
+    ]
+    # Los que siguen arrancando: su handshake falla y _connect los da por no arrancados.
+    cierres += [(client.name, client.close) for client in starting]
+    _a_la_vez(cierres)
     if closing:
         # Su close() ya está en marcha en otro hilo (llamarlo aquí no hace
         # nada). Volver antes dejaba que el intérprete parase ese hilo daemon
@@ -1083,7 +1110,8 @@ def terminate_all() -> None:
     handshake o a medio cierre en _retire) sin esperar a nadie. Sin esto, un
     wrapper (npx, sh -c) o un server que ignora el EOF de stdin quedaba
     huérfano al parar el servicio. Al que la señal pilla en pleno Popen lo
-    busca _kill_unspawned. Best-effort, nunca lanza."""
+    busca _kill_unspawned. Al que ignora el SIGTERM lo remata kill_survivors(),
+    que se llama justo antes del os._exit. Best-effort, nunca lanza."""
     with _STATE_LOCK:
         clients = [state.client for state in _STATE.values()] + list(_STARTING) + list(_CLOSING)
         spawning = list(_SPAWNING)
@@ -1092,5 +1120,36 @@ def terminate_all() -> None:
             client.terminate_now()
         except Exception:  # noqa: BLE001 - el proceso está saliendo
             pass
+        with _STATE_LOCK:
+            # setdefault: con dos señales seguidas cuenta el PRIMER SIGTERM.
+            _TERMINATED.setdefault(client, time.monotonic())
     if spawning:
         _kill_unspawned(spawning)
+
+
+def kill_survivors(grace_s: float = SIGTERM_GRACE_S) -> None:
+    """La otra mitad del apagado por SEÑAL: SIGKILL al grupo de cada server que
+    terminate_all() señaló y que, `grace_s` después de aquel SIGTERM, sigue
+    vivo o reteniendo sus tuberías. Se llama al final del apagado, con lo
+    demás ya hecho: después solo quedan el idle del HUD y el os._exit.
+
+    terminate_all() no espera ni escala, y os._exit se salta el close() de
+    atexit, que sí lo hace: un server que ignora el SIGTERM y el EOF (el nieto
+    de un wrapper, uno colgado con su propio manejador) sobrevivía a Crotolamo
+    en su propia sesión. Con systemd lo acababa matando el cgroup, tras
+    TimeoutStopSec; lanzado desde una terminal, nadie.
+
+    Con servers bien hechos no cuesta nada: vuelve en cuanto han salido (ms).
+    La gracia cuenta desde el SIGTERM (lo que el listener tarda entretanto en
+    vaciar la Memoria ya es gracia) y es una para todos, no una por server.
+    Solo toca a los que terminate_all() señaló. Best-effort, nunca lanza."""
+    with _STATE_LOCK:
+        signalled = list(_TERMINATED.items())
+    for client, signalled_at in signalled:
+        try:
+            if client.kill_if_survives(signalled_at + grace_s):
+                log.debug("MCP '%s': no terminó con el SIGTERM del apagado; SIGKILL", client.name)
+        except Exception:  # noqa: BLE001 - el proceso está saliendo
+            pass
+        with _STATE_LOCK:
+            _TERMINATED.pop(client, None)
